@@ -47,7 +47,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.2.2"
+VERSION = "wnt-gap-v1.2.3"
 PROMPT_VERSION = _secret("PROMPT_VERSION", "gap-v1.0")
 HARNESS = _secret("HARNESS", "grok-web-expert")
 MODEL_LABEL = _secret("MODEL_LABEL", "grok-web-expert")
@@ -72,7 +72,7 @@ STREAMLIT_APP_URL = _secret("STREAMLIT_APP_URL", "https://wnt-gap-bot.streamlit.
 EXECUTION_MODEL = "capped_sweep"
 
 CT = ZoneInfo("America/Chicago")
-POLL_START_CT = _secret("POLL_START_CT", "07:00")
+POLL_START_CT = _secret("POLL_START_CT", "10:00")
 JSON_DEADLINE_CT = _secret("JSON_DEADLINE_CT", "16:30")
 QUOTE_AFTER_PARSE = _flag("QUOTE_AFTER_PARSE", True)
 
@@ -103,8 +103,9 @@ def summary() -> str:
     where = "DEMO" if USE_DEMO else "PRODUCTION"
     return (
         f"{VERSION} | {mode} | {where} | {SERIES}\n"
-        f"capped sweep | trade |gap|>{GAP_THRESHOLD}¢ | take {LIMIT_OFFSET_CENTS}¢ from mid | "
-        f"decide open+{DECISION_LAG_MIN}m | cancel send+{CANCEL_AFTER_MIN}m\n"
+        f"|gap|>{GAP_THRESHOLD}¢ | take {LIMIT_OFFSET_CENTS}¢ from mid | "
+        f"poll from {POLL_START_CT} every 60s | file first-seen+{DECISION_LAG_MIN}m | "
+        f"cancel send+{CANCEL_AFTER_MIN}m\n"
         f"books A $1-hold · B $100-hold · C $1-scalp · D $100-scalp\n"
         f"NO bankroll / NO night cap / NO cluster cap — every |gap|>{GAP_THRESHOLD} word books all four\n"
         f"prompt {PROMPT_VERSION} | harness {HARNESS} | addendum {ADDENDUM}\n"

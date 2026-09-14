@@ -84,8 +84,8 @@ def detect_event(client: KalshiClient | None = None) -> dict:
     if not words:
         return {"ok": False, "reason": "no_markets", "event": event}
 
-    open_at = event_open_at(event, markets) or clock.market_open(date_str)
-    send_at = open_at + timedelta(minutes=C.DECISION_LAG_MIN)
+    seen_at = datetime.now(timezone.utc)
+    send_at = seen_at + timedelta(minutes=C.DECISION_LAG_MIN)
     paste = prompt.build_paste_file(date_str, event["event_ticker"], words)
     run = store.insert_run({
         "event_date": date_str,
@@ -99,7 +99,7 @@ def detect_event(client: KalshiClient | None = None) -> dict:
     })
     store.update_run(
         run["id"],
-        market_open_at=open_at,
+        market_open_at=seen_at,
         decision_at=send_at,
         status="detected",
     )
