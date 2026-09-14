@@ -6,16 +6,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from gap import clock, settle, store
+from gap import store, weekly
 
 
 def main() -> int:
     store.init_db()
-    start, end, week_id = clock.week_mon_fri()
-    if len(sys.argv) >= 3:
-        start, end = sys.argv[1], sys.argv[2]
-    out = settle.settle_range(start, end)
-    print(week_id, start, end, out)
+    force = "--force" in sys.argv
+    print(weekly.send_week_report(force=force))
     return 0
 
 

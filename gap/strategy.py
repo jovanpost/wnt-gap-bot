@@ -52,7 +52,6 @@ def decide(
     notional: float | None = None,
 ) -> dict | None:
     threshold = C.GAP_THRESHOLD if threshold is None else threshold
-    notional = C.NOTIONAL_DOLLARS if notional is None else notional
     if market_prob is None:
         return None
     gap_points = (probability / 100.0 - market_prob) * 100.0
@@ -75,9 +74,10 @@ def decide(
         touch = yes_bid_cents
         marketable = touch is not None and touch >= yes_limit
 
-    contracts = round(notional / (our_px / 100.0), 2)
-    cost_cents = int(round(contracts * our_px))  # risk / collateral
-    phone_notional_cents = int(round(contracts * yes_limit))
+    sized = notional is not None and notional > 0
+    contracts = round(notional / (our_px / 100.0), 2) if sized else 0.0
+    cost_cents = int(round(contracts * our_px)) if sized else 0
+    phone_notional_cents = int(round(contracts * yes_limit)) if sized else 0
     return {
         "side": side,
         "kalshi_action": kalshi_action,
@@ -96,19 +96,6 @@ def decide(
     }
 
 
-def apply_caps(candidates: list[dict]) -> list[dict]:
-    by_cluster: dict[str, int] = {}
-    kept: list[dict] = []
-    ordered = sorted(candidates, key=lambda r: abs(r["gap_points"]), reverse=True)
-    night_cap_cents = int(C.BANKROLL_DOLLARS * C.NIGHT_CAP_FRACTION * 100)
-    spent = 0
-    for row in ordered:
-        ck = row.get("cluster_key") or row["word"]
-        if by_cluster.get(ck, 0) >= C.CLUSTER_CAP:
-            continue
-        if spent + row["cost_cents"] > night_cap_cents:
-            continue
-        by_cluster[ck] = by_cluster.get(ck, 0) + 1
-        spent += row["cost_cents"]
-        kept.append(row)
-    return kept
+def apply_caps(candidates: list[dict], **_kwargs) -> list[dict]:
+    """No caps. Every gap that passed decide() is booked on that book."""
+    return list(candidates)

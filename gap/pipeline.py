@@ -236,8 +236,9 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
 
 
 def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
+    """One decision set, four independent books. No shared size or cash."""
     client = KalshiClient()
-    candidates = []
+    signals = []
     for f in forecasts:
         market = {}
         try:
@@ -247,65 +248,83 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
         bid, ask = market_yes_quotes(market)
         mid = market_mid_prob(bid, ask)
         store.insert_quote(run["id"], f.get("id"), f["market_ticker"], bid, ask, mid)
-        decision = strategy.decide(int(f["probability"]), mid, bid, ask)
-        if not decision:
+        bare = strategy.decide(int(f["probability"]), mid, bid, ask)
+        if not bare:
             continue
-        decision.update({
-            "forecast_id": f.get("id"),
-            "run_id": run["id"],
-            "event_date": str(run["event_date"])[:10],
-            "market_ticker": f["market_ticker"],
-            "word": f["word"],
+        signals.append({
+            "forecast": f,
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
             "cluster_key": strategy.cluster_key(f["word"], f.get("carrying_story")),
-            "paper": True,
-            "status": "paper_sweep",
-        })
-        candidates.append({
-            "forecast_id": decision["forecast_id"],
-            "run_id": decision["run_id"],
-            "event_date": decision["event_date"],
-            "market_ticker": decision["market_ticker"],
-            "word": decision["word"],
-            "side": decision["side"],
-            "limit_price_cents": decision["yes_price_cents"],
-            "contracts": decision["contracts"],
-            "cost_cents": decision["cost_cents"],
-            "gap_points": decision["gap_points"],
-            "threshold": decision["threshold"],
-            "cluster_key": decision["cluster_key"],
-            "paper": True,
-            "status": "paper_sweep",
         })
 
-    kept = strategy.apply_caps(candidates)
-    # wipe today's paper rows then rewrite (idempotent re-parse)
     from sqlalchemy import text
     with store.engine().begin() as conn:
         conn.execute(
             text("delete from gap_orders where run_id = :id and paper is true"),
             {"id": run["id"]},
         )
-    for row in kept:
-        store.insert_order(row)
-    return kept
+
+    kept_all: list[dict] = []
+    for spec in C.VARIANTS:
+        candidates = []
+        for sig in signals:
+            f = sig["forecast"]
+            decision = strategy.decide(
+                int(f["probability"]), sig["mid"], sig["bid"], sig["ask"],
+                notional=spec["notional"],
+            )
+            if not decision:
+                continue
+            candidates.append({
+                "forecast_id": f.get("id"),
+                "run_id": run["id"],
+                "event_date": str(run["event_date"])[:10],
+                "market_ticker": f["market_ticker"],
+                "word": f["word"],
+                "side": decision["side"],
+                "limit_price_cents": decision["yes_price_cents"],
+                "contracts": decision["contracts"],
+                "cost_cents": decision["cost_cents"],
+                "gap_points": decision["gap_points"],
+                "threshold": decision["threshold"],
+                "cluster_key": sig["cluster_key"],
+                "paper": True,
+                "status": "paper_sweep",
+                "variant_id": spec["id"],
+                "exit_rule": spec["exit"],
+                "notional_dollars": spec["notional"],
+                "execution_model": C.EXECUTION_MODEL,
+            })
+        kept = strategy.apply_caps(candidates, notional=spec["notional"])
+        for row in kept:
+            store.insert_order(row)
+        kept_all.extend(kept)
+    return kept_all
 
 
 def _book_summary(saved, booked, expected) -> str:
-    n_yes = sum(1 for o in booked if o["side"] == "YES")
-    n_no = sum(1 for o in booked if o["side"] == "NO")
-    spent = sum(o["cost_cents"] for o in booked) / 100.0
     store.log_activity(
         "parsed",
-        f"{len(saved)} forecasts, {len(booked)} paper sweeps, ${spent:.2f}",
+        f"{len(saved)} forecasts, {len(booked)} paper rows across A/B/C/D",
     )
-    mode = "paper" if C.PAPER else "LIVE-BLOCKED"
-    return (
-        f"parsed {len(saved)}/{len(expected)}\n"
-        f"sweeps: {len(booked)} ({n_no} NO, {n_yes} YES)\n"
-        f"limit = model − {C.GAP_THRESHOLD}¢ | cancel +{C.CANCEL_AFTER_MIN}m\n"
-        f"{mode} booked ${spent:.2f}\n"
-        f"live: {'on' if C.may_place_live() else 'off'}"
-    )
+    lines = [
+        f"parsed {len(saved)}/{len(expected)}",
+        f"limit = model − {C.GAP_THRESHOLD}¢ | cancel +{C.CANCEL_AFTER_MIN}m",
+        "four books, no shared size:",
+    ]
+    for spec in C.VARIANTS:
+        rows = [o for o in booked if o.get("variant_id") == spec["id"]]
+        spent = sum(o["cost_cents"] for o in rows) / 100.0
+        n_yes = sum(1 for o in rows if o["side"] == "YES")
+        n_no = sum(1 for o in rows if o["side"] == "NO")
+        lines.append(
+            f"  {spec['id']} ${spec['notional']:.0f} {spec['exit']}: "
+            f"{len(rows)} ({n_no} NO / {n_yes} YES) booked ${spent:.2f}"
+        )
+    lines.append(f"live: {'on' if C.may_place_live() else 'off'}")
+    return "\n".join(lines)
 
 
 def book_waiting_if_due() -> None:
@@ -333,6 +352,14 @@ def expire_if_needed() -> None:
 
 
 def poll_once() -> dict:
+    if clock.is_saturday_ct():
+        try:
+            from . import weekly
+            msg = weekly.send_week_report(force=False)
+            return {"ok": True, "reason": "saturday_weekly", "detail": msg}
+        except Exception as exc:
+            log.exception("weekly")
+            return {"ok": False, "reason": "weekly_failed", "error": str(exc)}
     if not clock.weekday_ct():
         return {"ok": True, "reason": "weekend"}
     book_waiting_if_due()
@@ -394,10 +421,15 @@ def register_commands() -> None:
         for o in orders:
             spent += o.get("cost_cents") or 0
             lines.append(
-                f"{o['word']}: {o['side']} {o['contracts']} @ {o['limit_price_cents']}c "
+                f"{o.get('variant_id') or '?'} {o['word']}: {o['side']} "
+                f"{o['contracts']} @ {o['limit_price_cents']}c "
                 f"gap {o['gap_points']:+.1f}"
             )
-        lines.append(f"notional ${spent/100:.2f} paper")
+        lines.append("")
+        for spec in C.VARIANTS:
+            rows = [x for x in orders if x.get("variant_id") == spec["id"]]
+            s = sum(x.get("cost_cents") or 0 for x in rows)
+            lines.append(f"{spec['id']} ${spec['notional']:.0f} {spec['exit']}: {len(rows)}  ${s/100:.2f}")
         return "\n".join(lines)
 
     notify.register("gap_status", _status)
@@ -405,5 +437,17 @@ def register_commands() -> None:
     notify.register("gap_prep", _prep)
     notify.register("gap_resend", _resend)
     notify.register("gap_sendnow", _sendnow)
+    def _settle(_args, _msg):
+        start, end, week_id = clock.week_mon_fri()
+        from . import settle as settle_mod
+        out = settle_mod.settle_range(start, end)
+        return f"{week_id} settle {out}"
+
+    def _week(_args, _msg):
+        from . import weekly
+        return weekly.send_week_report(force=True)
+
     notify.register("gap_pnl", _pnl)
     notify.register("gap_today", _pnl)
+    notify.register("gap_settle", _settle)
+    notify.register("gap_week", _week)

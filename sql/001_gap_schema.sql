@@ -1,7 +1,6 @@
--- WNT Gap Trader schema
--- Run this in the SAME Supabase project as wnt-nofade (SQL editor).
--- Tables are prefixed gap_ so they never collide with days/orders/fills/depth.
--- Do not ALTER no-fade tables from this file.
+-- WNT Gap Trader schema (v1.2)
+-- Run ONCE in the SAME Supabase project as wnt-nofade.
+-- Tables are prefixed gap_ so they never collide with days/orders/fills.
 
 create table if not exists gap_state (
   key         text primary key,
@@ -14,7 +13,6 @@ create table if not exists gap_runs (
   event_date      date not null,
   event_ticker    text not null,
   status          text not null default 'prompt_ready',
-  -- prompt_ready | awaiting_json | parsed | rejected | expired | no_event
   prompt_version  text not null default 'gap-v1.0',
   harness         text not null default 'grok-web-expert',
   word_list       jsonb not null default '[]'::jsonb,
@@ -27,6 +25,8 @@ create table if not exists gap_runs (
   markets_n       int not null default 0,
   submitted_at    timestamptz,
   parsed_at       timestamptz,
+  market_open_at  timestamptz,
+  decision_at     timestamptz,
   created_at      timestamptz not null default now(),
   unique (event_date, event_ticker)
 );
@@ -98,11 +98,15 @@ create table if not exists gap_orders (
   filled_contracts numeric not null default 0,
   fees_cents      int not null default 0,
   result          text,
-  realized_pnl_cents int
+  realized_pnl_cents int,
+  execution_model text default 'capped_sweep',
+  variant_id      text,
+  exit_rule       text,
+  notional_dollars numeric
 );
 
-create unique index if not exists gap_orders_one_live_ticker
-  on gap_orders (event_date, market_ticker)
+create unique index if not exists gap_orders_one_per_book
+  on gap_orders (event_date, market_ticker, variant_id)
   where status not in ('rejected', 'cancelled');
 
 create table if not exists gap_settlements (
@@ -113,7 +117,9 @@ create table if not exists gap_settlements (
   outcome         text,
   gross_cents     int,
   fees_cents      int,
-  net_cents       int
+  net_cents       int,
+  fill_model      text,
+  unique (order_id)
 );
 
 create table if not exists gap_activity (
@@ -122,11 +128,3 @@ create table if not exists gap_activity (
   kind        text not null,
   message     text not null
 );
-
--- addendum v1.1: paper sweep metadata (safe to re-run)
-alter table gap_orders add column if not exists execution_model text default 'capped_sweep';
-alter table gap_runs add column if not exists market_open_at timestamptz;
-alter table gap_runs add column if not exists decision_at timestamptz;
-
--- sanity: these names must never exist as unprefixed copies of no-fade tables
--- select tablename from pg_tables where schemaname='public' and tablename like 'gap_%';

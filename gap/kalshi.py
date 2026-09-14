@@ -181,6 +181,18 @@ class KalshiClient:
         return (self.request("GET", f"/markets/{ticker}", auth=False) or {}).get("market", {})
 
 
+def market_result(market: dict) -> str | None:
+    """Official YES/NO after settlement. None if still open."""
+    raw = (market.get("result") or market.get("settlement_result") or "").strip().lower()
+    status = (market.get("status") or "").strip().lower()
+    if raw in ("yes", "no"):
+        return raw
+    if status in ("settled", "finalized", "closed") and raw in ("", "all_no", "void", "scalar"):
+        if raw in ("void",):
+            return "void"
+    return None
+
+
 def market_yes_quotes(market: dict) -> tuple[int | None, int | None]:
     bid = None
     ask = None

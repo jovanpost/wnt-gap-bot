@@ -47,20 +47,20 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.1"
+VERSION = "wnt-gap-v1.2"
 PROMPT_VERSION = _secret("PROMPT_VERSION", "gap-v1.0")
 HARNESS = _secret("HARNESS", "grok-web-expert")
 MODEL_LABEL = _secret("MODEL_LABEL", "grok-web-expert")
-ADDENDUM = "v1.1"
+ADDENDUM = "v1.2"
 
 SERIES = _secret("SERIES", "KXWORLDNEWSMENTION")
 GAP_THRESHOLD = int(_num("GAP_THRESHOLD", 15))
-# Paper/live notional stays parked until the four-way pick is made.
-NOTIONAL_DOLLARS = _num("NOTIONAL_DOLLARS", 5.00)
-CLUSTER_CAP = int(_num("CLUSTER_CAP", 2))
-NIGHT_CAP_FRACTION = _num("NIGHT_CAP_FRACTION", 0.20)
-BANKROLL_DOLLARS = _num("BANKROLL_DOLLARS", 150.00)
-
+VARIANTS = (
+    {"id": "A", "notional": 1.0, "exit": "hold", "label": "A · $1 hold"},
+    {"id": "B", "notional": 100.0, "exit": "hold", "label": "B · $100 hold"},
+    {"id": "C", "notional": 1.0, "exit": "scalp", "label": "C · $1 scalp"},
+    {"id": "D", "notional": 100.0, "exit": "scalp", "label": "D · $100 scalp"},
+)
 # Addendum clocks
 DECISION_LAG_MIN = int(_num("DECISION_LAG_MIN", 60))
 CANCEL_AFTER_MIN = int(_num("CANCEL_AFTER_MIN", 60))
@@ -101,8 +101,8 @@ def summary() -> str:
         f"{VERSION} | {mode} | {where} | {SERIES}\n"
         f"capped sweep | limit = model − {GAP_THRESHOLD}¢ | "
         f"decide open+{DECISION_LAG_MIN}m | cancel send+{CANCEL_AFTER_MIN}m\n"
-        f"parked notional ${NOTIONAL_DOLLARS:.2f}/word | "
-        f"cluster cap {CLUSTER_CAP} | night cap {100 * NIGHT_CAP_FRACTION:.0f}%\n"
+        f"books A $1-hold · B $100-hold · C $1-scalp · D $100-scalp\n"
+        f"NO bankroll / NO night cap / NO cluster cap — every |gap|>{GAP_THRESHOLD} word books all four\n"
         f"prompt {PROMPT_VERSION} | harness {HARNESS} | addendum {ADDENDUM}\n"
         f"poll {POLL_START_CT} CT | json deadline {JSON_DEADLINE_CT} CT"
     )

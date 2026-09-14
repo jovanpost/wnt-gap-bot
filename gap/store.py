@@ -318,20 +318,42 @@ def insert_quote(run_id: int, forecast_id: int | None, market_ticker: str,
 
 
 def insert_order(row: dict) -> None:
+    payload = {
+        "forecast_id": row.get("forecast_id"),
+        "run_id": row["run_id"],
+        "event_date": row["event_date"],
+        "market_ticker": row["market_ticker"],
+        "word": row["word"],
+        "side": row["side"],
+        "limit_price_cents": row["limit_price_cents"],
+        "contracts": row["contracts"],
+        "cost_cents": row["cost_cents"],
+        "gap_points": row["gap_points"],
+        "threshold": row["threshold"],
+        "cluster_key": row.get("cluster_key"),
+        "paper": row.get("paper", True),
+        "status": row.get("status", "paper_sweep"),
+        "variant_id": row.get("variant_id"),
+        "exit_rule": row.get("exit_rule"),
+        "notional_dollars": row.get("notional_dollars"),
+        "execution_model": row.get("execution_model", C.EXECUTION_MODEL),
+    }
     with engine().begin() as conn:
         conn.execute(
             text("""
                 insert into gap_orders (
                     forecast_id, run_id, event_date, market_ticker, word, side,
                     limit_price_cents, contracts, cost_cents, gap_points, threshold,
-                    cluster_key, paper, status
+                    cluster_key, paper, status,
+                    variant_id, exit_rule, notional_dollars, execution_model
                 ) values (
                     :forecast_id, :run_id, cast(:event_date as date), :market_ticker, :word,
                     :side, :limit_price_cents, :contracts, :cost_cents, :gap_points,
-                    :threshold, :cluster_key, :paper, :status
+                    :threshold, :cluster_key, :paper, :status,
+                    :variant_id, :exit_rule, :notional_dollars, :execution_model
                 )
             """),
-            row,
+            payload,
         )
 
 
@@ -364,3 +386,105 @@ def recent_activity(limit: int = 40) -> list[dict]:
             {"n": limit},
         ).mappings().all()
     return [dict(r) for r in rows]
+
+
+def runs_between(start_date: str, end_date: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("""
+                select * from gap_runs
+                where event_date >= cast(:a as date)
+                  and event_date <= cast(:b as date)
+                order by event_date, id
+            """),
+            {"a": start_date, "b": end_date},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def orders_for_run(run_id: int) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_orders where run_id = :id order by variant_id, id"),
+            {"id": run_id},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def quotes_for_run(run_id: int) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_quotes where run_id = :id order by id"),
+            {"id": run_id},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def settlements_for_order_ids(order_ids: list[int]) -> dict[int, dict]:
+    if not order_ids:
+        return {}
+    out: dict[int, dict] = {}
+    with engine().connect() as conn:
+        for oid in order_ids:
+            row = conn.execute(
+                text("select * from gap_settlements where order_id = :id"),
+                {"id": oid},
+            ).mappings().first()
+            if row:
+                out[int(oid)] = dict(row)
+    return out
+
+
+def update_order(order_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    assignments = []
+    params: dict[str, Any] = {"id": order_id}
+    for i, (k, v) in enumerate(fields.items()):
+        key = f"p{i}"
+        assignments.append(f"{k} = :{key}")
+        params[key] = v
+    sql = f"update gap_orders set {', '.join(assignments)} where id = :id"
+    with engine().begin() as conn:
+        conn.execute(text(sql), params)
+
+
+def upsert_settlement(row: dict) -> None:
+    with engine().begin() as conn:
+        if using_postgres():
+            conn.execute(
+                text("""
+                    insert into gap_settlements (
+                        forecast_id, order_id, settled_at, outcome,
+                        gross_cents, fees_cents, net_cents, fill_model
+                    ) values (
+                        :forecast_id, :order_id, :settled_at, :outcome,
+                        :gross_cents, :fees_cents, :net_cents, :fill_model
+                    )
+                    on conflict (order_id) do update set
+                        settled_at = excluded.settled_at,
+                        outcome = excluded.outcome,
+                        gross_cents = excluded.gross_cents,
+                        fees_cents = excluded.fees_cents,
+                        net_cents = excluded.net_cents,
+                        fill_model = excluded.fill_model
+                """),
+                row,
+            )
+        else:
+            conn.execute(
+                text("delete from gap_settlements where order_id = :order_id"),
+                {"order_id": row["order_id"]},
+            )
+            conn.execute(
+                text("""
+                    insert into gap_settlements (
+                        forecast_id, order_id, settled_at, outcome,
+                        gross_cents, fees_cents, net_cents, fill_model
+                    ) values (
+                        :forecast_id, :order_id, :settled_at, :outcome,
+                        :gross_cents, :fees_cents, :net_cents, :fill_model
+                    )
+                """),
+                row,
+            )

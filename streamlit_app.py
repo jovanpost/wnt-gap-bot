@@ -58,12 +58,18 @@ if st.query_params.get("ping") == "true":
     st.write("alive")
     st.stop()
 
+if st.query_params.get("weekly") == "true":
+    boot()
+    from gap import weekly
+    st.write(weekly.send_week_report(force=False))
+    st.stop()
+
 services = boot()
 
 st.title("📐 WNT Gap Bot")
 st.caption(
-    "Addendum v1.1 · capped taker sweep · decide open+60m · cancel send+60m · "
-    "Telegram courier · paper only"
+    "v1.2 · four paper books · no caps · decide open+60m · cancel send+60m · "
+    "Telegram courier · Saturday weekly dump"
 )
 
 tab_live, tab_four, tab_curve = st.tabs(
@@ -123,7 +129,7 @@ with tab_live:
                 use_container_width=True,
             )
 
-    st.subheader("Paper sweeps")
+    st.subheader("Paper books (A/B/C/D, independent)")
     orders = store.orders_for_date(date_str)
     if orders:
         df = pd.DataFrame(orders)
@@ -132,17 +138,19 @@ with tab_live:
                 f"BUY YES @ {int(p)}¢" if s == "YES" else f"SELL YES @ {int(p)}¢"
                 for s, p in zip(df["side"], df["limit_price_cents"])
             ]
-            df["risk_cents"] = [
-                int(p) if s == "YES" else 100 - int(p)
-                for s, p in zip(df["side"], df["limit_price_cents"])
-            ]
         keep = [c for c in (
-            "word", "kalshi", "risk_cents", "contracts", "cost_cents",
-            "gap_points", "cluster_key", "status",
+            "variant_id", "notional_dollars", "exit_rule", "word", "kalshi",
+            "contracts", "cost_cents", "gap_points", "cluster_key", "status",
         ) if c in df.columns]
         st.dataframe(df[keep], hide_index=True, use_container_width=True)
+        if "variant_id" in df.columns:
+            cols = st.columns(4)
+            for spec, col in zip(C.VARIANTS, cols):
+                sub = df[df["variant_id"] == spec["id"]] if "variant_id" in df else df.iloc[0:0]
+                spent = float(sub["cost_cents"].sum()) / 100.0 if len(sub) and "cost_cents" in sub else 0.0
+                col.metric(spec["label"], f"{len(sub)} tickets", f"${spent:.2f}")
     else:
-        st.write("No paper sweeps yet.")
+        st.write("No paper sweeps yet. Four books book after JSON lands.")
 
     act = store.recent_activity(20)
     if act:

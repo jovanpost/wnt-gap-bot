@@ -98,6 +98,28 @@ def weekday_ct(when: datetime | None = None) -> bool:
     return when.weekday() < 5  # Mon-Fri
 
 
+def is_saturday_ct(when: datetime | None = None) -> bool:
+    when = when or now_ct()
+    return when.weekday() == 5
+
+
+def week_mon_fri(when: datetime | None = None) -> tuple[str, str, str]:
+    """
+    Mon–Fri of the WNT week that just finished if today is Sat/Sun,
+    otherwise the current week's Mon through today.
+    Returns (monday, friday, week_id YYYY-Www).
+    """
+    when = when or now_ct()
+    wd = when.weekday()  # Mon=0
+    monday = (when - timedelta(days=wd)).date()
+    if wd >= 5:
+        # Sat/Sun → previous Mon-Fri
+        pass
+    friday = monday + timedelta(days=4)
+    week_id = f"{monday.isocalendar()[0]}-W{monday.isocalendar()[1]:02d}"
+    return monday.strftime("%Y-%m-%d"), friday.strftime("%Y-%m-%d"), week_id
+
+
 def fmt(when: datetime | None) -> str:
     if when is None:
         return "never"
