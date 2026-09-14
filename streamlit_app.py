@@ -8,7 +8,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from gap import backtest, clock, config as C, notify, pipeline, store
+from gap import backtest, board, clock, config as C, notify, pipeline, store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,12 +68,12 @@ services = boot()
 
 st.title("📐 WNT Gap Bot")
 st.caption(
-    "v1.2 · four paper books · no caps · decide open+60m · cancel send+60m · "
+    f"{C.VERSION} · four paper books · mark-to-market from live Kalshi quotes · "
     "Telegram courier · Saturday weekly dump"
 )
 
-tab_live, tab_four, tab_curve = st.tabs(
-    ["Tonight (paper)", "Four-way backtest", "Cancel-window curve"]
+tab_live, tab_books, tab_four, tab_curve = st.tabs(
+    ["Tonight", "Four books · P&L", "Four-way backtest", "Cancel-window curve"]
 )
 
 # ---------------------------------------------------------------------------
@@ -129,29 +129,6 @@ with tab_live:
                 use_container_width=True,
             )
 
-    st.subheader("Paper books (A/B/C/D, independent)")
-    orders = store.orders_for_date(date_str)
-    if orders:
-        df = pd.DataFrame(orders)
-        if "limit_price_cents" in df.columns and "side" in df.columns:
-            df["kalshi"] = [
-                f"BUY YES @ {int(p)}¢" if s == "YES" else f"SELL YES @ {int(p)}¢"
-                for s, p in zip(df["side"], df["limit_price_cents"])
-            ]
-        keep = [c for c in (
-            "variant_id", "notional_dollars", "exit_rule", "word", "kalshi",
-            "contracts", "cost_cents", "gap_points", "cluster_key", "status",
-        ) if c in df.columns]
-        st.dataframe(df[keep], hide_index=True, use_container_width=True)
-        if "variant_id" in df.columns:
-            cols = st.columns(4)
-            for spec, col in zip(C.VARIANTS, cols):
-                sub = df[df["variant_id"] == spec["id"]] if "variant_id" in df else df.iloc[0:0]
-                spent = float(sub["cost_cents"].sum()) / 100.0 if len(sub) and "cost_cents" in sub else 0.0
-                col.metric(spec["label"], f"{len(sub)} tickets", f"${spent:.2f}")
-    else:
-        st.write("No paper sweeps yet. Four books book after JSON lands.")
-
     act = store.recent_activity(20)
     if act:
         st.subheader("Activity")
@@ -159,6 +136,124 @@ with tab_live:
             pd.DataFrame(act)[["at", "kind", "message"]],
             hide_index=True,
             use_container_width=True,
+        )
+
+# ---------------------------------------------------------------------------
+with tab_books:
+    date_str = clock.today_ct()
+    top = st.columns([3, 1])
+    with top[0]:
+        st.markdown(
+            "Live Kalshi YES bid/ask vs paper entry. "
+            "Phase-1 paper **assumes a full fill at the limit** "
+            "(same SIZE_UNTESTED tag as the tape). "
+            "Hold books mark to mid until official settlement. "
+            "Scalp books mark to mid until a tape hit or last-mid flatten."
+        )
+    with top[1]:
+        if st.button("Refresh quotes", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    @st.cache_data(ttl=20, show_spinner="Quoting Kalshi…")
+    def _tonight(d: str):
+        return board.tonight(d)
+
+    snap = _tonight(date_str)
+    rows = snap["rows"]
+    books = snap["books"]
+
+    if not rows:
+        st.info("No paper orders yet for " + date_str)
+    else:
+        cards = st.columns(4)
+        for card, b in zip(cards, books):
+            with card:
+                st.subheader(b["label"])
+                delta = f"{b['pct']:+.1f}%"
+                st.metric("P&L", f"${b['pnl']:+.2f}", delta)
+                st.caption(
+                    f"cost ${b['cost']:.2f} → mark ${b['mark']:.2f}\n\n"
+                    f"{b['filled']}/{b['n']} filled · W/L {b['wins']}/{b['losses']}"
+                )
+
+        cmp = pd.DataFrame([
+            {
+                "book": b["label"],
+                "size": f"${b['notional']:.0f}",
+                "exit": b["exit"],
+                "tickets": b["n"],
+                "filled": b["filled"],
+                "cost $": round(b["cost"], 2),
+                "mark $": round(b["mark"], 2),
+                "P&L $": round(b["pnl"], 2),
+                "P&L %": round(b["pct"], 2),
+                "W": b["wins"],
+                "L": b["losses"],
+            }
+            for b in books
+        ])
+        st.dataframe(
+            cmp,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "P&L $": st.column_config.NumberColumn(format="$%+.2f"),
+                "P&L %": st.column_config.NumberColumn(format="%+.1f%%"),
+                "cost $": st.column_config.NumberColumn(format="$%.2f"),
+                "mark $": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+
+        show_cols = [
+            "word", "action", "fill_label", "filled_ct",
+            "entry_yes", "now_yes", "cost_dollars", "mark_dollars",
+            "pnl_dollars", "pnl_pct", "gap_points",
+        ]
+        labels = {
+            "word": "word",
+            "action": "Kalshi",
+            "fill_label": "status",
+            "filled_ct": "filled ct",
+            "entry_yes": "entry YES ¢",
+            "now_yes": "now YES bid/ask/mid",
+            "cost_dollars": "cost $",
+            "mark_dollars": "mark $",
+            "pnl_dollars": "P&L $",
+            "pnl_pct": "P&L %",
+            "gap_points": "gap ¢",
+        }
+        cfg = {
+            "cost $": st.column_config.NumberColumn(format="$%.2f"),
+            "mark $": st.column_config.NumberColumn(format="$%.2f"),
+            "P&L $": st.column_config.NumberColumn(format="$%+.2f"),
+            "P&L %": st.column_config.NumberColumn(format="%+.1f%%"),
+            "gap ¢": st.column_config.NumberColumn(format="%+.1f"),
+            "entry YES ¢": st.column_config.NumberColumn(format="%d"),
+        }
+
+        for b in books:
+            sub = [r for r in rows if r.get("variant_id") == b["id"]]
+            with st.expander(
+                f"{b['label']}  ·  ${b['pnl']:+.2f}  ({b['pct']:+.1f}%)  ·  "
+                f"{b['filled']}/{b['n']} filled",
+                expanded=(b["id"] in ("A", "B")),
+            ):
+                if not sub:
+                    st.write("empty")
+                    continue
+                df = pd.DataFrame(sub)
+                view = df[show_cols].rename(columns=labels)
+                st.dataframe(
+                    view,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config=cfg,
+                )
+
+        st.caption(
+            f"{snap['n_words']} words · {snap['n_orders']} tickets · "
+            "quotes cached 20s · Refresh quotes to force a pull"
         )
 
 # ---------------------------------------------------------------------------
