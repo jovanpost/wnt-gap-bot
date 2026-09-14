@@ -68,7 +68,7 @@ MARKET_OPEN_CT = _secret("MARKET_OPEN_CT", "10:00")  # fallback if API has no op
 EXECUTION_MODEL = "capped_sweep"
 
 CT = ZoneInfo("America/Chicago")
-POLL_START_CT = _secret("POLL_START_CT", "11:00")
+POLL_START_CT = _secret("POLL_START_CT", "07:00")
 JSON_DEADLINE_CT = _secret("JSON_DEADLINE_CT", "16:30")
 QUOTE_AFTER_PARSE = _flag("QUOTE_AFTER_PARSE", True)
 

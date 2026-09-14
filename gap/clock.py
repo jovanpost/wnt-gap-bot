@@ -38,6 +38,42 @@ def before_decision(date_str: str, open_hhmm: str | None = None) -> bool:
     return now_ct() < decision_at(date_str, open_hhmm)
 
 
+def parse_dt(val) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val
+    raw = str(val).strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def send_due_at(detected) -> datetime | None:
+    start = parse_dt(detected)
+    if start is None:
+        return None
+    return start + timedelta(minutes=C.DECISION_LAG_MIN)
+
+
+def ready_to_send(detected, when: datetime | None = None) -> bool:
+    due = send_due_at(detected)
+    if due is None:
+        return False
+    when = when or now_ct()
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc) >= due.astimezone(timezone.utc)
+
+
 def poll_start(date_str: str) -> datetime:
     return _at(date_str, C.POLL_START_CT)
 

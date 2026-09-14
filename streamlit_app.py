@@ -84,7 +84,12 @@ with tab_live:
     run = store.get_run_for_date(date_str)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Today CT", date_str)
-    c2.metric("Decision", clock.fmt(clock.decision_at(date_str)))
+    send_label = clock.fmt(clock.decision_at(date_str))
+    if run:
+        due = clock.send_due_at(run.get("market_open_at") or run.get("created_at"))
+        if due:
+            send_label = clock.fmt(due)
+    c2.metric("File send", send_label)
     if run:
         c3.metric("Run", str(run.get("status")))
         c4.metric("Markets", str(run.get("markets_n") or 0))
@@ -93,7 +98,16 @@ with tab_live:
         c4.metric("Markets", "—")
 
     if not run:
-        st.write("No event file yet. Poll starts", C.POLL_START_CT, "CT weekdays.")
+        st.write(
+            "No event yet. Poll starts", C.POLL_START_CT,
+            "CT. File sends", C.DECISION_LAG_MIN, "min after first detect."
+        )
+    elif run.get("status") == "detected":
+        st.warning(
+            "Event seen. Telegram file waits until "
+            + send_label
+            + ". /gap_sendnow skips the wait."
+        )
     else:
         st.write(
             f"`{run.get('event_ticker')}` · `{run.get('harness')}` · "

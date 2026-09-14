@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import clock, config as C, notify, parser, prompt, store, strategy
 from .kalshi import (
@@ -53,11 +53,20 @@ def snapshot_markets(client: KalshiClient, event: dict) -> list[dict]:
     return uniquify_words(rows)
 
 
-def send_prompt_for_today(client: KalshiClient | None = None, force: bool = False) -> dict:
+def _snapshot_words(client: KalshiClient, event: dict) -> list[dict]:
+    markets = snapshot_markets(client, event)
+    return [
+        {"word": m["word"], "market_ticker": m["market_ticker"], "title": m["title"]}
+        for m in markets
+    ]
+
+
+def detect_event(client: KalshiClient | None = None) -> dict:
+    """Record first sighting. Do not Telegram yet."""
     date_str = clock.today_ct()
     existing = store.get_run_for_date(date_str)
-    if existing and not force:
-        return {"ok": True, "reason": "already_have_run", "run": existing}
+    if existing:
+        return {"ok": True, "reason": "already_detected", "run": existing}
 
     client = client or KalshiClient()
     events = client.get_events(C.SERIES, status="open")
@@ -66,32 +75,100 @@ def send_prompt_for_today(client: KalshiClient | None = None, force: bool = Fals
         store.log_activity("no_event", f"no open {C.SERIES} event for {date_str}")
         return {"ok": False, "reason": "no_event"}
 
-    markets = snapshot_markets(client, event)
-    if not markets:
+    words = _snapshot_words(client, event)
+    if not words:
         return {"ok": False, "reason": "no_markets", "event": event}
 
-    words = [{"word": m["word"], "market_ticker": m["market_ticker"], "title": m["title"]}
-             for m in markets]
+    now = datetime.now(timezone.utc)
+    send_at = now + timedelta(minutes=C.DECISION_LAG_MIN)
     paste = prompt.build_paste_file(date_str, event["event_ticker"], words)
-    caption = prompt.build_telegram_caption(date_str, event["event_ticker"], len(words))
-
     run = store.insert_run({
         "event_date": date_str,
         "event_ticker": event["event_ticker"],
-        "status": "awaiting_json",
+        "status": "detected",
         "prompt_version": C.PROMPT_VERSION,
         "harness": C.HARNESS,
         "word_list": words,
         "prompt_text": paste,
         "markets_n": len(words),
     })
+    store.update_run(
+        run["id"],
+        market_open_at=now,
+        decision_at=send_at,
+        status="detected",
+    )
+    store.insert_markets(run["id"], date_str, event["event_ticker"], words)
+    store.log_activity(
+        "detected",
+        f"{event['event_ticker']} n={len(words)} send_at={clock.fmt(send_at)}",
+    )
+    return {"ok": True, "reason": "detected", "run": store.get_run_for_date(date_str), "n": len(words)}
+
+
+def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> dict:
+    """Send the .txt only after detect + 60m, unless force."""
+    date_str = clock.today_ct()
+    run = store.get_run_for_date(date_str)
+    if not run:
+        found = detect_event(client)
+        if not found.get("ok"):
+            return found
+        run = found["run"]
+
+    if run.get("status") not in ("detected", "awaiting_json") and not force:
+        return {"ok": True, "reason": f"status_{run.get('status')}", "run": run}
+
+    if run.get("telegram_msg_id") and run.get("status") == "awaiting_json" and not force:
+        return {"ok": True, "reason": "already_sent", "run": run}
+
+    detected = run.get("market_open_at") or run.get("created_at")
+    if not force and not clock.ready_to_send(detected):
+        due = clock.send_due_at(detected)
+        return {
+            "ok": True,
+            "reason": "waiting_send",
+            "run": run,
+            "send_at": clock.fmt(due),
+        }
+
+    client = client or KalshiClient()
+    events = client.get_events(C.SERIES, status="open")
+    event = pick_tonight_event(events, date_str) or {"event_ticker": run["event_ticker"]}
+    words = _snapshot_words(client, event) or (run.get("word_list") or [])
+    if isinstance(words, str):
+        import json as _json
+        words = _json.loads(words)
+    if not words:
+        return {"ok": False, "reason": "no_markets", "run": run}
+
+    paste = prompt.build_paste_file(date_str, event["event_ticker"], words)
+    caption = prompt.build_telegram_caption(date_str, event["event_ticker"], len(words))
+    caption = (
+        f"{caption}\n"
+        f"Detected {clock.fmt(clock.parse_dt(detected))}. "
+        f"Wait was {C.DECISION_LAG_MIN}m. Paste this whole file into a NEW Expert chat."
+    )
+    store.update_run(
+        run["id"],
+        word_list=words,
+        prompt_text=paste,
+        markets_n=len(words),
+        event_ticker=event["event_ticker"],
+    )
     store.insert_markets(run["id"], date_str, event["event_ticker"], words)
 
     msg_id = notify.send_document(f"gap-{date_str}.txt", paste, caption)
-    if msg_id:
-        store.update_run(run["id"], telegram_msg_id=msg_id, status="awaiting_json")
+    store.update_run(run["id"], telegram_msg_id=msg_id, status="awaiting_json")
     store.log_activity("prompt_sent", f"{event['event_ticker']} n={len(words)} msg={msg_id}")
-    return {"ok": True, "run": store.get_run_for_date(date_str), "n": len(words)}
+    return {"ok": True, "reason": "sent", "run": store.get_run_for_date(date_str), "n": len(words)}
+
+
+def send_prompt_for_today(client: KalshiClient | None = None, force: bool = False) -> dict:
+    found = detect_event(client)
+    if not found.get("ok") and found.get("reason") != "already_detected":
+        return found
+    return dispatch_prompt(force=force, client=client)
 
 
 def ingest_json(raw: str, _msg: dict | None = None) -> str:
@@ -99,6 +176,9 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
     run = store.get_run_for_date(date_str)
     if not run:
         return "no run for today — send /gap_prep first"
+    if run.get("status") == "detected":
+        due = clock.send_due_at(run.get("market_open_at") or run.get("created_at"))
+        return f"file not sent yet — waiting until {clock.fmt(due)}"
     if run.get("status") == "parsed" and not C.PAPER:
         return "already parsed today"
     if clock.past_json_deadline(date_str) and run.get("status") != "parsed":
@@ -151,15 +231,6 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
         run["id"], date_str, run["event_ticker"],
         C.HARNESS, C.PROMPT_VERSION, forecast_rows,
     )
-    if clock.before_decision(date_str):
-        store.update_run(run["id"], status="parsed_waiting_decision")
-        when = clock.fmt(clock.decision_at(date_str))
-        store.log_activity("parsed_wait", f"{len(saved)} forecasts; book at {when}")
-        return (
-            f"parsed {len(saved)}/{len(expected)}\n"
-            f"waiting for decision clock ({when})\n"
-            f"capped sweep: limit = model − {C.GAP_THRESHOLD}¢"
-        )
     booked = book_from_forecasts(run, saved)
     return _book_summary(saved, booked, expected)
 
@@ -255,7 +326,7 @@ def expire_if_needed() -> None:
     if not clock.past_json_deadline(date_str):
         return
     run = store.get_run_for_date(date_str)
-    if run and run.get("status") == "awaiting_json":
+    if run and run.get("status") in ("awaiting_json", "detected"):
         store.update_run(run["id"], status="expired", parse_error="past json deadline")
         notify.send(f"{date_str}: JSON deadline passed — no gap trades today.")
         store.log_activity("expired", date_str)
@@ -281,33 +352,38 @@ def register_commands() -> None:
         if not run:
             return f"no run today\n{C.summary()}"
         orders = store.orders_for_date(clock.today_ct())
+        extra = ""
+        if run.get("status") == "detected":
+            due = clock.send_due_at(run.get("market_open_at") or run.get("created_at"))
+            extra = f"\nsend file at {clock.fmt(due)}"
         return (
             f"{C.summary()}\n\n"
             f"run #{run['id']} {run['event_ticker']}\n"
-            f"status={run['status']} markets={run.get('markets_n')}\n"
+            f"status={run['status']} markets={run.get('markets_n')}"
+            f"{extra}\n"
             f"orders today={len(orders)} (all paper={C.PAPER})"
         )
 
     def _prep(_args, _msg):
         out = send_prompt_for_today(force=False)
-        if out.get("reason") == "already_have_run":
-            return "already sent today's file. /gap_resend to send again."
         if not out.get("ok"):
             return f"prep failed: {out.get('reason')}"
-        return f"sent {out.get('n')} words"
+        if out.get("reason") == "waiting_send":
+            return f"event seen. file waits until {out.get('send_at')}. /gap_sendnow to skip."
+        if out.get("reason") in ("already_sent", "already_detected"):
+            return f"{out.get('reason')}. /gap_resend or /gap_sendnow to send the file."
+        if out.get("reason") == "sent":
+            return f"sent {out.get('n')} words — paste into a NEW Expert chat"
+        return f"{out.get('reason')} n={out.get('n')}"
 
     def _resend(_args, _msg):
-        date_str = clock.today_ct()
-        run = store.get_run_for_date(date_str)
-        if not run or not run.get("prompt_text"):
-            out = send_prompt_for_today(force=True)
-            return f"prep {out.get('reason') or 'sent'}"
-        caption = prompt.build_telegram_caption(
-            date_str, run["event_ticker"], run.get("markets_n") or 0
-        )
-        msg_id = notify.send_document(f"gap-{date_str}.txt", run["prompt_text"], caption)
-        store.update_run(run["id"], telegram_msg_id=msg_id, status="awaiting_json")
-        return "resent file"
+        out = dispatch_prompt(force=True)
+        if not out.get("ok"):
+            return f"resend failed: {out.get('reason')}"
+        return f"sent {out.get('n')} words — paste into a NEW Expert chat"
+
+    def _sendnow(_args, _msg):
+        return _resend(_args, _msg)
 
     def _pnl(_args, _msg):
         orders = store.orders_for_date(clock.today_ct())
@@ -328,5 +404,6 @@ def register_commands() -> None:
     notify.register("status", _status)
     notify.register("gap_prep", _prep)
     notify.register("gap_resend", _resend)
+    notify.register("gap_sendnow", _sendnow)
     notify.register("gap_pnl", _pnl)
     notify.register("gap_today", _pnl)
