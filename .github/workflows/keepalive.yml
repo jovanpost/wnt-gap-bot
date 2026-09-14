@@ -19,7 +19,9 @@ jobs:
           BASE="${BASE%/}"
           URL="${BASE}/?ping=true"
           echo "curl $URL"
-          BODY="$(curl -sS -L --max-time 25 -w "\n%{http_code}" "$URL" || true)"
-          CODE="$(echo "$BODY" | tail -n1)"
+          CODE="$(curl -sS -o /dev/null -w "%{http_code}" \
+            --max-time 25 --max-redirs 0 \
+            -A "Mozilla/5.0 wnt-gap-keepalive" \
+            "$URL" || true)"
           echo "http $CODE"
           exit 0
