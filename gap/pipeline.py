@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from . import clock, config as C, notify, parser, prompt, store, strategy
 from .kalshi import (
     KalshiClient,
+    event_open_at,
     market_mid_prob,
     market_yes_quotes,
     uniquify_words,
@@ -75,12 +76,16 @@ def detect_event(client: KalshiClient | None = None) -> dict:
         store.log_activity("no_event", f"no open {C.SERIES} event for {date_str}")
         return {"ok": False, "reason": "no_event"}
 
-    words = _snapshot_words(client, event)
+    markets = snapshot_markets(client, event)
+    words = [
+        {"word": m["word"], "market_ticker": m["market_ticker"], "title": m["title"]}
+        for m in markets
+    ]
     if not words:
         return {"ok": False, "reason": "no_markets", "event": event}
 
-    now = datetime.now(timezone.utc)
-    send_at = now + timedelta(minutes=C.DECISION_LAG_MIN)
+    open_at = event_open_at(event, markets) or clock.market_open(date_str)
+    send_at = open_at + timedelta(minutes=C.DECISION_LAG_MIN)
     paste = prompt.build_paste_file(date_str, event["event_ticker"], words)
     run = store.insert_run({
         "event_date": date_str,
@@ -94,7 +99,7 @@ def detect_event(client: KalshiClient | None = None) -> dict:
     })
     store.update_run(
         run["id"],
-        market_open_at=now,
+        market_open_at=open_at,
         decision_at=send_at,
         status="detected",
     )
@@ -122,9 +127,11 @@ def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> 
     if run.get("telegram_msg_id") and run.get("status") == "awaiting_json" and not force:
         return {"ok": True, "reason": "already_sent", "run": run}
 
-    detected = run.get("market_open_at") or run.get("created_at")
-    if not force and not clock.ready_to_send(detected):
+    due = clock.parse_dt(run.get("decision_at"))
+    if due is None:
+        detected = run.get("market_open_at") or run.get("created_at")
         due = clock.send_due_at(detected)
+    if not force and due is not None and clock.now_ct() < due.astimezone(C.CT):
         return {
             "ok": True,
             "reason": "waiting_send",

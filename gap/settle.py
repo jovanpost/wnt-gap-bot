@@ -15,7 +15,7 @@ from .kalshi import KalshiClient, market_result
 
 log = logging.getLogger("gap.settle")
 
-FILL_MODEL = "paper_full_at_limit"
+FILL_MODEL = "paper_full_at_limit_SIZE_UNTESTED"
 
 
 def _our_px(order: dict) -> int:

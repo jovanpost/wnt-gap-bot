@@ -47,7 +47,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.2.1"
+VERSION = "wnt-gap-v1.2.2"
 PROMPT_VERSION = _secret("PROMPT_VERSION", "gap-v1.0")
 HARNESS = _secret("HARNESS", "grok-web-expert")
 MODEL_LABEL = _secret("MODEL_LABEL", "grok-web-expert")
@@ -67,7 +67,8 @@ VARIANTS = (
 # Addendum clocks
 DECISION_LAG_MIN = int(_num("DECISION_LAG_MIN", 60))
 CANCEL_AFTER_MIN = int(_num("CANCEL_AFTER_MIN", 60))
-MARKET_OPEN_CT = _secret("MARKET_OPEN_CT", "10:00")  # fallback if API has no open_time
+MARKET_OPEN_CT = _secret("MARKET_OPEN_CT", "12:30")  # modal WNT open; API open_time wins
+STREAMLIT_APP_URL = _secret("STREAMLIT_APP_URL", "https://wnt-gap-bot.streamlit.app")
 EXECUTION_MODEL = "capped_sweep"
 
 CT = ZoneInfo("America/Chicago")

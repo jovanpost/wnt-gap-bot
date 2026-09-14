@@ -6,6 +6,7 @@ import logging
 import random
 import re
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -179,6 +180,40 @@ class KalshiClient:
 
     def get_market(self, ticker: str) -> dict:
         return (self.request("GET", f"/markets/{ticker}", auth=False) or {}).get("market", {})
+
+
+def _parse_ts(raw) -> datetime | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        except Exception:
+            return None
+    try:
+        dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def event_open_at(event: dict | None, markets: list[dict] | None = None) -> datetime | None:
+    blobs: list[dict] = []
+    if event:
+        blobs.append(event)
+    for m in markets or []:
+        blobs.append(m)
+        raw = m.get("raw")
+        if isinstance(raw, dict):
+            blobs.append(raw)
+    for obj in blobs:
+        for key in ("open_time", "open_ts", "start_time"):
+            dt = _parse_ts(obj.get(key))
+            if dt is not None:
+                return dt
+    return None
 
 
 def market_result(market: dict) -> str | None:
