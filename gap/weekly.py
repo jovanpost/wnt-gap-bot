@@ -32,11 +32,12 @@ def build_week_report(start: str | None = None, end: str | None = None) -> tuple
     lines.append("")
     lines.append("FILL MODEL")
     lines.append("paper_full_at_limit_SIZE_UNTESTED")
-    lines.append("Assumes 100% fill AT the limit. That makes B look like A×100 and")
-    lines.append("C/D look like holds. Do NOT read weekly $ as evidence that $100")
+    lines.append("Assumes 100% ENTRY fill AT the limit. B is not evidence $100 fills.")
+    lines.append("Do NOT read A vs B as a size study. Entry size is still untested.")
     lines.append("fills like $1. Real tape (60m): ~95% fill at $20 vs ~84% at $100.")
     lines.append("A real sweep also fills through the cap, not only at the cap.")
-    lines.append("C/D have no minute tape — tagged scalp_unobserved_settled_as_hold.")
+    lines.append("C/D: 60s quote tape. HIT = bid (YES) or ask (NO) reached Grok.")
+    lines.append("MISS = model never printed; flatten last mid. Entry size still untested.")
     lines.append("")
     lines.append("CAPS")
     lines.append("Paper: no cluster cap, no night cap, no bankroll — maximize nights.")
@@ -124,7 +125,7 @@ def build_week_report(start: str | None = None, end: str | None = None) -> tuple
     lines.append("Read the frozen rules. Do not invent a bankroll, cluster cap, or $5 size.")
     lines.append("Compare A vs B vs C vs D on this week only. Recommend whether to")
     lines.append("keep running all four paper, drop a book, or change gap / clocks.")
-    lines.append("C/D scalp marks are settlement stand-ins until a tape exists.")
+    lines.append("C/D use the 60s tape (hit at model vs miss at last mid), not settlement.")
     text = "\n".join(lines) + "\n"
     fname = f"gap-week-{week_id}.txt"
     return fname, text

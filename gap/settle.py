@@ -63,6 +63,10 @@ def settle_run(run: dict, client: KalshiClient | None = None) -> dict:
             except Exception as exc:
                 log.warning("settle quote %s: %s", ticker, exc)
                 by_ticker[ticker] = None
+        if (order.get("exit_rule") == "scalp"
+                and str(order.get("status") or "").startswith("scalp_")):
+            settled += 1
+            continue
         outcome = by_ticker[ticker]
         if outcome is None:
             open_n += 1

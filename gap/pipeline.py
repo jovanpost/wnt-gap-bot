@@ -359,6 +359,11 @@ def expire_if_needed() -> None:
 
 
 def poll_once() -> dict:
+    try:
+        from . import tape
+        tape.track_tape()
+    except Exception:
+        log.exception("track_tape")
     if clock.is_saturday_ct():
         try:
             from . import weekly
