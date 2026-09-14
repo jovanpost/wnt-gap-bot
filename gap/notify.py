@@ -126,6 +126,7 @@ def _extract_payload(msg: dict) -> str | None:
 
 
 def _dispatch_command(raw: str, msg: dict) -> str | None:
+    global _incomplete_notified
     parts = raw.split()
     cmd = parts[0].split("@")[0].lower().lstrip("/")
     if cmd in ("start", "help"):
@@ -138,7 +139,6 @@ def _dispatch_command(raw: str, msg: dict) -> str | None:
     if cmd == "gap_clear":
         n = len(_pending)
         _pending.clear()
-        global _incomplete_notified
         _incomplete_notified = False
         return f"cleared {n} buffered message(s). paste Grok's answer again."
     handler = _handlers.get(cmd)
@@ -152,7 +152,7 @@ def _dispatch_command(raw: str, msg: dict) -> str | None:
 
 
 def _flush_pending() -> None:
-    """1s of silence: join every part, extract the JSON object, book."""
+    """Silence, then join every part, extract the JSON object, book."""
     global _incomplete_notified
     if not _pending or _json_handler is None:
         return
@@ -164,8 +164,6 @@ def _flush_pending() -> None:
 
     from . import parser
 
-    # Try empty-join first (true Telegram 4096 split), then newline-join
-    # (client wrap), then each individually in case one message is complete.
     blobs = [
         "".join(raw_parts),
         "\n".join(raw_parts),
@@ -207,6 +205,7 @@ def _flush_pending() -> None:
 
 
 def _listen() -> None:
+    global _incomplete_notified
     from . import store
 
     offset = 0
@@ -218,9 +217,6 @@ def _listen() -> None:
             offset = int(saved["offset"])
         except (TypeError, ValueError):
             offset = 0
-
-    # Resume from saved offset only. Never drain with offset=-1 —
-    # that deleted inbound Grok JSON on every Streamlit reboot.
 
     while True:
         try:
@@ -247,10 +243,8 @@ def _listen() -> None:
                     if reply:
                         send(reply, reply_to=msg.get("message_id"))
                     continue
-                # A file is the whole payload. Drop leftover chat fragments.
                 if msg.get("document"):
                     _pending.clear()
-                    global _incomplete_notified
                     _incomplete_notified = False
                 _pending.append((now, msg, raw))
 
@@ -263,7 +257,6 @@ def _listen() -> None:
                         f"({int(oldest)}s old) — no complete JSON."
                     )
                     _pending.clear()
-                    global _incomplete_notified
                     _incomplete_notified = False
                 elif age >= DEBOUNCE_SEC:
                     _flush_pending()
