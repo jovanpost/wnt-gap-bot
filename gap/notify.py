@@ -14,9 +14,16 @@ log = logging.getLogger("gap.notify")
 
 API = "https://api.telegram.org"
 
+# After the last inbound message, wait this long with no new parts, then stitch.
+DEBOUNCE_SEC = 1.0
+STALE_SEC = 180.0
+
 _handlers: dict[str, Callable[[list[str], dict], str]] = {}
 _json_handler: Callable[[str, dict], str] | None = None
 _listener_started = False
+# (received_monotonic, msg, payload)
+_pending: list[tuple[float, dict, str]] = []
+_incomplete_notified = False
 
 
 def _url(method: str) -> str:
@@ -118,44 +125,67 @@ def _extract_payload(msg: dict) -> str | None:
     return None
 
 
-def _looks_like_json(text: str) -> bool:
-    t = text.strip()
-    if t.startswith("/"):
-        cmd = t.split()[0].split("@")[0].lower()
-        if cmd in ("/gap_json", "/json"):
-            return True
-    if t.startswith("{") or t.startswith("```"):
-        return True
-    return False
-
-
-def _dispatch(msg: dict) -> str | None:
-    raw = _extract_payload(msg) or ""
-    if raw.startswith("/"):
-        parts = raw.split()
-        cmd = parts[0].split("@")[0].lower().lstrip("/")
-        if cmd in ("start", "help"):
-            names = ", ".join(f"/{n}" for n in sorted(_handlers))
-            return f"gap bot commands: {names}\nOr reply to the nightly file with Grok's JSON."
-        handler = _handlers.get(cmd)
-        if handler:
-            try:
-                return handler(parts[1:], msg)
-            except Exception as exc:
-                log.exception("handler /%s", cmd)
-                return f"error: {exc}"
-        return None
-
-    if _json_handler and _looks_like_json(raw):
-        body = raw
-        if body.lower().startswith("/gap_json") or body.lower().startswith("/json"):
-            body = body.split("\n", 1)[1] if "\n" in body else ""
+def _dispatch_command(raw: str, msg: dict) -> str | None:
+    parts = raw.split()
+    cmd = parts[0].split("@")[0].lower().lstrip("/")
+    if cmd in ("start", "help"):
+        names = ", ".join(f"/{n}" for n in sorted(_handlers))
+        return (
+            f"gap bot commands: {names}\n"
+            "Paste Grok's answer (splits are fine). "
+            "After 1s of silence I stitch, pull the JSON, and book."
+        )
+    handler = _handlers.get(cmd)
+    if handler:
         try:
-            return _json_handler(body, msg)
+            return handler(parts[1:], msg)
         except Exception as exc:
-            log.exception("json handler")
-            return f"parse error: {exc}"
+            log.exception("handler /%s", cmd)
+            return f"error: {exc}"
     return None
+
+
+def _flush_pending() -> None:
+    """1s of silence: join every part, extract the JSON object, book."""
+    global _incomplete_notified
+    if not _pending or _json_handler is None:
+        return
+
+    parts = list(_pending)
+    blob = "\n".join(p[2] for p in parts if p[2])
+    last_msg = parts[-1][1]
+    n = len(parts)
+
+    from . import parser
+
+    extracted = parser.strip_fences(blob)
+    try:
+        parser.load_json(extracted)
+    except Exception as exc:
+        # Keep the buffer so the next chunk can finish the object.
+        if not _incomplete_notified:
+            send(
+                f"got {n} message(s), {len(blob)} chars — JSON not complete yet "
+                f"({exc}). send the rest, or attach one .txt."
+            )
+            _incomplete_notified = True
+        return
+
+    _pending.clear()
+    _incomplete_notified = False
+
+    send(
+        f"JSON extracted from {n} message(s) ({len(extracted)} chars). "
+        "Scoring gaps and booking A/B/C/D…"
+    )
+    try:
+        result = _json_handler(extracted, last_msg)
+    except Exception as exc:
+        log.exception("json handler")
+        send(f"parse/book error: {exc}")
+        return
+    if result:
+        send(result)
 
 
 def _listen() -> None:
@@ -171,28 +201,19 @@ def _listen() -> None:
         except (TypeError, ValueError):
             offset = 0
 
-    # Drain backlog once so a restart does not replay old JSON.
-    try:
-        primed = requests.get(
-            _url("getUpdates"),
-            params={"timeout": 0, "offset": -1},
-            timeout=20,
-        ).json()
-        results = primed.get("result") or []
-        if results:
-            offset = int(results[-1]["update_id"]) + 1
-            store.set_state("telegram_offset", offset)
-    except Exception:
-        pass
+    # Resume from saved offset only. Never drain with offset=-1 —
+    # that deleted inbound Grok JSON on every Streamlit reboot.
 
     while True:
         try:
+            long_poll = 1 if _pending else 50
             resp = requests.get(
                 _url("getUpdates"),
-                params={"timeout": 50, "offset": offset},
-                timeout=60,
+                params={"timeout": long_poll, "offset": offset},
+                timeout=long_poll + 15,
             )
             data = resp.json() if resp.status_code == 200 else {}
+            now = time.monotonic()
             for upd in data.get("result") or []:
                 offset = int(upd["update_id"]) + 1
                 store.set_state("telegram_offset", offset)
@@ -200,9 +221,29 @@ def _listen() -> None:
                 chat_id = (msg.get("chat") or {}).get("id")
                 if not _allowed(chat_id):
                     continue
-                reply = _dispatch(msg)
-                if reply:
-                    send(reply, reply_to=msg.get("message_id"))
+                raw = (_extract_payload(msg) or "").strip()
+                if not raw:
+                    continue
+                if raw.startswith("/"):
+                    reply = _dispatch_command(raw, msg)
+                    if reply:
+                        send(reply, reply_to=msg.get("message_id"))
+                    continue
+                _pending.append((now, msg, raw))
+
+            if _pending:
+                age = time.monotonic() - _pending[-1][0]
+                oldest = time.monotonic() - _pending[0][0]
+                if oldest > STALE_SEC and age >= DEBOUNCE_SEC:
+                    send(
+                        f"dropped {len(_pending)} stale message(s) "
+                        f"({int(oldest)}s old) — no complete JSON."
+                    )
+                    _pending.clear()
+                    global _incomplete_notified
+                    _incomplete_notified = False
+                elif age >= DEBOUNCE_SEC:
+                    _flush_pending()
         except Exception as exc:
             log.warning("listen loop: %s", exc)
             time.sleep(10)
@@ -215,4 +256,4 @@ def start_listener() -> None:
     t = threading.Thread(target=_listen, name="gap-telegram", daemon=True)
     t.start()
     _listener_started = True
-    log.info("telegram listener started")
+    log.info("telegram listener started (debounce %.1ss)", DEBOUNCE_SEC)

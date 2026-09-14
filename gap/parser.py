@@ -5,11 +5,25 @@ import json
 import re
 from typing import Any
 
+# Kalshi tape only. Do not flag oil/$107 or $5,000 dividend copy.
 PRICE_RE = re.compile(
-    r"(¢|\$\s*\d|\b\d{1,2}\s*c(?:ents)?\b|\byes\s*bid\b|\bno\s*ask\b|"
-    r"\bbid\s*[:@]|\bask\s*[:@]|\b0\.\d{2}\b|kalshi\.com)",
+    r"(¢|"
+    r"\b\d{1,2}\s*c(?:ents)?\b|"
+    r"\byes\s*bid\b|\bno\s*ask\b|"
+    r"\bbid\s*[:@]|\bask\s*[:@]|"
+    r"kalshi\.com|"
+    r"\blimit\s+\d{1,2}\b)",
     re.I,
 )
+
+
+def normalize_quotes(text: str) -> str:
+    return (
+        text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
 
 
 class ParseError(ValueError):
@@ -17,10 +31,10 @@ class ParseError(ValueError):
 
 
 def strip_fences(raw: str) -> str:
-    text = raw.strip()
+    text = normalize_quotes(raw.strip())
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
     text = re.sub(r"\s*```$", "", text)
-    # Sometimes Grok wraps JSON in commentary. Pull the outermost object.
+    # Grok wraps JSON in research commentary. Pull the outermost object.
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
