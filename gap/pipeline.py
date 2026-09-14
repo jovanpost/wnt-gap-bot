@@ -311,7 +311,7 @@ def _book_summary(saved, booked, expected) -> str:
     )
     lines = [
         f"parsed {len(saved)}/{len(expected)}",
-        f"limit = model − {C.GAP_THRESHOLD}¢ | cancel +{C.CANCEL_AFTER_MIN}m",
+        f"|gap|>{C.GAP_THRESHOLD}¢ | take {C.LIMIT_OFFSET_CENTS}¢ from mid | cancel +{C.CANCEL_AFTER_MIN}m",
         "four books, no shared size:",
     ]
     for spec in C.VARIANTS:

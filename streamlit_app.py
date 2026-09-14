@@ -165,7 +165,7 @@ with tab_live:
 with tab_four:
     st.markdown(
         "Entry for all four: **capped taker sweep**, decision at open+60, "
-        "`limit = model − 15`, cancel at send+60. "
+        f"`|gap|>{C.GAP_THRESHOLD}` then take `{C.LIMIT_OFFSET_CENTS}¢` from mid, cancel at send+60. "
         "Each variant is an independent pass over the **same fixed batch** "
         "and a **read-only** tape — no shared remaining-volume counter."
     )

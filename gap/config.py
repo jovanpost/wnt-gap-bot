@@ -47,7 +47,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.2"
+VERSION = "wnt-gap-v1.2.1"
 PROMPT_VERSION = _secret("PROMPT_VERSION", "gap-v1.0")
 HARNESS = _secret("HARNESS", "grok-web-expert")
 MODEL_LABEL = _secret("MODEL_LABEL", "grok-web-expert")
@@ -55,6 +55,9 @@ ADDENDUM = "v1.2"
 
 SERIES = _secret("SERIES", "KXWORLDNEWSMENTION")
 GAP_THRESHOLD = int(_num("GAP_THRESHOLD", 15))
+# How far we walk from the quoted mid toward the model. Not the filter.
+# Filter 15 + take 15 on a 16¢ gap leaves ~0¢ vs the tape. Default 8.
+LIMIT_OFFSET_CENTS = int(_num("LIMIT_OFFSET_CENTS", 8))
 VARIANTS = (
     {"id": "A", "notional": 1.0, "exit": "hold", "label": "A · $1 hold"},
     {"id": "B", "notional": 100.0, "exit": "hold", "label": "B · $100 hold"},
@@ -99,7 +102,7 @@ def summary() -> str:
     where = "DEMO" if USE_DEMO else "PRODUCTION"
     return (
         f"{VERSION} | {mode} | {where} | {SERIES}\n"
-        f"capped sweep | limit = model − {GAP_THRESHOLD}¢ | "
+        f"capped sweep | trade |gap|>{GAP_THRESHOLD}¢ | take {LIMIT_OFFSET_CENTS}¢ from mid | "
         f"decide open+{DECISION_LAG_MIN}m | cancel send+{CANCEL_AFTER_MIN}m\n"
         f"books A $1-hold · B $100-hold · C $1-scalp · D $100-scalp\n"
         f"NO bankroll / NO night cap / NO cluster cap — every |gap|>{GAP_THRESHOLD} word books all four\n"

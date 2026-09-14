@@ -17,17 +17,28 @@ def cluster_key(word: str, carrying_story: str | None) -> str:
     return base.strip() or word.lower()
 
 
-def yes_limit_cents(economic_side: str, model_prob: int, threshold: int | None = None) -> int:
+def yes_limit_cents(
+    economic_side: str,
+    model_prob: int,
+    mid_cents: int | None = None,
+    take: int | None = None,
+    threshold: int | None = None,
+) -> int:
     """
-    Price we send to Kalshi on the YES contract.
-
-    Buy YES:  model − 15   (82 → 67)
-    Sell YES: model + 15   (20 → 35)  == 100 − ((100 − model) − 15)
+    Walk TAKE cents from the quoted mid toward the model.
+    Never cross the model. Old 'model − 15' is gone — that spent the
+    whole filter on a minimum gap.
     """
-    thr = C.GAP_THRESHOLD if threshold is None else threshold
+    take = C.LIMIT_OFFSET_CENTS if take is None else take
+    if mid_cents is None:
+        # fallback only if we have no quote; keep a stub off the model
+        if economic_side == "YES":
+            return int(model_prob) - take
+        return int(model_prob) + take
+    mid = int(mid_cents)
     if economic_side == "YES":
-        return int(model_prob) - thr
-    return int(model_prob) + thr
+        return min(mid + take, int(model_prob) - 1)
+    return max(mid - take, int(model_prob) + 1)
 
 
 def our_price_cents(economic_side: str, yes_limit: int) -> int:
@@ -37,9 +48,9 @@ def our_price_cents(economic_side: str, yes_limit: int) -> int:
     return 100 - yes_limit
 
 
-def sweep_limit_cents(side: str, model_prob: int, threshold: int | None = None) -> int:
-    """Back-compat: economic-side limit (NO cents when side=NO)."""
-    yes_px = yes_limit_cents(side, model_prob, threshold)
+def sweep_limit_cents(side: str, model_prob: int, threshold: int | None = None,
+                     mid_cents: int | None = None) -> int:
+    yes_px = yes_limit_cents(side, model_prob, mid_cents=mid_cents, threshold=threshold)
     return our_price_cents(side, yes_px)
 
 
@@ -61,7 +72,11 @@ def decide(
     # Economic side. Kalshi only lists YES.
     side = "YES" if gap_points > 0 else "NO"
     kalshi_action = "buy_yes" if side == "YES" else "sell_yes"
-    yes_limit = yes_limit_cents(side, probability, threshold)
+    if yes_bid_cents is not None and yes_ask_cents is not None:
+        mid_cents = int(round((yes_bid_cents + yes_ask_cents) / 2.0))
+    else:
+        mid_cents = int(round(market_prob * 100.0))
+    yes_limit = yes_limit_cents(side, probability, mid_cents=mid_cents)
     our_px = our_price_cents(side, yes_limit)
     if yes_limit <= 0 or yes_limit >= 100 or our_px <= 0 or our_px >= 100:
         return None
