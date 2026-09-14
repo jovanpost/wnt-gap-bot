@@ -127,9 +127,9 @@ def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> 
     if run.get("telegram_msg_id") and run.get("status") == "awaiting_json" and not force:
         return {"ok": True, "reason": "already_sent", "run": run}
 
+    detected = run.get("market_open_at") or run.get("created_at")
     due = clock.parse_dt(run.get("decision_at"))
     if due is None:
-        detected = run.get("market_open_at") or run.get("created_at")
         due = clock.send_due_at(detected)
     if not force and due is not None and clock.now_ct() < due.astimezone(C.CT):
         return {
