@@ -161,6 +161,8 @@ def enrich_orders(orders: list[dict], quotes: dict[str, dict] | None = None) -> 
             "filled_ct": round(filled, 2),
             "unfilled_ct": round(max(0.0, intended - filled), 2),
             "fill_pct": sim.get("fill_pct"),
+            "tape_ct": sim.get("tape_ct"),
+            "book_cross_ct": sim.get("book_cross_ct"),
             "entry_yes": int(o.get("limit_price_cents") or 0),
             "yes_bid": q.get("bid"),
             "yes_ask": q.get("ask"),
@@ -221,3 +223,42 @@ def tonight(date_str: str) -> dict[str, Any]:
         "n_orders": len(rows),
         "n_words": len({r.get("word") for r in rows}),
     }
+
+
+def as_markdown(snap: dict) -> str:
+    lines = [
+        f"# WNT Gap Bot {C.VERSION} · {snap.get('date')}",
+        "",
+        f"{snap.get('n_words')} words · {snap.get('n_orders')} tickets",
+        "",
+        "## Books",
+        "",
+        "| book | tickets | filled | cost $ | mark $ | P&L $ | P&L % | W | L |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for b in snap.get("books") or []:
+        lines.append(
+            f"| {b['label']} | {b['n']} | {b['filled']} | "
+            f"{b['cost']:.2f} | {b['mark']:.2f} | {b['pnl']:+.2f} | "
+            f"{b['pct']:+.1f}% | {b['wins']} | {b['losses']} |"
+        )
+    for b in snap.get("books") or []:
+        sub = [r for r in snap.get("rows") or [] if r.get("variant_id") == b["id"]]
+        lines += ["", f"## {b['label']}", ""]
+        lines.append(
+            "| word | side | status | want | filled | left | fill % | "
+            "tape@L | book@L | entry | now | cost $ | mark $ | P&L $ | P&L % | gap |"
+        )
+        lines.append("|" + "---|" * 16)
+        for r in sub:
+            lines.append(
+                f"| {r.get('word')} | {r.get('action')} | {r.get('fill_label')} | "
+                f"{r.get('intended_ct')} | {r.get('filled_ct')} | {r.get('unfilled_ct')} | "
+                f"{r.get('fill_pct')} | {r.get('tape_ct')} | {r.get('book_cross_ct')} | "
+                f"{r.get('entry_yes')} | {r.get('now_yes')} | "
+                f"{r.get('cost_dollars')} | {r.get('mark_dollars')} | "
+                f"{r.get('pnl_dollars')} | {None if r.get('pnl_pct') is None else round(r['pnl_pct'], 1)} | "
+                f"{r.get('gap_points')} |"
+            )
+    lines += ["", "_Fills = prints at limit±1¢ plus book size at limit±1¢. Mid is mark only._", ""]
+    return "\n".join(lines)

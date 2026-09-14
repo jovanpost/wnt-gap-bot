@@ -144,10 +144,9 @@ with tab_books:
     top = st.columns([3, 1])
     with top[0]:
         st.markdown(
-            "Fills = nofade crossing book + public prints. "
-            "SELL YES @ L only counts YES bids ≥ L and trades printed at ≥ L. "
-            "Mid is mark-to-market only. Each book sees the full tape. "
-            "Unfilled dies at send+60m."
+            "Each minute: take 50% of size at the limit ±1¢ that minute "
+            "(nofade BACKTEST_FILL_RATE). Add those slices. "
+            "A 94¢ print does not fill an 82¢ rest. Mid is mark only."
         )
     with top[1]:
         if st.button("Refresh quotes", use_container_width=True):
@@ -206,7 +205,8 @@ with tab_books:
 
         show_cols = [
             "word", "action", "fill_label", "intended_ct", "filled_ct",
-            "unfilled_ct", "fill_pct", "entry_yes", "now_yes",
+            "unfilled_ct", "fill_pct", "tape_ct", "book_cross_ct",
+            "entry_yes", "now_yes",
             "cost_dollars", "mark_dollars", "pnl_dollars", "pnl_pct", "gap_points",
         ]
         labels = {
@@ -217,6 +217,8 @@ with tab_books:
             "filled_ct": "filled ct",
             "unfilled_ct": "left ct",
             "fill_pct": "fill %",
+            "tape_ct": "tape@L",
+            "book_cross_ct": "book@L",
             "entry_yes": "entry YES ¢",
             "now_yes": "now YES bid/ask/mid",
             "cost_dollars": "cost $",
@@ -254,6 +256,16 @@ with tab_books:
                     column_config=cfg,
                 )
 
+        md = board.as_markdown(snap)
+        st.download_button(
+            "Download board.md",
+            data=md,
+            file_name=f"gap-board-{date_str}.md",
+            mime="text/markdown",
+        )
+        with st.expander("Copy as Markdown", expanded=False):
+            st.caption("Select all, copy, paste back here.")
+            st.code(md, language="markdown")
         st.caption(
             f"{snap['n_words']} words · {snap['n_orders']} tickets · "
             "quotes cached 20s · Refresh quotes to force a pull"

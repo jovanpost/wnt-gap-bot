@@ -47,7 +47,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.3.0"
+VERSION = "wnt-gap-v1.3.2"
 PROMPT_VERSION = _secret("PROMPT_VERSION", "gap-v1.0")
 HARNESS = _secret("HARNESS", "grok-web-expert")
 MODEL_LABEL = _secret("MODEL_LABEL", "grok-web-expert")
@@ -70,6 +70,9 @@ CANCEL_AFTER_MIN = int(_num("CANCEL_AFTER_MIN", 60))
 MARKET_OPEN_CT = _secret("MARKET_OPEN_CT", "12:30")  # modal WNT open; API open_time wins
 STREAMLIT_APP_URL = _secret("STREAMLIT_APP_URL", "https://wnt-gap-bot.streamlit.app")
 EXECUTION_MODEL = "capped_sweep"
+# Each minute we may take this fraction of size sitting at our limit.
+# Same 50% haircut the nofade backtest uses (BACKTEST_FILL_RATE).
+FILL_TAKE_FRACTION = float(_num("FILL_TAKE_FRACTION", 0.50))
 
 CT = ZoneInfo("America/Chicago")
 POLL_START_CT = _secret("POLL_START_CT", "10:00")
