@@ -144,9 +144,10 @@ with tab_books:
     top = st.columns([3, 1])
     with top[0]:
         st.markdown(
-            "Fills walk Kalshi **1-minute candles** from the moment the ticket "
-            "was booked. Each book sees the full tape (no shared liquidity). "
-            "Unfilled size cancels at send+60m. Marks use live YES bid/ask."
+            "Fills = nofade crossing book + public prints. "
+            "SELL YES @ L only counts YES bids ≥ L and trades printed at ≥ L. "
+            "Mid is mark-to-market only. Each book sees the full tape. "
+            "Unfilled dies at send+60m."
         )
     with top[1]:
         if st.button("Refresh quotes", use_container_width=True):

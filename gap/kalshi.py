@@ -27,6 +27,15 @@ class KalshiError(RuntimeError):
         super().__init__(f"{endpoint} -> {status}: {body[:300]}")
 
 
+def _to_count(value: Any) -> float:
+    if value is None or value == "":
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _to_cents(value: Any) -> int | None:
     if value is None or value == "":
         return None
@@ -181,6 +190,30 @@ class KalshiClient:
     def get_market(self, ticker: str) -> dict:
         return (self.request("GET", f"/markets/{ticker}", auth=False) or {}).get("market", {})
 
+    def get_orderbook(self, ticker: str, depth: int = 10) -> dict:
+        raw = self.request(
+            "GET", f"/markets/{ticker}/orderbook",
+            params={"depth": depth}, auth=False,
+        ) or {}
+        book = raw.get("orderbook_fp") or raw.get("orderbook") or {}
+        out: dict[str, list[tuple[int, float]]] = {"yes": [], "no": []}
+        for side in ("yes", "no"):
+            levels = book.get(f"{side}_dollars")
+            if levels is None:
+                levels = book.get(side)
+            parsed = []
+            for level in levels or []:
+                try:
+                    cents = _to_cents(level[0])
+                    count = _to_count(level[1])
+                except (IndexError, TypeError):
+                    continue
+                if cents is not None:
+                    parsed.append((cents, count))
+            parsed.sort(key=lambda x: x[0])
+            out[side] = parsed
+        return out
+
     def get_market_candlesticks(
         self,
         ticker: str,
@@ -300,6 +333,24 @@ def market_yes_quotes(market: dict) -> tuple[int | None, int | None]:
             ask = _to_cents(market.get(key))
             break
     return bid, ask
+
+
+def book_metrics(book: dict, yes_limit: int) -> dict:
+    """Nofade crossing math, parameterized by our YES limit.
+
+    SELL YES @ L fills against YES bids at >= L.
+    BUY YES @ L fills against YES asks <= L, which are NO bids at >= 100-L.
+    """
+    yes = book.get("yes") or []
+    no = book.get("no") or []
+    return {
+        "best_yes_bid": yes[-1][0] if yes else None,
+        "best_no_bid": no[-1][0] if no else None,
+        "yes_size_total": sum(c for _, c in yes),
+        "no_size_total": sum(c for _, c in no),
+        "yes_size_that_would_fill_sell": sum(c for p, c in yes if p >= yes_limit),
+        "yes_size_that_would_fill_buy": sum(c for p, c in no if p >= (100 - yes_limit)),
+    }
 
 
 def market_mid_prob(bid_cents: int | None, ask_cents: int | None) -> float | None:

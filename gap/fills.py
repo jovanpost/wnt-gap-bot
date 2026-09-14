@@ -1,13 +1,18 @@
-"""Paper fills from Kalshi 1-minute candles. Independent books, full tape each."""
+"""Paper fills the nofade way: orderbook crossing size + public trades.
+
+Not mid. Not candle range. A SELL YES @ L only eats:
+  1) YES bids sitting at >= L on the live book (would lift us right now)
+  2) public prints at YES >= L since the ticket was booked
+Each book sees the full tape. Unfilled size dies at cancel+60m.
+"""
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from . import clock, config as C, store
-from .kalshi import KalshiClient, _to_cents
-from .backtest import Bar, _bar_fill_yes_buy, _bar_fill_no_buy
+from . import config as C, store
+from .kalshi import KalshiClient, _to_cents, _to_count, book_metrics
 
 log = logging.getLogger("gap.fills")
 
@@ -23,98 +28,57 @@ def _as_dt(raw) -> datetime | None:
         return None
 
 
-def _ohlc_cents(blob: dict, key: str) -> tuple[int | None, int | None, int | None, int | None]:
-    part = blob.get(key) or {}
-    if not isinstance(part, dict):
-        return None, None, None, None
-
-    def grab(*names: str) -> int | None:
-        for n in names:
-            if part.get(n) is not None:
-                return _to_cents(part[n])
-        return None
-
-    return (
-        grab("open_dollars", "open", "open_cents"),
-        grab("high_dollars", "high", "high_cents"),
-        grab("low_dollars", "low", "low_cents"),
-        grab("close_dollars", "close", "close_cents"),
-    )
+def _trade_yes_px(tr: dict) -> int | None:
+    for k in ("yes_price_dollars", "yes_price", "yes_price_cents", "price"):
+        if tr.get(k) is not None:
+            return _to_cents(tr[k])
+    return None
 
 
-def _volume(blob: dict) -> float:
-    for k in ("volume", "volume_fp", "volume_count"):
-        if blob.get(k) is not None:
-            try:
-                return float(blob[k])
-            except (TypeError, ValueError):
-                continue
+def _trade_count(tr: dict) -> float:
+    for k in ("count_fp", "count", "contracts"):
+        if tr.get(k) is not None:
+            return _to_count(tr[k])
     return 0.0
 
 
-def candle_to_bar(ticker: str, raw: dict) -> Bar | None:
-    ts_raw = raw.get("end_period_ts") or raw.get("end_ts") or raw.get("period_end")
-    try:
-        ts = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
-    except Exception:
-        return None
-    _o, high, low, close = _ohlc_cents(raw, "price")
-    if close is None:
-        _o2, high2, low2, close = _ohlc_cents(raw, "yes_bid")
-        high = high or high2
-        low = low or low2
-    if close is None:
-        return None
-    high = high if high is not None else close
-    low = low if low is not None else close
-    return Bar(
-        ts=ts,
-        ticker=ticker,
-        yes_high=int(high),
-        yes_low=int(low),
-        yes_close=int(close),
-        volume=_volume(raw),
-    )
+def _trade_ts(tr: dict) -> datetime | None:
+    return _as_dt(tr.get("created_time") or tr.get("created_ts") or tr.get("ts"))
 
 
-def load_bars(
-    tickers: list[str],
-    start: datetime,
-    end: datetime,
-    event_ticker: str | None = None,
-    client: KalshiClient | None = None,
-) -> dict[str, list[Bar]]:
-    client = client or KalshiClient()
-    start_ts = int(start.timestamp()) - 60
-    end_ts = int(end.timestamp()) + 60
-    grouped: dict[str, list[dict]] = {}
-    if event_ticker:
-        try:
-            grouped = client.get_event_candlesticks(event_ticker, start_ts, end_ts, 1)
-        except Exception as exc:
-            log.warning("event candles: %s", exc)
-            grouped = {}
-    out: dict[str, list[Bar]] = {t: [] for t in tickers}
-    for ticker in tickers:
-        raws = grouped.get(ticker) or []
-        if not raws:
-            try:
-                raws = client.get_market_candlesticks(ticker, start_ts, end_ts, 1)
-            except Exception as exc:
-                log.warning("candles %s: %s", ticker, exc)
-                raws = []
-        bars = []
-        for raw in raws:
-            bar = candle_to_bar(ticker, raw)
-            if bar:
-                bars.append(bar)
-        bars.sort(key=lambda b: b.ts)
-        out[ticker] = bars
-    return out
+def tape_contracts(trades: list[dict], side: str, yes_limit: int, start: datetime) -> float:
+    total = 0.0
+    for tr in trades:
+        ts = _trade_ts(tr)
+        if ts and ts < start:
+            continue
+        px = _trade_yes_px(tr)
+        if px is None:
+            continue
+        if side == "YES" and px > yes_limit:
+            continue
+        if side != "YES" and px < yes_limit:
+            continue
+        total += _trade_count(tr)
+    return total
 
 
-def simulate_order(order: dict, bars: list[Bar], now: datetime | None = None) -> dict[str, Any]:
-    """Walk 1-minute tape from placed_at until cancel window. Independent of other books."""
+def book_available(book: dict, side: str, yes_limit: int) -> tuple[float, int | None]:
+    metrics = book_metrics(book, yes_limit)
+    if side == "YES":
+        avail = float(metrics.get("yes_size_that_would_fill_buy") or 0)
+    else:
+        avail = float(metrics.get("yes_size_that_would_fill_sell") or 0)
+    best_yes = metrics.get("best_yes_bid")
+    return avail, (int(best_yes) if best_yes is not None else None)
+
+
+def simulate_order(
+    order: dict,
+    book: dict | None,
+    trades: list[dict],
+    now: datetime | None = None,
+) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     intended = float(order.get("contracts") or 0)
     side = order.get("side") or "NO"
@@ -123,44 +87,21 @@ def simulate_order(order: dict, bars: list[Bar], now: datetime | None = None) ->
     start = _as_dt(order.get("placed_at")) or now
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
-    deadline = start.timestamp() + C.CANCEL_AFTER_MIN * 60
-    deadline_dt = datetime.fromtimestamp(deadline, tz=timezone.utc)
+    deadline = datetime.fromtimestamp(
+        start.timestamp() + C.CANCEL_AFTER_MIN * 60, tz=timezone.utc
+    )
+    window_closed = now >= deadline
 
-    remaining = intended
-    filled = 0.0
-    paid = 0.0
-    last_ts = None
-    if not bars:
-        return {
-            "intended_ct": round(intended, 2),
-            "filled_ct": None,
-            "unfilled_ct": None,
-            "fill_pct": None,
-            "avg_fill_cents": None,
-            "filled_cost_cents": None,
-            "fill_status": "no 1-min tape yet",
-            "window_closed": False,
-            "bars_used": 0,
-            "last_bar": None,
-        }
-    for bar in bars:
-        if bar.ts < start:
-            continue
-        if bar.ts.timestamp() > deadline and remaining > 0:
-            break
-        if remaining <= 0:
-            break
-        if side == "YES":
-            take, cost = _bar_fill_yes_buy(bar, yes_limit, remaining)
-        else:
-            take, cost = _bar_fill_no_buy(bar, our_px, remaining)
-        filled += take
-        paid += cost
-        remaining -= take
-        last_ts = bar.ts
+    printed = tape_contracts(trades, side, yes_limit, start)
+    book_sz, best_yes = book_available(book or {}, side, yes_limit)
+    available = max(printed, book_sz)
+    if window_closed:
+        available = printed
 
+    filled = min(intended, available)
+    remaining = max(0.0, intended - filled)
     fill_pct = (filled / intended * 100.0) if intended else 0.0
-    window_closed = now >= deadline_dt
+
     if filled <= 0 and window_closed:
         status = "unfilled"
     elif filled + 1e-6 >= intended:
@@ -170,38 +111,60 @@ def simulate_order(order: dict, bars: list[Bar], now: datetime | None = None) ->
     else:
         status = "partial · working"
 
-    avg = int(round(paid / filled)) if filled else None
-    cost_cents = int(round(filled * (avg if avg is not None else our_px))) if filled else 0
+    if side != "YES" and best_yes is not None and best_yes >= yes_limit:
+        avg_yes = min(max(yes_limit, best_yes), 99)
+        avg_our = max(1, 100 - avg_yes)
+    else:
+        avg_our = our_px
+
     return {
         "intended_ct": round(intended, 2),
         "filled_ct": round(filled, 2),
-        "unfilled_ct": round(max(0.0, intended - filled), 2),
+        "unfilled_ct": round(remaining, 2),
         "fill_pct": round(fill_pct, 1),
-        "avg_fill_cents": avg,
-        "filled_cost_cents": cost_cents,
+        "avg_fill_cents": avg_our,
+        "filled_cost_cents": int(round(filled * avg_our)),
         "fill_status": status,
         "window_closed": window_closed,
-        "bars_used": len(bars),
-        "last_bar": last_ts.isoformat() if last_ts else None,
+        "book_cross_ct": round(book_sz, 2),
+        "tape_ct": round(printed, 2),
+        "best_yes_bid": best_yes,
+        "bars_used": len(trades),
+        "last_bar": None,
     }
 
 
-def apply_to_orders(orders: list[dict], event_ticker: str | None = None) -> dict[str, list[Bar]]:
-    """Recompute fills from candles and persist filled_contracts."""
+def apply_to_orders(orders: list[dict], event_ticker: str | None = None) -> dict:
     if not orders:
         return {}
+    client = KalshiClient()
     tickers = sorted({o["market_ticker"] for o in orders if o.get("market_ticker")})
     starts = [_as_dt(o.get("placed_at")) for o in orders]
     starts = [s for s in starts if s]
-    start = min(starts) if starts else datetime.now(timezone.utc)
-    now = datetime.now(timezone.utc)
-    bars_by = load_bars(tickers, start, now, event_ticker=event_ticker)
+    min_start = min(starts) if starts else datetime.now(timezone.utc)
+    min_ts = int(min_start.timestamp()) - 30
+
+    books: dict[str, dict] = {}
+    trades: dict[str, list] = {}
+    for ticker in tickers:
+        try:
+            books[ticker] = client.get_orderbook(ticker, depth=10)
+        except Exception as exc:
+            log.warning("orderbook %s: %s", ticker, exc)
+            books[ticker] = {"yes": [], "no": []}
+        try:
+            trades[ticker] = client.get_trades(ticker, min_ts=min_ts)
+        except Exception as exc:
+            log.warning("trades %s: %s", ticker, exc)
+            trades[ticker] = []
+
     for o in orders:
-        sim = simulate_order(o, bars_by.get(o.get("market_ticker") or "", []))
+        ticker = o.get("market_ticker") or ""
+        sim = simulate_order(o, books.get(ticker), trades.get(ticker) or [])
         o["_fill"] = sim
         try:
             if sim.get("filled_ct") is not None:
                 store.update_order(o["id"], filled_contracts=sim["filled_ct"])
         except Exception:
             log.exception("persist fill %s", o.get("id"))
-    return bars_by
+    return {"books": books, "trades": {k: len(v) for k, v in trades.items()}}
