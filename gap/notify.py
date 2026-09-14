@@ -15,7 +15,7 @@ log = logging.getLogger("gap.notify")
 API = "https://api.telegram.org"
 
 # After the last inbound message, wait this long with no new parts, then stitch.
-DEBOUNCE_SEC = 1.0
+DEBOUNCE_SEC = 2.5
 STALE_SEC = 180.0
 
 _handlers: dict[str, Callable[[list[str], dict], str]] = {}
@@ -132,9 +132,15 @@ def _dispatch_command(raw: str, msg: dict) -> str | None:
         names = ", ".join(f"/{n}" for n in sorted(_handlers))
         return (
             f"gap bot commands: {names}\n"
-            "Paste Grok's answer (splits are fine). "
-            "After 1s of silence I stitch, pull the JSON, and book."
+            "/gap_clear drops a half-pasted JSON buffer.\n"
+            "Paste Grok's full answer. Telegram splits are repaired."
         )
+    if cmd == "gap_clear":
+        n = len(_pending)
+        _pending.clear()
+        global _incomplete_notified
+        _incomplete_notified = False
+        return f"cleared {n} buffered message(s). paste Grok's answer again."
     handler = _handlers.get(cmd)
     if handler:
         try:
@@ -152,21 +158,33 @@ def _flush_pending() -> None:
         return
 
     parts = list(_pending)
-    blob = "\n".join(p[2] for p in parts if p[2])
+    raw_parts = [p[2] for p in parts if p[2]]
     last_msg = parts[-1][1]
     n = len(parts)
 
     from . import parser
 
-    extracted = parser.strip_fences(blob)
-    try:
-        parser.load_json(extracted)
-    except Exception as exc:
-        # Keep the buffer so the next chunk can finish the object.
+    # Try empty-join first (true Telegram 4096 split), then newline-join
+    # (client wrap), then each individually in case one message is complete.
+    blobs = [
+        "".join(raw_parts),
+        "\n".join(raw_parts),
+    ]
+    extracted = None
+    last_exc: Exception | None = None
+    for blob in blobs:
+        try:
+            parser.load_json(blob)
+            extracted = blob
+            break
+        except Exception as exc:
+            last_exc = exc
+
+    if extracted is None:
         if not _incomplete_notified:
             send(
-                f"got {n} message(s), {len(blob)} chars — JSON not complete yet "
-                f"({exc}). send the rest, or attach one .txt."
+                f"got {n} message(s), {sum(len(p) for p in raw_parts)} chars — "
+                f"still assembling ({last_exc}). send the rest."
             )
             _incomplete_notified = True
         return
@@ -229,6 +247,11 @@ def _listen() -> None:
                     if reply:
                         send(reply, reply_to=msg.get("message_id"))
                     continue
+                # A file is the whole payload. Drop leftover chat fragments.
+                if msg.get("document"):
+                    _pending.clear()
+                    global _incomplete_notified
+                    _incomplete_notified = False
                 _pending.append((now, msg, raw))
 
             if _pending:
