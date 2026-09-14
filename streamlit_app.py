@@ -30,7 +30,7 @@ def boot():
                 pipeline.poll_once()
             except Exception:
                 logging.getLogger("gap.poll").exception("poll_once")
-            time.sleep(60)
+            time.sleep(5)
 
     t = threading.Thread(target=_poll_loop, name="gap-poll", daemon=True)
     t.start()
@@ -144,9 +144,10 @@ with tab_books:
     top = st.columns([3, 1])
     with top[0]:
         st.markdown(
-            "Each minute: take 50% of size at the limit ±1¢ that minute "
-            "(nofade BACKTEST_FILL_RATE). Add those slices. "
-            "A 94¢ print does not fill an 82¢ rest. Mid is mark only."
+            "Paper dry poll (nofade): every 5s, if the **current book** has "
+            "YES bids at/through your Sell-YES limit, take "
+            "`min(remaining, that size)`. No last price. No volume. "
+            "Leftover stays resting until send+60m."
         )
     with top[1]:
         if st.button("Refresh quotes", use_container_width=True):
