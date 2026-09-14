@@ -85,13 +85,19 @@ def track_tape(client: KalshiClient | None = None) -> dict:
     run = store.get_run_for_date(date_str)
     if not run:
         return {"ok": True, "reason": "no_run"}
+    all_orders = store.orders_for_run(run["id"])
+    try:
+        from . import fills
+        fills.apply_to_orders(all_orders, event_ticker=run.get("event_ticker"))
+    except Exception:
+        log.exception("apply fills")
     orders = [
-        o for o in store.orders_for_run(run["id"])
+        o for o in all_orders
         if (o.get("exit_rule") == "scalp"
             and o.get("status") in ("paper_sweep", "paper_booked"))
     ]
     if not orders:
-        return {"ok": True, "reason": "no_open_scalp"}
+        return {"ok": True, "reason": "fills_only"}
 
     client = client or KalshiClient()
     forecasts = store.forecasts_for_run(run["id"])

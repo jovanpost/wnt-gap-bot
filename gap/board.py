@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from . import config as C, fees, store
+from . import config as C, fees, fills, store
 from .kalshi import KalshiClient, market_result, market_yes_quotes, market_mid_prob
 
 log = logging.getLogger("gap.board")
@@ -21,20 +21,18 @@ def _our_entry(order: dict) -> int:
 
 
 def _filled(order: dict) -> float:
-    status = str(order.get("status") or "")
-    if status in ("cancelled", "canceled", "rejected", "void"):
-        return float(order.get("filled_contracts") or 0)
-    filled = order.get("filled_contracts")
-    if filled not in (None, 0, 0.0):
-        return float(filled)
-    # Paper Phase 1: full at limit. Label that in the UI.
-    if status in OPEN or status in CLOSED:
-        return float(order.get("contracts") or 0)
+    sim = order.get("_fill") or {}
+    if sim.get("filled_ct") is not None:
+        return float(sim["filled_ct"])
+    stored = order.get("filled_contracts")
+    if stored not in (None,):
+        return float(stored or 0)
     return 0.0
 
 
 def _status_label(order: dict, result: str | None) -> str:
     status = str(order.get("status") or "")
+    sim = order.get("_fill") or {}
     if status == "scalp_hit":
         return "closed · scalp hit"
     if status == "scalp_miss":
@@ -43,9 +41,16 @@ def _status_label(order: dict, result: str | None) -> str:
         return f"settled · {result or order.get('result') or '?'}"
     if status in ("void", "cancelled", "canceled"):
         return status
+    fill = sim.get("fill_status")
+    pct = sim.get("fill_pct")
+    if fill:
+        extra = f" · {pct:.0f}%" if pct is not None else ""
+        if result in ("yes", "no"):
+            return f"{fill}{extra} · settle {result}"
+        return f"{fill}{extra}"
     if result in ("yes", "no"):
-        return f"filled · awaiting settle ({result})"
-    return "filled · paper (full at limit)"
+        return f"working · settle {result}"
+    return "working · quoting tape"
 
 
 def _mark_yes(bid, ask, mid) -> int | None:
@@ -120,7 +125,14 @@ def enrich_orders(orders: list[dict], quotes: dict[str, dict] | None = None) -> 
         q = quotes.get(o.get("market_ticker") or "", {})
         mark_yes = _mark_yes(q.get("bid"), q.get("ask"), q.get("mid"))
         filled = _filled(o)
-        cost = int(o.get("cost_cents") or 0)
+        sim = o.get("_fill") or {}
+        intended = float(sim.get("intended_ct") or o.get("contracts") or 0)
+        if filled <= 0:
+            cost = 0
+        elif sim.get("filled_cost_cents"):
+            cost = int(sim["filled_cost_cents"])
+        else:
+            cost = int(o.get("cost_cents") or 0)
         realized = o.get("realized_pnl_cents")
         sett = settlements.get(int(o["id"])) if o.get("id") is not None else None
         if realized is None and sett:
@@ -145,7 +157,10 @@ def enrich_orders(orders: list[dict], quotes: dict[str, dict] | None = None) -> 
             **o,
             "action": action,
             "fill_label": _status_label(o, q.get("result")),
+            "intended_ct": round(intended, 2),
             "filled_ct": round(filled, 2),
+            "unfilled_ct": round(max(0.0, intended - filled), 2),
+            "fill_pct": sim.get("fill_pct"),
             "entry_yes": int(o.get("limit_price_cents") or 0),
             "yes_bid": q.get("bid"),
             "yes_ask": q.get("ask"),
@@ -193,6 +208,11 @@ def summarize(rows: list[dict]) -> list[dict]:
 
 def tonight(date_str: str) -> dict[str, Any]:
     orders = store.orders_for_date(date_str)
+    run = store.get_run_for_date(date_str)
+    try:
+        fills.apply_to_orders(orders, event_ticker=(run or {}).get("event_ticker"))
+    except Exception:
+        log.exception("apply fills")
     rows = enrich_orders(orders)
     return {
         "date": date_str,

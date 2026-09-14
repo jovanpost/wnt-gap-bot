@@ -144,11 +144,9 @@ with tab_books:
     top = st.columns([3, 1])
     with top[0]:
         st.markdown(
-            "Live Kalshi YES bid/ask vs paper entry. "
-            "Phase-1 paper **assumes a full fill at the limit** "
-            "(same SIZE_UNTESTED tag as the tape). "
-            "Hold books mark to mid until official settlement. "
-            "Scalp books mark to mid until a tape hit or last-mid flatten."
+            "Fills walk Kalshi **1-minute candles** from the moment the ticket "
+            "was booked. Each book sees the full tape (no shared liquidity). "
+            "Unfilled size cancels at send+60m. Marks use live YES bid/ask."
         )
     with top[1]:
         if st.button("Refresh quotes", use_container_width=True):
@@ -206,15 +204,18 @@ with tab_books:
         )
 
         show_cols = [
-            "word", "action", "fill_label", "filled_ct",
-            "entry_yes", "now_yes", "cost_dollars", "mark_dollars",
-            "pnl_dollars", "pnl_pct", "gap_points",
+            "word", "action", "fill_label", "intended_ct", "filled_ct",
+            "unfilled_ct", "fill_pct", "entry_yes", "now_yes",
+            "cost_dollars", "mark_dollars", "pnl_dollars", "pnl_pct", "gap_points",
         ]
         labels = {
             "word": "word",
             "action": "Kalshi",
             "fill_label": "status",
+            "intended_ct": "want ct",
             "filled_ct": "filled ct",
+            "unfilled_ct": "left ct",
+            "fill_pct": "fill %",
             "entry_yes": "entry YES ¢",
             "now_yes": "now YES bid/ask/mid",
             "cost_dollars": "cost $",
@@ -228,6 +229,7 @@ with tab_books:
             "mark $": st.column_config.NumberColumn(format="$%.2f"),
             "P&L $": st.column_config.NumberColumn(format="$%+.2f"),
             "P&L %": st.column_config.NumberColumn(format="%+.1f%%"),
+            "fill %": st.column_config.NumberColumn(format="%.0f%%"),
             "gap ¢": st.column_config.NumberColumn(format="%+.1f"),
             "entry YES ¢": st.column_config.NumberColumn(format="%d"),
         }

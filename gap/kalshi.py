@@ -181,6 +181,66 @@ class KalshiClient:
     def get_market(self, ticker: str) -> dict:
         return (self.request("GET", f"/markets/{ticker}", auth=False) or {}).get("market", {})
 
+    def get_market_candlesticks(
+        self,
+        ticker: str,
+        start_ts: int,
+        end_ts: int,
+        period: int = 1,
+        series_ticker: str | None = None,
+    ) -> list[dict]:
+        series = series_ticker or C.SERIES
+        data = self.request(
+            "GET",
+            f"/series/{series}/markets/{ticker}/candlesticks",
+            params={
+                "start_ts": int(start_ts),
+                "end_ts": int(end_ts),
+                "period_interval": int(period),
+            },
+            auth=False,
+        )
+        return data.get("candlesticks") or []
+
+    def get_event_candlesticks(
+        self,
+        event_ticker: str,
+        start_ts: int,
+        end_ts: int,
+        period: int = 1,
+        series_ticker: str | None = None,
+    ) -> dict[str, list[dict]]:
+        series = series_ticker or C.SERIES
+        data = self.request(
+            "GET",
+            f"/series/{series}/events/{event_ticker}/candlesticks",
+            params={
+                "start_ts": int(start_ts),
+                "end_ts": int(end_ts),
+                "period_interval": int(period),
+            },
+            auth=False,
+        )
+        tickers = data.get("market_tickers") or []
+        groups = data.get("market_candlesticks") or []
+        out: dict[str, list[dict]] = {}
+        for i, ticker in enumerate(tickers):
+            out[ticker] = groups[i] if i < len(groups) else []
+        if out:
+            return out
+        # Some payloads nest ticker on each candle group.
+        if isinstance(groups, list) and groups and isinstance(groups[0], dict):
+            if "ticker" in groups[0]:
+                for g in groups:
+                    out[str(g.get("ticker"))] = g.get("candlesticks") or []
+        return out
+
+    def get_trades(self, ticker: str, min_ts: int | None = None, limit: int = 1000) -> list[dict]:
+        params: dict[str, Any] = {"ticker": ticker, "limit": limit}
+        if min_ts:
+            params["min_ts"] = int(min_ts)
+        return self.paginate("/markets/trades", "trades", params, auth=False, max_pages=5)
+
 
 def _parse_ts(raw) -> datetime | None:
     if raw is None or raw == "":
