@@ -117,6 +117,48 @@ def model_yes(order: dict, forecasts: list[dict]) -> int | None:
     return int(round(entry + C.LIMIT_OFFSET_CENTS + float(gap)))
 
 
+
+def load_gh_tape(event_ticker: str, start: datetime, end: datetime) -> dict[str, list[tuple[datetime, int | None, int | None]]]:
+    """ticker -> [(ts, ask_low, bid_high)] 1-min. Used only for G $1 through-check."""
+    client = KalshiClient()
+    try:
+        data = client.get_event_candlesticks(
+            event_ticker, int(start.timestamp()) - 60, int(end.timestamp()) + 60, 1
+        )
+    except Exception as exc:
+        log.warning("gh candles: %s", exc)
+        return {}
+    out: dict[str, list] = {}
+    items = data.items() if isinstance(data, dict) else []
+    for ticker, bars in items:
+        rows = []
+        for raw in bars or []:
+            ts_raw = raw.get("end_period_ts") or raw.get("end_ts")
+            try:
+                ts = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
+            except Exception:
+                continue
+            ask = raw.get("yes_ask") or {}
+            bid = raw.get("yes_bid") or {}
+            ask_lo = _cents(ask.get("low_dollars") or ask.get("low"))
+            bid_hi = _cents(bid.get("high_dollars") or bid.get("high"))
+            rows.append((ts, ask_lo, bid_hi))
+        rows.sort(key=lambda r: r[0])
+        out[str(ticker)] = rows
+    return out
+
+
+def gh_through(side: str, yes_limit: int, tape: list, deadline: datetime) -> bool:
+    for ts, ask_lo, bid_hi in tape:
+        if ts > deadline:
+            continue
+        if side == "YES" and ask_lo is not None and ask_lo <= yes_limit:
+            return True
+        if side != "YES" and bid_hi is not None and bid_hi >= yes_limit:
+            return True
+    return False
+
+
 def load_ask_tape(event_ticker: str, start: datetime, end: datetime) -> dict[str, list[tuple[datetime, int, int]]]:
     """ticker -> [(ts, ask_low, ask_close), ...]"""
     client = KalshiClient()
@@ -193,7 +235,7 @@ def score_date(date_str: str, event_ticker: str | None = None) -> dict[str, Any]
     start = min(starts) if starts else datetime.now(timezone.utc)
     end = datetime.now(timezone.utc)
     tape_by = load_ask_tape(event_ticker, start, end) if event_ticker else {}
-    extra_early = ensure_eh_books(date_str, run, forecasts, {}, {})
+    extra_early = ensure_eh_books(date_str, run, forecasts, tape_by, {})
     log.info("ensure early %s", extra_early)
     orders = store.orders_for_date(date_str)
 
@@ -278,7 +320,7 @@ def score_date(date_str: str, event_ticker: str | None = None) -> dict[str, Any]
             })
             n_hold += 1
     extra = ensure_eh_books(date_str, run, forecasts, tape_by, outcomes)
-    store.set_state(f"scored_{date_str}", "v1.4.4")
+    store.set_state(f"scored_{date_str}", "v1.4.5")
     store.log_activity("score", f"{date_str} hold={n_hold} scalp={n_scalp} zero={n_zero} extra={extra}")
     return {"ok": True, "hold": n_hold, "scalp": n_scalp, "zero": n_zero, "extra": extra}
 
@@ -399,8 +441,18 @@ def ensure_eh_books(date_str, run, forecasts, tape_by, outcomes):
             if not strategy.fade_gate_ok(p, o.get("side")):
                 filled = 0.0
         else:
-            # No honest G/H fill tape before 5:29 CT. Leave 0.
             filled = 0.0
+            if vid == "G" and date_str:
+                from datetime import date, time
+                raw = str(date_str)[:10]
+                y, m, d = [int(x) for x in raw.split("-")]
+                start = datetime.combine(date(y, m, d), time(12, 30), tzinfo=C.CT).astimezone(timezone.utc)
+                deadline = datetime.combine(date(y, m, d), time(17, 29), tzinfo=C.CT).astimezone(timezone.utc)
+                ev = run.get("event_ticker") if run else None
+                tape_map = load_gh_tape(ev, start, deadline) if ev else {}
+                tape = tape_map.get(o.get("market_ticker") or "") or []
+                if gh_through(o.get("side") or "NO", int(o.get("limit_price_cents") or 0), tape, deadline):
+                    filled = intended
         outcome = outcomes.get(o.get("market_ticker") or "")
         if filled <= 0:
             store.update_order(o["id"], filled_contracts=0, status="unfilled", realized_pnl_cents=0, result=outcome)
