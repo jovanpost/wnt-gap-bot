@@ -460,40 +460,19 @@ def update_order(order_id: int, **fields: Any) -> None:
 
 def upsert_settlement(row: dict) -> None:
     with engine().begin() as conn:
-        if using_postgres():
-            conn.execute(
-                text("""
-                    insert into gap_settlements (
-                        forecast_id, order_id, settled_at, outcome,
-                        gross_cents, fees_cents, net_cents, fill_model
-                    ) values (
-                        :forecast_id, :order_id, :settled_at, :outcome,
-                        :gross_cents, :fees_cents, :net_cents, :fill_model
-                    )
-                    on conflict (order_id) do update set
-                        settled_at = excluded.settled_at,
-                        outcome = excluded.outcome,
-                        gross_cents = excluded.gross_cents,
-                        fees_cents = excluded.fees_cents,
-                        net_cents = excluded.net_cents,
-                        fill_model = excluded.fill_model
-                """),
-                row,
-            )
-        else:
-            conn.execute(
-                text("delete from gap_settlements where order_id = :order_id"),
-                {"order_id": row["order_id"]},
-            )
-            conn.execute(
-                text("""
-                    insert into gap_settlements (
-                        forecast_id, order_id, settled_at, outcome,
-                        gross_cents, fees_cents, net_cents, fill_model
-                    ) values (
-                        :forecast_id, :order_id, :settled_at, :outcome,
-                        :gross_cents, :fees_cents, :net_cents, :fill_model
-                    )
-                """),
-                row,
-            )
+        conn.execute(
+            text("delete from gap_settlements where order_id = :order_id"),
+            {"order_id": row["order_id"]},
+        )
+        conn.execute(
+            text("""
+                insert into gap_settlements (
+                    forecast_id, order_id, settled_at, outcome,
+                    gross_cents, fees_cents, net_cents, fill_model
+                ) values (
+                    :forecast_id, :order_id, :settled_at, :outcome,
+                    :gross_cents, :fees_cents, :net_cents, :fill_model
+                )
+            """),
+            row,
+        )

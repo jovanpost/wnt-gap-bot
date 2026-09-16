@@ -15,6 +15,13 @@ from .kalshi import KalshiClient, market_result
 
 log = logging.getLogger("gap.score")
 
+def _settle_row(row: dict) -> None:
+    try:
+        _settle_row(row)
+    except Exception:
+        log.exception("settlement write skipped")
+
+
 # Honest dry-book snapshot from the 2026-09-15 13:54 CT board,
 # before settle.py wrote intended size into filled_contracts.
 FREEZE_2026_09_15 = {
@@ -183,6 +190,9 @@ def score_date(date_str: str, event_ticker: str | None = None) -> dict[str, Any]
     start = min(starts) if starts else datetime.now(timezone.utc)
     end = datetime.now(timezone.utc)
     tape_by = load_ask_tape(event_ticker, start, end) if event_ticker else {}
+    extra_early = ensure_eh_books(date_str, run, forecasts, {}, {})
+    log.info("ensure early %s", extra_early)
+    orders = store.orders_for_date(date_str)
 
     client = KalshiClient()
     outcomes: dict[str, str | None] = {}
@@ -232,7 +242,7 @@ def score_date(date_str: str, event_ticker: str | None = None) -> dict[str, Any]
                 fees_cents=fees.fee_cents(filled, int(o["limit_price_cents"]))
                 + fees.fee_cents(filled, exit_yes),
             )
-            store.upsert_settlement({
+            _settle_row({
                 "forecast_id": o.get("forecast_id"),
                 "order_id": o["id"],
                 "settled_at": datetime.now(timezone.utc),
@@ -253,7 +263,7 @@ def score_date(date_str: str, event_ticker: str | None = None) -> dict[str, Any]
                 result=outcome,
                 realized_pnl_cents=net,
             )
-            store.upsert_settlement({
+            _settle_row({
                 "forecast_id": o.get("forecast_id"),
                 "order_id": o["id"],
                 "settled_at": datetime.now(timezone.utc),
@@ -398,7 +408,7 @@ def ensure_eh_books(date_str, run, forecasts, tape_by, outcomes):
             continue
         net = hold_pnl(o, filled, outcome or "no")
         store.update_order(o["id"], filled_contracts=round(filled, 4), status="settled", result=outcome, realized_pnl_cents=net)
-        store.upsert_settlement({
+        _settle_row({
             "forecast_id": o.get("forecast_id"),
             "order_id": o["id"],
             "settled_at": datetime.now(timezone.utc),
