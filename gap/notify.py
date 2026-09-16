@@ -152,7 +152,7 @@ def _dispatch_command(raw: str, msg: dict) -> str | None:
 
 
 def _flush_pending() -> None:
-    """Silence, then join every part, extract the JSON object, book."""
+    """1s of silence: join every part, extract the JSON object, book."""
     global _incomplete_notified
     if not _pending or _json_handler is None:
         return
@@ -164,6 +164,8 @@ def _flush_pending() -> None:
 
     from . import parser
 
+    # Try empty-join first (true Telegram 4096 split), then newline-join
+    # (client wrap), then each individually in case one message is complete.
     blobs = [
         "".join(raw_parts),
         "\n".join(raw_parts),
@@ -218,6 +220,9 @@ def _listen() -> None:
         except (TypeError, ValueError):
             offset = 0
 
+    # Resume from saved offset only. Never drain with offset=-1 —
+    # that deleted inbound Grok JSON on every Streamlit reboot.
+
     while True:
         try:
             long_poll = 1 if _pending else 50
@@ -243,6 +248,7 @@ def _listen() -> None:
                     if reply:
                         send(reply, reply_to=msg.get("message_id"))
                     continue
+                # A file is the whole payload. Drop leftover chat fragments.
                 if msg.get("document"):
                     _pending.clear()
                     _incomplete_notified = False

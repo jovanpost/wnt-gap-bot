@@ -114,3 +114,46 @@ def decide(
 def apply_caps(candidates: list[dict], **_kwargs) -> list[dict]:
     """No caps. Every gap that passed decide() is booked on that book."""
     return list(candidates)
+
+
+def grok_prefers(probability: int) -> str | None:
+    """Side Grok puts at >= 50.01. Integer forecasts: YES if p>=51, NO if p<=49."""
+    p = int(probability)
+    if p >= 51:
+        return "YES"
+    if p <= 49:
+        return "NO"
+    return None
+
+
+def fade_gate_ok(probability: int, side: str) -> bool:
+    pref = grok_prefers(probability)
+    return pref is not None and pref == side
+
+
+def grok10_limit(probability: int) -> dict | None:
+    """One rest: 10¢ cheap to Grok on Grok's side. YES@p-10 or NO@(100-p)-10."""
+    pref = grok_prefers(probability)
+    if pref is None:
+        return None
+    p = int(probability)
+    if pref == "YES":
+        yes_limit = p - 10
+        side = "YES"
+    else:
+        no_cost = (100 - p) - 10
+        yes_limit = 100 - no_cost  # == p + 10
+        side = "NO"
+    if yes_limit <= 0 or yes_limit >= 100:
+        return None
+    our_px = our_price_cents(side, yes_limit)
+    if our_px <= 0 or our_px >= 100:
+        return None
+    return {
+        "side": side,
+        "yes_price_cents": yes_limit,
+        "our_price_cents": our_px,
+        "gap_points": None,
+        "threshold": 0,
+        "kalshi_action": "buy_yes" if side == "YES" else "sell_yes",
+    }

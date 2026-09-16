@@ -47,11 +47,11 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.3.4"
+VERSION = "wnt-gap-v1.4.0"
 PROMPT_VERSION = _secret("PROMPT_VERSION", "gap-v1.0")
 HARNESS = _secret("HARNESS", "grok-web-expert")
 MODEL_LABEL = _secret("MODEL_LABEL", "grok-web-expert")
-ADDENDUM = "v1.2"
+ADDENDUM = "v1.4"
 
 SERIES = _secret("SERIES", "KXWORLDNEWSMENTION")
 GAP_THRESHOLD = int(_num("GAP_THRESHOLD", 15))
@@ -59,11 +59,17 @@ GAP_THRESHOLD = int(_num("GAP_THRESHOLD", 15))
 # Filter 15 + take 15 on a 16¢ gap leaves ~0¢ vs the tape. Default 8.
 LIMIT_OFFSET_CENTS = int(_num("LIMIT_OFFSET_CENTS", 8))
 VARIANTS = (
-    {"id": "A", "notional": 1.0, "exit": "hold", "label": "A · $1 hold"},
-    {"id": "B", "notional": 100.0, "exit": "hold", "label": "B · $100 hold"},
-    {"id": "C", "notional": 1.0, "exit": "scalp", "label": "C · $1 scalp"},
-    {"id": "D", "notional": 100.0, "exit": "scalp", "label": "D · $100 scalp"},
+    {"id": "A", "notional": 1.0, "exit": "hold", "rule": "fade15", "cancel": "send60", "label": "A · $1 hold fade"},
+    {"id": "B", "notional": 100.0, "exit": "hold", "rule": "fade15", "cancel": "send60", "label": "B · $100 hold fade"},
+    {"id": "C", "notional": 1.0, "exit": "scalp", "rule": "fade15", "cancel": "send60", "label": "C · $1 scalp fade"},
+    {"id": "D", "notional": 100.0, "exit": "scalp", "rule": "fade15", "cancel": "send60", "label": "D · $100 scalp fade"},
+    {"id": "E", "notional": 1.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "send60", "label": "E · $1 hold fade+Grok>50"},
+    {"id": "F", "notional": 100.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "send60", "label": "F · $100 hold fade+Grok>50"},
+    {"id": "G", "notional": 1.0, "exit": "hold", "rule": "grok10", "cancel": "show529", "label": "G · $1 hold Grok−10"},
+    {"id": "H", "notional": 100.0, "exit": "hold", "rule": "grok10", "cancel": "show529", "label": "H · $100 hold Grok−10"},
 )
+SHOW_CANCEL_CT = _secret("SHOW_CANCEL_CT", "17:29")
+GROK10_OFFSET = int(_num("GROK10_OFFSET", 10))
 # Addendum clocks
 DECISION_LAG_MIN = int(_num("DECISION_LAG_MIN", 60))
 CANCEL_AFTER_MIN = int(_num("CANCEL_AFTER_MIN", 60))
@@ -110,8 +116,8 @@ def summary() -> str:
         f"|gap|>{GAP_THRESHOLD}¢ | take {LIMIT_OFFSET_CENTS}¢ from mid | "
         f"poll from {POLL_START_CT} every 60s | file first-seen+{DECISION_LAG_MIN}m | "
         f"cancel send+{CANCEL_AFTER_MIN}m\n"
-        f"books A $1-hold · B $100-hold · C $1-scalp · D $100-scalp\n"
-        f"NO bankroll / NO night cap / NO cluster cap — every |gap|>{GAP_THRESHOLD} word books all four\n"
+        f"A/B fade hold · C/D fade scalp · E/F fade+Grok>50 hold · G/H Grok−10 hold cancel 5:29 CT\n"
+        f"NO bankroll / NO night cap / NO cluster cap\n"
         f"prompt {PROMPT_VERSION} | harness {HARNESS} | addendum {ADDENDUM}\n"
         f"poll {POLL_START_CT} CT | json deadline {JSON_DEADLINE_CT} CT"
     )

@@ -41,7 +41,7 @@ def _hit(side: str, model: int, bid, ask) -> tuple[bool, int | None]:
 
 
 def _scalp_net(order: dict, exit_yes: int) -> tuple[int, int]:
-    filled = float(order.get("contracts") or 0)
+    filled = float(order.get("filled_contracts") or 0)
     entry_yes = int(order["limit_price_cents"])
     entry_fee = fees.fee_cents(filled, entry_yes)
     exit_fee = fees.fee_cents(filled, exit_yes)
@@ -69,7 +69,7 @@ def _close(order: dict, exit_yes: int, tag: str, outcome: str) -> None:
         order["id"],
         status="scalp_hit" if "hit" in tag else "scalp_miss",
         result=outcome,
-        filled_contracts=order.get("contracts") or 0,
+        filled_contracts=order.get("filled_contracts") or 0,
         fees_cents=fee,
         realized_pnl_cents=net,
     )

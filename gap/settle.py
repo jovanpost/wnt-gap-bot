@@ -15,7 +15,7 @@ from .kalshi import KalshiClient, market_result
 
 log = logging.getLogger("gap.settle")
 
-FILL_MODEL = "paper_full_at_limit_SIZE_UNTESTED"
+FILL_MODEL = "paper_filled_only_v135"
 
 
 def _our_px(order: dict) -> int:
@@ -26,10 +26,13 @@ def _our_px(order: dict) -> int:
 
 
 def settle_order(order: dict, outcome: str) -> dict:
-    contracts = float(order.get("contracts") or 0)
+    intended = float(order.get("contracts") or 0)
+    filled = float(order.get("filled_contracts") or 0)
+    if filled > intended:
+        filled = intended
     our_px = _our_px(order)
-    fee = fees.fee_cents(contracts, our_px)
-    net = fees.hold_pnl_cents(order["side"], contracts, our_px, outcome, fee)
+    fee = fees.fee_cents(filled, our_px)
+    net = fees.hold_pnl_cents(order["side"], filled, our_px, outcome, fee)
     gross = net + fee
     exit_rule = order.get("exit_rule") or "hold"
     note = FILL_MODEL
@@ -77,11 +80,12 @@ def settle_run(run: dict, client: KalshiClient | None = None) -> dict:
             continue
         row = settle_order(order, outcome)
         store.upsert_settlement(row)
+        filled = float(order.get("filled_contracts") or 0)
         store.update_order(
             order["id"],
-            status="settled",
+            status="settled" if filled > 0 else "unfilled",
             result=outcome,
-            filled_contracts=order.get("contracts") or 0,
+            filled_contracts=filled,
             fees_cents=row["fees_cents"],
             realized_pnl_cents=row["net_cents"],
         )

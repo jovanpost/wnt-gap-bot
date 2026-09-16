@@ -34,8 +34,33 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _show_cancel_utc(event_date) -> datetime | None:
+    if not event_date:
+        return None
+    raw = str(event_date)[:10]
+    try:
+        y, m, d = [int(x) for x in raw.split("-")]
+    except ValueError:
+        return None
+    hh, mm = (C.SHOW_CANCEL_CT if hasattr(C, "SHOW_CANCEL_CT") else "17:29").split(":")
+    from datetime import date, time
+    local = datetime.combine(date(y, m, d), time(int(hh), int(mm)), tzinfo=C.CT)
+    return local.astimezone(timezone.utc)
+
+
 def window_open(order: dict, now: datetime | None = None) -> bool:
     now = now or _now()
+    vid = str(order.get("variant_id") or "")
+    cancel = None
+    for spec in C.VARIANTS:
+        if spec["id"] == vid:
+            cancel = spec.get("cancel")
+            break
+    if cancel == "show529" or vid in ("G", "H"):
+        deadline = _show_cancel_utc(order.get("event_date"))
+        if deadline is None:
+            return False
+        return now <= deadline
     start = _as_dt(order.get("placed_at")) or now
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)

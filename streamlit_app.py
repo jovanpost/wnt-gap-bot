@@ -1,4 +1,4 @@
-"""Status light + four-way backtest board. No public order buttons."""
+"""Status light + eight-book board. No public order buttons."""
 from __future__ import annotations
 
 import logging
@@ -68,7 +68,7 @@ services = boot()
 
 st.title("📐 WNT Gap Bot")
 st.caption(
-    f"{C.VERSION} · four paper books · mark-to-market from live Kalshi quotes · "
+    f"{C.VERSION} · eight paper books · mark-to-market from live Kalshi quotes · "
     "Telegram courier · Saturday weekly dump"
 )
 

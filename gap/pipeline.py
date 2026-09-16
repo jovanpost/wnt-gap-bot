@@ -243,7 +243,7 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
 
 
 def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
-    """One decision set, four independent books. No shared size or cash."""
+    """One decision set, eight independent books. No shared size or cash."""
     client = KalshiClient()
     signals = []
     for f in forecasts:
@@ -255,9 +255,6 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
         bid, ask = market_yes_quotes(market)
         mid = market_mid_prob(bid, ask)
         store.insert_quote(run["id"], f.get("id"), f["market_ticker"], bid, ask, mid)
-        bare = strategy.decide(int(f["probability"]), mid, bid, ask)
-        if not bare:
-            continue
         signals.append({
             "forecast": f,
             "bid": bid,
@@ -278,12 +275,31 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
         candidates = []
         for sig in signals:
             f = sig["forecast"]
-            decision = strategy.decide(
-                int(f["probability"]), sig["mid"], sig["bid"], sig["ask"],
-                notional=spec["notional"],
-            )
-            if not decision:
-                continue
+            p = int(f["probability"])
+            rule = spec.get("rule") or "fade15"
+            if rule == "grok10":
+                g = strategy.grok10_limit(p)
+                if not g:
+                    continue
+                our_px = g["our_price_cents"]
+                contracts = round(spec["notional"] / (our_px / 100.0), 2)
+                decision = {
+                    "side": g["side"],
+                    "yes_price_cents": g["yes_price_cents"],
+                    "contracts": contracts,
+                    "cost_cents": int(round(contracts * our_px)),
+                    "gap_points": 0.0,
+                    "threshold": 0,
+                }
+            else:
+                decision = strategy.decide(
+                    p, sig["mid"], sig["bid"], sig["ask"],
+                    notional=spec["notional"],
+                )
+                if not decision:
+                    continue
+                if rule == "fade15_gate50" and not strategy.fade_gate_ok(p, decision["side"]):
+                    continue
             candidates.append({
                 "forecast_id": f.get("id"),
                 "run_id": run["id"],
@@ -314,12 +330,12 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
 def _book_summary(saved, booked, expected) -> str:
     store.log_activity(
         "parsed",
-        f"{len(saved)} forecasts, {len(booked)} paper rows across A/B/C/D",
+        f"{len(saved)} forecasts, {len(booked)} paper rows across A-H",
     )
     lines = [
         f"parsed {len(saved)}/{len(expected)}",
         f"|gap|>{C.GAP_THRESHOLD}¢ | take {C.LIMIT_OFFSET_CENTS}¢ from mid | cancel +{C.CANCEL_AFTER_MIN}m",
-        "four books, no shared size:",
+        "eight books, no shared size:",
     ]
     for spec in C.VARIANTS:
         rows = [o for o in booked if o.get("variant_id") == spec["id"]]
