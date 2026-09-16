@@ -62,6 +62,73 @@ def _snapshot_words(client: KalshiClient, event: dict) -> list[dict]:
     ]
 
 
+
+def _event_score(event: dict, date_str: str) -> tuple[int, int]:
+    ticker = (event.get("event_ticker") or "").upper()
+    title = (event.get("title") or "").upper()
+    hay = ticker + " " + title
+    date_hits = sum(1 for tok in clock.event_date_tokens(date_str) if tok in hay)
+    return date_hits, 0
+
+
+def maybe_upgrade_event(client: KalshiClient | None = None) -> dict:
+    """If a better same-day event appears before JSON, switch and reschedule +60m."""
+    date_str = clock.today_ct()
+    run = store.get_run_for_date(date_str)
+    if not run or run.get("status") not in ("detected", "awaiting_json"):
+        return {"ok": True, "reason": "no_upgrade"}
+    client = client or KalshiClient()
+    events = client.get_events(C.SERIES, status="open")
+    event = pick_tonight_event(events, date_str)
+    if not event:
+        return {"ok": True, "reason": "no_open"}
+    new_ticker = event["event_ticker"]
+    words = _snapshot_words(client, event)
+    old_ticker = run.get("event_ticker")
+    old_n = int(run.get("markets_n") or 0)
+    new_n = len(words)
+    old_hits, _ = _event_score({"event_ticker": old_ticker or ""}, date_str)
+    new_hits, _ = _event_score(event, date_str)
+    better_date = new_hits > old_hits
+    better_book = new_n >= 5 and new_n > old_n
+    stub = old_n <= 2 and new_n > old_n
+    if new_ticker == old_ticker and not better_book:
+        return {"ok": True, "reason": "same_event"}
+    if not (better_date or better_book or stub):
+        return {"ok": True, "reason": "not_better"}
+    if not words:
+        return {"ok": False, "reason": "upgrade_no_markets"}
+
+    seen_at = datetime.now(timezone.utc)
+    send_at = seen_at + timedelta(minutes=C.DECISION_LAG_MIN)
+    paste = prompt.build_paste_file(date_str, new_ticker, words)
+    from sqlalchemy import text
+    with store.engine().begin() as conn:
+        conn.execute(text("delete from gap_markets where run_id = :id"), {"id": run["id"]})
+    store.insert_markets(run["id"], date_str, new_ticker, words)
+    store.update_run(
+        run["id"],
+        event_ticker=new_ticker,
+        word_list=words,
+        prompt_text=paste,
+        markets_n=new_n,
+        market_open_at=seen_at,
+        decision_at=send_at,
+        status="detected",
+        telegram_msg_id=None,
+        parse_error=None,
+    )
+    store.log_activity(
+        "upgraded",
+        f"{old_ticker} n={old_n} -> {new_ticker} n={new_n} send_at={clock.fmt(send_at)}",
+    )
+    notify.send(
+        f"event upgraded\n{old_ticker} ({old_n} mkts) -> {new_ticker} ({new_n} mkts)\n"
+        f"new file at {clock.fmt(send_at)} CT  (+{C.DECISION_LAG_MIN}m)\n"
+        f"do not paste JSON for the old ticker"
+    )
+    return {"ok": True, "reason": "upgraded", "send_at": clock.fmt(send_at), "ticker": new_ticker}
+
 def detect_event(client: KalshiClient | None = None) -> dict:
     """Record first sighting. Do not Telegram yet."""
     date_str = clock.today_ct()
@@ -396,6 +463,10 @@ def poll_once() -> dict:
         return {"ok": True, "reason": "outside_window"}
     if not clock.in_poll_window():
         return {"ok": True, "reason": "outside_window"}
+    try:
+        maybe_upgrade_event()
+    except Exception:
+        log.exception("upgrade")
     return send_prompt_for_today()
 
 
