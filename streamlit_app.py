@@ -73,7 +73,7 @@ st.caption(
 )
 
 tab_live, tab_books, tab_four, tab_curve = st.tabs(
-    ["Tonight", "Four books · P&L", "Four-way backtest", "Cancel-window curve"]
+    ["Tonight", "Eight books · P&L", "Old 4-way fixture (not live)", "Cancel-window curve"]
 )
 
 # ---------------------------------------------------------------------------
@@ -140,19 +140,22 @@ with tab_live:
 
 # ---------------------------------------------------------------------------
 with tab_books:
-    date_str = clock.today_ct()
-    top = st.columns([3, 1])
-    with top[0]:
-        st.markdown(
-            "Paper dry poll (nofade): every 5s, if the **current book** has "
-            "YES bids at/through your Sell-YES limit, take "
-            "`min(remaining, that size)`. No last price. No volume. "
-            "Leftover stays resting until send+60m."
+    pick = st.columns([2, 2, 1])
+    with pick[0]:
+        date_str = st.text_input("Board date (CT)", value=clock.today_ct())
+    with pick[1]:
+        st.caption(
+            "A–D fade 15¢. E/F fade + Grok side ≥50.01 hold. "
+            "G/H Grok−10 hold, cancel 5:29 CT. Pick 2026-09-15 to see the rebuild."
         )
-    with top[1]:
+    with pick[2]:
         if st.button("Refresh quotes", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
+    st.markdown(
+        "Live marks from Kalshi. **This** tab is the paper books. "
+        "The fixture tab is an old 128-night backtest — ignore it for last night."
+    )
 
     @st.cache_data(ttl=20, show_spinner="Quoting Kalshi…")
     def _tonight(d: str):
@@ -165,16 +168,17 @@ with tab_books:
     if not rows:
         st.info("No paper orders yet for " + date_str)
     else:
-        cards = st.columns(4)
-        for card, b in zip(cards, books):
-            with card:
-                st.subheader(b["label"])
-                delta = f"{b['pct']:+.1f}%"
-                st.metric("P&L", f"${b['pnl']:+.2f}", delta)
-                st.caption(
-                    f"cost ${b['cost']:.2f} → mark ${b['mark']:.2f}\n\n"
-                    f"{b['filled']}/{b['n']} filled · W/L {b['wins']}/{b['losses']}"
-                )
+        for chunk_start in range(0, len(books), 4):
+            cards = st.columns(4)
+            for card, b in zip(cards, books[chunk_start:chunk_start + 4]):
+                with card:
+                    st.subheader(b["label"])
+                    delta = f"{b['pct']:+.1f}%"
+                    st.metric("P&L", f"${b['pnl']:+.2f}", delta)
+                    st.caption(
+                        f"cost ${b['cost']:.2f} → mark ${b['mark']:.2f}\n\n"
+                        f"{b['filled']}/{b['n']} filled · W/L {b['wins']}/{b['losses']}"
+                    )
 
         cmp = pd.DataFrame([
             {
@@ -243,7 +247,7 @@ with tab_books:
             with st.expander(
                 f"{b['label']}  ·  ${b['pnl']:+.2f}  ({b['pct']:+.1f}%)  ·  "
                 f"{b['filled']}/{b['n']} filled",
-                expanded=(b["id"] in ("A", "B")),
+                expanded=(b["id"] in ("A", "E", "G")),
             ):
                 if not sub:
                     st.write("empty")
@@ -274,8 +278,12 @@ with tab_books:
 
 # ---------------------------------------------------------------------------
 with tab_four:
+    st.warning(
+        "Historical fixture only (128 old nights). Not Sep 14/15. "
+        "Use **Eight books · P&L** and set the date."
+    )
     st.markdown(
-        "Entry for all four: **capped taker sweep**, decision at open+60, "
+        "Entry for A–D on that old tape: **capped taker sweep**, decision at open+60, "
         f"`|gap|>{C.GAP_THRESHOLD}` then take `{C.LIMIT_OFFSET_CENTS}¢` from mid, cancel at send+60. "
         "Each variant is an independent pass over the **same fixed batch** "
         "and a **read-only** tape — no shared remaining-volume counter."
