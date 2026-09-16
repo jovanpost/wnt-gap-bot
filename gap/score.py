@@ -25,18 +25,21 @@ def _settle_row(row: dict) -> None:
 # Honest dry-book snapshot from the 2026-09-15 13:54 CT board,
 # before settle.py wrote intended size into filled_contracts.
 FREEZE_2026_09_15 = {
+    # $1: rest was small; treat as filled if it was working on the 1:54 board.
+    # $100: ONLY sizes we actually measured (Fed 22, Diesel 42.5, Inflation 10).
+    # Everything else $100 = 0. Do not copy $1 fill% onto $100.
     "Anthropic / Claude": {"1": 0.0, "100": 0.0},
-    "Emmy / Emmys": {"1": 2.63, "100": 263.16},
+    "Emmy / Emmys": {"1": 2.63, "100": 0.0},
     "Fed / Federal Reserve / Interest Rate": {"1": 1.43, "100": 22.0},
-    "Hoax": {"1": 1.39, "100": 138.89},
+    "Hoax": {"1": 1.39, "100": 0.0},
     "Diesel": {"1": 1.56, "100": 42.5},
     "Inflation": {"1": 1.72, "100": 10.0},
-    "Space": {"1": 1.47, "100": 147.06},
+    "Space": {"1": 1.47, "100": 0.0},
     "OpenAI": {"1": 0.0, "100": 0.0},
-    "Saudi": {"1": 2.38, "100": 238.1},
-    "Supreme Court": {"1": 4.17, "100": 416.67},
+    "Saudi": {"1": 2.38, "100": 0.0},
+    "Supreme Court": {"1": 4.17, "100": 0.0},
     "Kennedy": {"1": 0.0, "100": 0.0},
-    "AI / Artificial Intelligence": {"1": 2.78, "100": 277.78},
+    "AI / Artificial Intelligence": {"1": 2.78, "100": 0.0},
 }
 
 GROK_2026_09_15 = {
@@ -275,7 +278,7 @@ def score_date(date_str: str, event_ticker: str | None = None) -> dict[str, Any]
             })
             n_hold += 1
     extra = ensure_eh_books(date_str, run, forecasts, tape_by, outcomes)
-    store.set_state(f"scored_{date_str}", "v1.4.2")
+    store.set_state(f"scored_{date_str}", "v1.4.4")
     store.log_activity("score", f"{date_str} hold={n_hold} scalp={n_scalp} zero={n_zero} extra={extra}")
     return {"ok": True, "hold": n_hold, "scalp": n_scalp, "zero": n_zero, "extra": extra}
 
@@ -396,12 +399,8 @@ def ensure_eh_books(date_str, run, forecasts, tape_by, outcomes):
             if not strategy.fade_gate_ok(p, o.get("side")):
                 filled = 0.0
         else:
-            # G $1 fill only if YES-buy was through before 5:29. H stays 0.
-            if vid == "H":
-                filled = 0.0
-            else:
-                tape = tape_by.get(o.get("market_ticker") or "") or []
-                filled = intended if _through_before_529(o.get("side"), int(o["limit_price_cents"]), tape) else 0.0
+            # No honest G/H fill tape before 5:29 CT. Leave 0.
+            filled = 0.0
         outcome = outcomes.get(o.get("market_ticker") or "")
         if filled <= 0:
             store.update_order(o["id"], filled_contracts=0, status="unfilled", realized_pnl_cents=0, result=outcome)

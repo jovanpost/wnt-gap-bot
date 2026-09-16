@@ -219,7 +219,7 @@ def tonight(date_str: str) -> dict[str, Any]:
         from . import score
         extra_n = sum(1 for o in orders if o.get("variant_id") in ("E", "F", "G", "H"))
         key = f"scored_{date_str}"
-        if store.get_state(key) != "v1.4.2" or extra_n == 0:
+        if store.get_state(key) != "v1.4.4" or extra_n == 0:
             score.score_date(date_str, event_ticker=(run or {}).get("event_ticker"))
             orders = store.orders_for_date(date_str)
     except Exception:
