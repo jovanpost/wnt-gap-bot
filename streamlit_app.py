@@ -73,7 +73,7 @@ st.caption(
 )
 
 tab_live, tab_books, tab_four, tab_curve = st.tabs(
-    ["Tonight", "Eight books · P&L", "Old 4-way fixture (not live)", "Cancel-window curve"]
+    ["Tonight", "Eight books · P&L", "All nights · 8 books", "Cancel-window curve"]
 )
 
 # ---------------------------------------------------------------------------
@@ -278,76 +278,40 @@ with tab_books:
 
 # ---------------------------------------------------------------------------
 with tab_four:
-    st.warning(
-        "Historical fixture only (128 old nights). Not Sep 14/15. "
-        "Use **Eight books · P&L** and set the date."
-    )
     st.markdown(
-        "Entry for A–D on that old tape: **capped taker sweep**, decision at open+60, "
-        f"`|gap|>{C.GAP_THRESHOLD}` then take `{C.LIMIT_OFFSET_CENTS}¢` from mid, cancel at send+60. "
-        "Each variant is an independent pass over the **same fixed batch** "
-        "and a **read-only** tape — no shared remaining-volume counter."
+        "Running paper totals across every night in the database. "
+        "This is A–H on real booked tickets, not the old 128-night fixture."
     )
-    board = fixture_board()
-    st.caption(
-        f"FIXTURE tape · {board['n_raw']} market-nights · "
-        f"{board['n_batch']} triggered gaps · cancel {board['four']['cancel_min']}m. "
-        "Drop real candles later in `data/`; this board is the algorithm, labeled."
-    )
+    if st.button("Rebuild Sep 15 + rescore"):
+        from gap import score
+        try:
+            store.set_state("scored_2026-09-15", "")
+            out = score.score_date("2026-09-15")
+            st.write(out)
+        except Exception as exc:
+            st.exception(exc)
+        st.cache_data.clear()
+        st.rerun()
+    hist = board.history()
+    books = hist["books"]
+    st.caption(f"{len(hist['nights'])} nights · {hist['n_orders']} tickets · {hist['n_words']} word-nights")
+    if books:
+        for chunk_start in range(0, len(books), 4):
+            cards = st.columns(4)
+            for card, b in zip(cards, books[chunk_start:chunk_start + 4]):
+                with card:
+                    st.subheader(b["label"])
+                    st.metric("P&L", f"${b['pnl']:+.2f}", f"{b['pct']:+.1f}%")
+                    st.caption(f"{b['filled']}/{b['n']} filled · W/L {b['wins']}/{b['losses']}")
+        cmp = pd.DataFrame([{
+            "book": b["label"], "tickets": b["n"], "filled": b["filled"],
+            "cost $": round(b["cost"], 2), "P&L $": round(b["pnl"], 2),
+            "P&L %": round(b["pct"], 2), "W": b["wins"], "L": b["losses"],
+        } for b in books])
+        st.dataframe(cmp, hide_index=True, use_container_width=True)
+    else:
+        st.info("No paper tickets stored yet.")
 
-    winner = board["four"]["winner"]
-    cards = st.columns(4)
-    for spec, card in zip(backtest.VARIANTS, cards):
-        row = next(s for s in board["four"]["summaries"] if s["variant"] == spec["id"])
-        with card:
-            badge = " ← pick" if spec["id"] == winner else ""
-            st.subheader(f"{row['label']}{badge}")
-            st.metric("Fill-adjusted edge", f"{row['fill_adjusted_edge']:+.3f}")
-            st.metric("Net $", f"{row['net_dollars']:+.2f}")
-            st.metric("Avg fill", f"{row['avg_fill_pct']:.0f}%")
-            st.write(
-                f"fully filled {row['fully_filled_pct']:.0f}% · "
-                f"triggered {row['n_triggered']} · filled {row['n_filled']}\n\n"
-                f"intended ${row['intended_dollars']:.0f} · "
-                f"deployed ${row['deployed_dollars']:.0f}\n\n"
-                f"per intended $ {row['edge_per_intended_dollar']:+.3f} · "
-                f"per deployed $ {row['edge_per_deployed_dollar']:+.3f}\n\n"
-                f"W/L {row['wins']}/{row['losses']}"
-            )
-
-    st.markdown(
-        f"**Current pick on this fixture:** variant **{winner}** "
-        "(highest fill-adjusted edge = deployed-dollar edge × avg fill). "
-        "Shelve the other three; do not delete them."
-    )
-
-    st.subheader("Compare")
-    st.dataframe(
-        pd.DataFrame(board["four"]["summaries"]).drop(columns=[]),
-        hide_index=True,
-        use_container_width=True,
-    )
-
-    st.subheader("Trades")
-    pick = st.selectbox("Variant book", ["A", "B", "C", "D"], index=0)
-    book = pd.DataFrame(board["four"]["books"][pick])
-    show = [c for c in (
-        "event_date", "word", "kalshi_action", "side", "model_prob",
-        "market_yes_cents", "yes_price_cents", "limit_cents", "intended",
-        "filled", "fill_pct", "avg_fill_cents", "exit_reason", "net_cents",
-        "outcome",
-    ) if c in book.columns]
-    st.dataframe(book[show], hide_index=True, use_container_width=True)
-
-    st.subheader("Informal prototype table (do not use for price-paid)")
-    st.caption(
-        "These numbers sampled a fresh batch per window. Fill % columns are "
-        "honest within each sample; average price paid was not. The curve tab "
-        "is the fixed-batch version."
-    )
-    st.dataframe(pd.DataFrame(backtest.INFORMAL_FILL_TABLE), hide_index=True)
-
-# ---------------------------------------------------------------------------
 with tab_curve:
     st.markdown(
         "Same decision batch, same orders, cancel window extended "

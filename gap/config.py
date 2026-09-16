@@ -47,7 +47,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.4.0"
+VERSION = "wnt-gap-v1.4.2"
 PROMPT_VERSION = _secret("PROMPT_VERSION", "gap-v1.0")
 HARNESS = _secret("HARNESS", "grok-web-expert")
 MODEL_LABEL = _secret("MODEL_LABEL", "grok-web-expert")

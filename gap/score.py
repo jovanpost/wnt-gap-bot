@@ -265,7 +265,7 @@ def score_date(date_str: str, event_ticker: str | None = None) -> dict[str, Any]
             })
             n_hold += 1
     extra = ensure_eh_books(date_str, run, forecasts, tape_by, outcomes)
-    store.set_state(f"scored_{date_str}", "v1.4.0")
+    store.set_state(f"scored_{date_str}", "v1.4.2")
     store.log_activity("score", f"{date_str} hold={n_hold} scalp={n_scalp} zero={n_zero} extra={extra}")
     return {"ok": True, "hold": n_hold, "scalp": n_scalp, "zero": n_zero, "extra": extra}
 
@@ -286,8 +286,12 @@ def _through_before_529(side: str, yes_limit: int, tape: list) -> bool:
 
 
 def ensure_eh_books(date_str, run, forecasts, tape_by, outcomes):
-    if date_str != "2026-09-15" or not run:
+    if not run:
         return {"inserted": 0}
+    forecasts = list(forecasts or [])
+    if not forecasts:
+        forecasts = store.forecasts_for_run(run["id"])
+    markets = {m.get("word"): m for m in store.markets_for_run(run["id"])}
     existing = store.orders_for_run(run["id"])
     have = {(o.get("variant_id"), o.get("word")) for o in existing}
     by_word_ab = {}
@@ -316,8 +320,30 @@ def ensure_eh_books(date_str, run, forecasts, tape_by, outcomes):
                 row["exit_rule"] = "hold"
                 row["notional_dollars"] = spec["notional"]
                 row["status"] = "paper_sweep"
-                store.insert_order(row)
-                n_ins += 1
+                try:
+                    store.insert_order({
+                        "forecast_id": src.get("forecast_id"),
+                        "run_id": src["run_id"],
+                        "event_date": str(src.get("event_date") or date_str)[:10],
+                        "market_ticker": src["market_ticker"],
+                        "word": word,
+                        "side": src["side"],
+                        "limit_price_cents": src["limit_price_cents"],
+                        "contracts": src["contracts"],
+                        "cost_cents": src["cost_cents"],
+                        "gap_points": src.get("gap_points"),
+                        "threshold": src.get("threshold") or 15,
+                        "cluster_key": src.get("cluster_key"),
+                        "paper": True,
+                        "status": "paper_sweep",
+                        "variant_id": spec["id"],
+                        "exit_rule": "hold",
+                        "notional_dollars": spec["notional"],
+                        "execution_model": src.get("execution_model"),
+                    })
+                    n_ins += 1
+                except Exception:
+                    log.exception("insert %s %s", spec["id"], word)
             elif spec["rule"] == "grok10":
                 g = strategy.grok10_limit(p)
                 if not g:

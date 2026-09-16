@@ -217,8 +217,9 @@ def tonight(date_str: str) -> dict[str, Any]:
         log.exception("apply fills")
     try:
         from . import score
+        extra_n = sum(1 for o in orders if o.get("variant_id") in ("E", "F", "G", "H"))
         key = f"scored_{date_str}"
-        if store.get_state(key) != "v1.4.0":
+        if store.get_state(key) != "v1.4.2" or extra_n == 0:
             score.score_date(date_str, event_ticker=(run or {}).get("event_ticker"))
             orders = store.orders_for_date(date_str)
     except Exception:
@@ -270,3 +271,26 @@ def as_markdown(snap: dict) -> str:
             )
     lines += ["", "_Fills = prints at limit±1¢ plus book size at limit±1¢. Mid is mark only._", ""]
     return "\n".join(lines)
+
+
+def history() -> dict:
+    """All paper nights, eight books accumulated."""
+    orders = store.all_paper_orders()
+    # skip fill poll on history; use stored filled + realized
+    for o in orders:
+        o["_fill"] = {
+            "filled_ct": float(o.get("filled_contracts") or 0),
+            "intended_ct": float(o.get("contracts") or 0),
+            "fill_pct": None,
+        }
+    quotes = {}
+    rows = enrich_orders(orders, quotes=quotes)
+    books = summarize(rows)
+    nights = sorted({str(r.get("event_date"))[:10] for r in rows if r.get("event_date")})
+    return {
+        "rows": rows,
+        "books": books,
+        "nights": nights,
+        "n_orders": len(rows),
+        "n_words": len({(str(r.get("event_date"))[:10], r.get("word")) for r in rows}),
+    }

@@ -402,7 +402,16 @@ def runs_between(start_date: str, end_date: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def all_paper_orders() -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_orders where paper is true order by event_date, variant_id, id")
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
 def orders_for_run(run_id: int) -> list[dict]:
+
     with engine().connect() as conn:
         rows = conn.execute(
             text("select * from gap_orders where run_id = :id order by variant_id, id"),
