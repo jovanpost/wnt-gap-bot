@@ -365,6 +365,19 @@ def insert_order(row: dict) -> None:
                     :threshold, :cluster_key, :paper, :status,
                     :variant_id, :exit_rule, :notional_dollars, :execution_model
                 )
+                on conflict (event_date, market_ticker, variant_id) do update set
+                    forecast_id = excluded.forecast_id,
+                    run_id = excluded.run_id,
+                    word = excluded.word,
+                    side = excluded.side,
+                    limit_price_cents = excluded.limit_price_cents,
+                    our_price_cents = excluded.our_price_cents,
+                    contracts = excluded.contracts,
+                    cost_cents = excluded.cost_cents,
+                    gap_points = excluded.gap_points,
+                    status = excluded.status,
+                    exit_rule = excluded.exit_rule,
+                    notional_dollars = excluded.notional_dollars
             """),
             payload,
         )

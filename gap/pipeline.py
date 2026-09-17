@@ -331,10 +331,22 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
         })
 
     from sqlalchemy import text
+    date_str = str(run.get("event_date") or "")[:10]
     with store.engine().begin() as conn:
         conn.execute(
-            text("delete from gap_orders where run_id = :id and paper is true"),
-            {"id": run["id"]},
+            text(
+                "delete from gap_settlements where order_id in "
+                "(select id from gap_orders where run_id = :id "
+                " or event_date = cast(:d as date))"
+            ),
+            {"id": run["id"], "d": date_str},
+        )
+        conn.execute(
+            text(
+                "delete from gap_orders where run_id = :id "
+                "or event_date = cast(:d as date)"
+            ),
+            {"id": run["id"], "d": date_str},
         )
 
     kept_all: list[dict] = []
