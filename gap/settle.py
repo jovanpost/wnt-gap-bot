@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from . import fees, outcomes, store
+from . import fees, pricing, store
 from .kalshi import KalshiClient, market_result
 
 log = logging.getLogger("gap.settle")
@@ -18,21 +18,14 @@ log = logging.getLogger("gap.settle")
 FILL_MODEL = "paper_filled_only_v135"
 
 
-def _our_px(order: dict) -> int:
-    yes_limit = int(order["limit_price_cents"])
-    if order["side"] == "YES":
-        return yes_limit
-    return 100 - yes_limit
-
-
 def settle_order(order: dict, outcome: str) -> dict:
     intended = float(order.get("contracts") or 0)
     filled = float(order.get("filled_contracts") or 0)
     if filled > intended:
         filled = intended
-    our_px = _our_px(order)
-    fee = fees.fee_cents(filled, our_px)
-    net = fees.hold_pnl_cents(order["side"], filled, our_px, outcome, fee)
+    our_px = pricing.entry_price_cents(order)
+    fee = pricing.entry_fee_cents(order)
+    net = fees.hold_pnl_cents(order.get("side") or "NO", filled, our_px, outcome, fee)
     gross = net + fee
     exit_rule = order.get("exit_rule") or "hold"
     note = FILL_MODEL
@@ -72,9 +65,9 @@ def settle_run(run: dict, client: KalshiClient | None = None) -> dict:
             settled += 1
             continue
         outcome = by_ticker[ticker]
+        # ALIGNED TO wnt-nofade-bot: the exchange is the only authority. No
+        # hand-maintained table. Unresolved rows stay pending for next sweep.
         if outcome not in ("yes", "no", "void"):
-            outcome = outcomes.official_for(run.get("event_date") or "", order.get("word") or "")
-        if outcome is None:
             open_n += 1
             continue
         if outcome == "void":

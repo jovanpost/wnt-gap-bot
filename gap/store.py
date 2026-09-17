@@ -326,6 +326,17 @@ def insert_order(row: dict) -> None:
         "word": row["word"],
         "side": row["side"],
         "limit_price_cents": row["limit_price_cents"],
+        # v1.4.8: persist the price of the side WE hold. strategy.decide()
+        # already computes this; it used to be dropped on the floor here,
+        # forcing every downstream consumer to re-derive it (and some got it
+        # wrong). Derive once as a fallback for callers that omit it.
+        "our_price_cents": row.get("our_price_cents") or (
+            row["limit_price_cents"]
+            if str(row.get("side") or "NO").upper() == "YES"
+            else 100 - int(row["limit_price_cents"])
+        ),
+        "avg_fill_price_cents": row.get("avg_fill_price_cents"),
+        "fees_cents": row.get("fees_cents", 0),
         "contracts": row["contracts"],
         "cost_cents": row["cost_cents"],
         "gap_points": row["gap_points"],
@@ -343,12 +354,14 @@ def insert_order(row: dict) -> None:
             text("""
                 insert into gap_orders (
                     forecast_id, run_id, event_date, market_ticker, word, side,
-                    limit_price_cents, contracts, cost_cents, gap_points, threshold,
+                    limit_price_cents, our_price_cents, avg_fill_price_cents, fees_cents,
+                    contracts, cost_cents, gap_points, threshold,
                     cluster_key, paper, status,
                     variant_id, exit_rule, notional_dollars, execution_model
                 ) values (
                     :forecast_id, :run_id, cast(:event_date as date), :market_ticker, :word,
-                    :side, :limit_price_cents, :contracts, :cost_cents, :gap_points,
+                    :side, :limit_price_cents, :our_price_cents, :avg_fill_price_cents,
+                    :fees_cents, :contracts, :cost_cents, :gap_points,
                     :threshold, :cluster_key, :paper, :status,
                     :variant_id, :exit_rule, :notional_dollars, :execution_model
                 )

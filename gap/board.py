@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from . import config as C, fees, fills, outcomes, store
+from . import config as C, fills, pricing, store
 from .kalshi import KalshiClient, market_result, market_yes_quotes, market_mid_prob
 
 log = logging.getLogger("gap.board")
@@ -14,20 +14,12 @@ CLOSED = {"scalp_hit", "scalp_miss", "settled", "void", "cancelled", "canceled"}
 
 
 def _our_entry(order: dict) -> int:
-    yes = int(order.get("limit_price_cents") or 0)
-    if (order.get("side") or "NO") == "YES":
-        return yes
-    return 100 - yes
+    """Delegates to pricing. Kept as a thin alias so call sites read clearly."""
+    return pricing.entry_price_cents(order)
 
 
 def _filled(order: dict) -> float:
-    sim = order.get("_fill") or {}
-    if sim.get("filled_ct") is not None:
-        return float(sim["filled_ct"])
-    stored = order.get("filled_contracts")
-    if stored not in (None,):
-        return float(stored or 0)
-    return 0.0
+    return pricing.filled_contracts(order)
 
 
 def _status_label(order: dict, result: str | None) -> str:
@@ -36,7 +28,9 @@ def _status_label(order: dict, result: str | None) -> str:
     if status == "scalp_hit":
         return "closed · scalp hit"
     if status == "scalp_miss":
-        return "closed · scalp miss (last mid)"
+        if result in ("yes", "no"):
+            return f"closed · scalp miss → held to settle {result}"
+        return "closed · scalp miss (awaiting settle)"
     if status == "settled":
         return f"settled · {result or order.get('result') or '?'}"
     if status in ("void", "cancelled", "canceled"):
@@ -66,34 +60,15 @@ def _mark_yes(bid, ask, mid) -> int | None:
 
 
 def _hold_pnl(order: dict, outcome: str, filled: float) -> int:
-    our = _our_entry(order)
-    fee = fees.fee_cents(filled, our)
-    return fees.hold_pnl_cents(order.get("side") or "NO", filled, our, outcome, fee)
+    return pricing.hold_pnl_cents(order, outcome)
 
 
 def _unrealized_cents(order: dict, mark_yes: int | None) -> int | None:
-    if mark_yes is None:
-        return None
-    filled = _filled(order)
-    if filled <= 0:
-        return 0
-    entry_yes = int(order.get("limit_price_cents") or 0)
-    our = _our_entry(order)
-    entry_fee = fees.fee_cents(filled, our)
-    if (order.get("side") or "NO") == "YES":
-        gross = filled * (mark_yes - entry_yes)
-    else:
-        gross = filled * (entry_yes - mark_yes)
-    return int(round(gross - entry_fee))
+    return pricing.unrealized_cents(order, mark_yes)
 
 
 def _mark_value_cents(order: dict, mark_yes: int | None) -> int | None:
-    if mark_yes is None:
-        return None
-    filled = _filled(order)
-    if (order.get("side") or "NO") == "YES":
-        return int(round(filled * mark_yes))
-    return int(round(filled * (100 - mark_yes)))
+    return pricing.mark_value_cents(order, mark_yes)
 
 
 def fetch_quotes(tickers: list[str]) -> dict[str, dict]:
@@ -131,17 +106,20 @@ def enrich_orders(orders: list[dict], quotes: dict[str, dict] | None = None) -> 
     for o in orders:
         q = quotes.get(o.get("market_ticker") or "", {})
         date_str = str(o.get("event_date") or "")
-        result = (
-            outcomes.official_for(date_str, o.get("word") or "")
-            or q.get("result")
-            or o.get("result")
-        )
+        # ALIGNED: result comes from what settlement wrote, or the exchange.
+        result = o.get("result") or q.get("result")
         if result == "yes":
             mark_yes = 100
         elif result == "no":
             mark_yes = 0
         else:
-            mark_yes = _mark_yes(q.get("bid"), q.get("ask"), q.get("mid"))
+            # After close Kalshi returns mid ~0. Reading that as a mark turns
+            # every short into a full winner. Unknown means unknown.
+            q_status = str(q.get("status") or "").lower()
+            if q_status in ("", "active", "open"):
+                mark_yes = _mark_yes(q.get("bid"), q.get("ask"), q.get("mid"))
+            else:
+                mark_yes = None
         filled = _filled(o)
         sim = o.get("_fill") or {}
         intended = float(sim.get("intended_ct") or o.get("contracts") or 0)
@@ -149,17 +127,20 @@ def enrich_orders(orders: list[dict], quotes: dict[str, dict] | None = None) -> 
         if filled <= 0:
             cost = 0
         else:
-            cost = int(round(filled * our))
+            cost = pricing.cost_cents(o)
         realized = o.get("realized_pnl_cents")
         sett = settlements.get(int(o["id"])) if o.get("id") is not None else None
         if realized is None and sett:
             realized = sett.get("net_cents")
         status = str(o.get("status") or "")
-        if filled > 0 and result in ("yes", "no") and status != "scalp_hit":
-            pnl = _hold_pnl(o, result, filled)
-            mark_val = cost + pnl
-        elif status in CLOSED and realized is not None:
+        closed = status in CLOSED
+        # ORDER OF TRUST: frozen realized P&L, then official result, then a
+        # live mark and only while genuinely open.
+        if realized is not None and (closed or result in ("yes", "no")):
             pnl = int(realized)
+            mark_val = cost + pnl
+        elif filled > 0 and result in ("yes", "no") and status != "scalp_hit":
+            pnl = _hold_pnl(o, result, filled)
             mark_val = cost + pnl
         else:
             pnl = _unrealized_cents(o, mark_yes) if mark_yes is not None else None
@@ -246,9 +227,8 @@ def tonight(date_str: str) -> dict[str, Any]:
         log.exception("score date")
     try:
         from . import settle
-        if date_str in outcomes.OFFICIAL:
-            settle.apply_official(date_str)
-            orders = store.orders_for_date(date_str)
+        settle.apply_official(date_str)
+        orders = store.orders_for_date(date_str)
     except Exception:
         log.exception("apply official")
     rows = enrich_orders(orders)

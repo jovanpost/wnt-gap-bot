@@ -375,6 +375,11 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
                 "word": f["word"],
                 "side": decision["side"],
                 "limit_price_cents": decision["yes_price_cents"],
+                # v1.4.8: carry the price of the side we hold all the way to
+                # the DB. decide() has always computed this; it used to be
+                # discarded at insert, which is what forced every downstream
+                # module to re-derive it -- and some re-derived it wrong.
+                "our_price_cents": decision["our_price_cents"],
                 "contracts": decision["contracts"],
                 "cost_cents": decision["cost_cents"],
                 "gap_points": decision["gap_points"],
