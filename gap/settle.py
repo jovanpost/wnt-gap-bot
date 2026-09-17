@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from . import fees, store
+from . import fees, outcomes, store
 from .kalshi import KalshiClient, market_result
 
 log = logging.getLogger("gap.settle")
@@ -66,11 +66,14 @@ def settle_run(run: dict, client: KalshiClient | None = None) -> dict:
             except Exception as exc:
                 log.warning("settle quote %s: %s", ticker, exc)
                 by_ticker[ticker] = None
-        if (order.get("exit_rule") == "scalp"
-                and str(order.get("status") or "").startswith("scalp_")):
+        status = str(order.get("status") or "")
+        # Keep a real scalp *hit*. A miss never printed Grok — still hold to settlement.
+        if order.get("exit_rule") == "scalp" and status == "scalp_hit":
             settled += 1
             continue
         outcome = by_ticker[ticker]
+        if outcome not in ("yes", "no", "void"):
+            outcome = outcomes.official_for(run.get("event_date") or "", order.get("word") or "")
         if outcome is None:
             open_n += 1
             continue
@@ -95,6 +98,39 @@ def settle_run(run: dict, client: KalshiClient | None = None) -> dict:
         f"run {run['id']} {run.get('event_date')} settled={settled} open={open_n} void={void_n}",
     )
     return {"ok": True, "settled": settled, "open": open_n, "void": void_n}
+
+
+def sync_gh_fills(date_str: str) -> int:
+    """H takes the same names G filled. Size is H's own intended, not a $1 clone of count."""
+    orders = store.orders_for_date(date_str)
+    g_fill = {
+        o.get("word"): float(o.get("filled_contracts") or 0)
+        for o in orders
+        if o.get("variant_id") == "G"
+    }
+    n = 0
+    for o in orders:
+        if o.get("variant_id") != "H":
+            continue
+        g = g_fill.get(o.get("word"), 0.0)
+        intended = float(o.get("contracts") or 0)
+        want = intended if g > 0 else 0.0
+        cur = float(o.get("filled_contracts") or 0)
+        if abs(cur - want) < 1e-9:
+            continue
+        store.update_order(o["id"], filled_contracts=round(want, 4))
+        n += 1
+    return n
+
+
+def apply_official(date_str: str) -> dict:
+    run = store.get_run_for_date(date_str)
+    if not run:
+        return {"ok": False, "reason": "no_run"}
+    synced = sync_gh_fills(date_str)
+    out = settle_run(run)
+    out["synced_h"] = synced
+    return out
 
 
 def settle_range(start_date: str, end_date: str) -> dict:

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from . import config as C, fees, fills, store
+from . import config as C, fees, fills, outcomes, store
 from .kalshi import KalshiClient, market_result, market_yes_quotes, market_mid_prob
 
 log = logging.getLogger("gap.board")
@@ -65,6 +65,12 @@ def _mark_yes(bid, ask, mid) -> int | None:
     return None
 
 
+def _hold_pnl(order: dict, outcome: str, filled: float) -> int:
+    our = _our_entry(order)
+    fee = fees.fee_cents(filled, our)
+    return fees.hold_pnl_cents(order.get("side") or "NO", filled, our, outcome, fee)
+
+
 def _unrealized_cents(order: dict, mark_yes: int | None) -> int | None:
     if mark_yes is None:
         return None
@@ -72,7 +78,8 @@ def _unrealized_cents(order: dict, mark_yes: int | None) -> int | None:
     if filled <= 0:
         return 0
     entry_yes = int(order.get("limit_price_cents") or 0)
-    entry_fee = fees.fee_cents(filled, entry_yes)
+    our = _our_entry(order)
+    entry_fee = fees.fee_cents(filled, our)
     if (order.get("side") or "NO") == "YES":
         gross = filled * (mark_yes - entry_yes)
     else:
@@ -123,26 +130,39 @@ def enrich_orders(orders: list[dict], quotes: dict[str, dict] | None = None) -> 
     rows = []
     for o in orders:
         q = quotes.get(o.get("market_ticker") or "", {})
-        mark_yes = _mark_yes(q.get("bid"), q.get("ask"), q.get("mid"))
+        date_str = str(o.get("event_date") or "")
+        result = (
+            outcomes.official_for(date_str, o.get("word") or "")
+            or q.get("result")
+            or o.get("result")
+        )
+        if result == "yes":
+            mark_yes = 100
+        elif result == "no":
+            mark_yes = 0
+        else:
+            mark_yes = _mark_yes(q.get("bid"), q.get("ask"), q.get("mid"))
         filled = _filled(o)
         sim = o.get("_fill") or {}
         intended = float(sim.get("intended_ct") or o.get("contracts") or 0)
+        our = _our_entry(o)
         if filled <= 0:
             cost = 0
-        elif sim.get("filled_cost_cents"):
-            cost = int(sim["filled_cost_cents"])
         else:
-            cost = int(o.get("cost_cents") or 0)
+            cost = int(round(filled * our))
         realized = o.get("realized_pnl_cents")
         sett = settlements.get(int(o["id"])) if o.get("id") is not None else None
         if realized is None and sett:
             realized = sett.get("net_cents")
-        closed = str(o.get("status") or "") in CLOSED
-        if closed and realized is not None:
+        status = str(o.get("status") or "")
+        if filled > 0 and result in ("yes", "no") and status != "scalp_hit":
+            pnl = _hold_pnl(o, result, filled)
+            mark_val = cost + pnl
+        elif status in CLOSED and realized is not None:
             pnl = int(realized)
             mark_val = cost + pnl
         else:
-            pnl = _unrealized_cents(o, mark_yes)
+            pnl = _unrealized_cents(o, mark_yes) if mark_yes is not None else None
             mark_val = _mark_value_cents(o, mark_yes)
         pct = (pnl / cost * 100.0) if (pnl is not None and cost) else None
         action = (
@@ -156,7 +176,7 @@ def enrich_orders(orders: list[dict], quotes: dict[str, dict] | None = None) -> 
         rows.append({
             **o,
             "action": action,
-            "fill_label": _status_label(o, q.get("result")),
+            "fill_label": _status_label(o, result if result in ("yes", "no") else q.get("result")),
             "intended_ct": round(intended, 2),
             "filled_ct": round(filled, 2),
             "unfilled_ct": round(max(0.0, intended - filled), 2),
@@ -219,11 +239,18 @@ def tonight(date_str: str) -> dict[str, Any]:
         from . import score
         extra_n = sum(1 for o in orders if o.get("variant_id") in ("E", "F", "G", "H"))
         key = f"scored_{date_str}"
-        if store.get_state(key) != "v1.4.5" or extra_n == 0:
+        if store.get_state(key) != "v1.4.7" or extra_n == 0:
             score.score_date(date_str, event_ticker=(run or {}).get("event_ticker"))
             orders = store.orders_for_date(date_str)
     except Exception:
         log.exception("score date")
+    try:
+        from . import settle
+        if date_str in outcomes.OFFICIAL:
+            settle.apply_official(date_str)
+            orders = store.orders_for_date(date_str)
+    except Exception:
+        log.exception("apply official")
     rows = enrich_orders(orders)
     return {
         "date": date_str,

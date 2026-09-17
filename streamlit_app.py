@@ -282,16 +282,28 @@ with tab_four:
         "Running paper totals across every night in the database. "
         "This is A–H on real booked tickets, not the old 128-night fixture."
     )
-    if st.button("Rebuild Sep 15 + rescore"):
-        from gap import score
-        try:
-            store.set_state("scored_2026-09-15", "")
-            out = score.score_date("2026-09-15")
-            st.write(out)
-        except Exception as exc:
-            st.exception(exc)
-        st.cache_data.clear()
-        st.rerun()
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button("Rebuild Sep 15 + rescore"):
+            from gap import score
+            try:
+                store.set_state("scored_2026-09-15", "")
+                out = score.score_date("2026-09-15")
+                st.write(out)
+            except Exception as exc:
+                st.exception(exc)
+            st.cache_data.clear()
+            st.rerun()
+    with cols[1]:
+        if st.button("Apply Sep 16 official yes/no"):
+            from gap import settle
+            try:
+                out = settle.apply_official("2026-09-16")
+                st.write(out)
+            except Exception as exc:
+                st.exception(exc)
+            st.cache_data.clear()
+            st.rerun()
     hist = board.history()
     books = hist["books"]
     st.caption(f"{len(hist['nights'])} nights · {hist['n_orders']} tickets · {hist['n_words']} word-nights")

@@ -311,13 +311,24 @@ def event_open_at(event: dict | None, markets: list[dict] | None = None) -> date
 
 def market_result(market: dict) -> str | None:
     """Official YES/NO after settlement. None if still open."""
-    raw = (market.get("result") or market.get("settlement_result") or "").strip().lower()
+    for key in ("result", "settlement_result", "market_result"):
+        raw = str(market.get(key) or "").strip().lower()
+        if raw in ("yes", "no", "void"):
+            return raw
     status = (market.get("status") or "").strip().lower()
-    if raw in ("yes", "no"):
-        return raw
-    if status in ("settled", "finalized", "closed") and raw in ("", "all_no", "void", "scalar"):
-        if raw in ("void",):
-            return "void"
+    if status in ("settled", "finalized"):
+        # settled books often leave yes_bid/ask at 0/1 or 99/100
+        bid = market.get("yes_bid") or market.get("yes_bid_dollars")
+        last = market.get("last_price") or market.get("last_price_dollars")
+        try:
+            if last is not None:
+                px = float(last)
+                if px >= 0.99:
+                    return "yes"
+                if px <= 0.01:
+                    return "no"
+        except Exception:
+            pass
     return None
 
 

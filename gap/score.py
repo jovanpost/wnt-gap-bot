@@ -320,7 +320,7 @@ def score_date(date_str: str, event_ticker: str | None = None) -> dict[str, Any]
             })
             n_hold += 1
     extra = ensure_eh_books(date_str, run, forecasts, tape_by, outcomes)
-    store.set_state(f"scored_{date_str}", "v1.4.5")
+    store.set_state(f"scored_{date_str}", "v1.4.7")
     store.log_activity("score", f"{date_str} hold={n_hold} scalp={n_scalp} zero={n_zero} extra={extra}")
     return {"ok": True, "hold": n_hold, "scalp": n_scalp, "zero": n_zero, "extra": extra}
 
