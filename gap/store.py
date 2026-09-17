@@ -365,7 +365,16 @@ def insert_order(row: dict) -> None:
                     :threshold, :cluster_key, :paper, :status,
                     :variant_id, :exit_rule, :notional_dollars, :execution_model
                 )
-                on conflict (event_date, market_ticker, variant_id) do update set
+                -- gap_orders_one_per_book is a PARTIAL unique index
+                -- (excludes rejected/cancelled rows, so a word can be
+                -- retried after a rejection instead of being permanently
+                -- blocked). Postgres only accepts a partial index as the
+                -- ON CONFLICT arbiter if the same predicate is repeated
+                -- here -- omitting it is what caused 'no unique or exclusion
+                -- constraint matching the ON CONFLICT specification'.
+                on conflict (event_date, market_ticker, variant_id)
+                    where status not in ('rejected', 'cancelled')
+                    do update set
                     forecast_id = excluded.forecast_id,
                     run_id = excluded.run_id,
                     word = excluded.word,
