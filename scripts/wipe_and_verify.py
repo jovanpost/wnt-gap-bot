@@ -25,7 +25,7 @@ try:
 except ImportError:
     sys.exit("pip install sqlalchemy psycopg2-binary")
 
-BAD_DAYS = ["2026-09-15", "2026-09-16"]
+DEFAULT_BAD_DAYS = ["2026-09-15", "2026-09-16"]
 
 
 def engine():
@@ -63,10 +63,10 @@ def check(eng):
         print(f"  {n}")
 
 
-def wipe(eng):
+def wipe(eng, days):
     with eng.begin() as cx:
         total = 0
-        for day in BAD_DAYS:
+        for day in days:
             # settlements first -- they reference orders
             s = cx.execute(text("""
                 delete from gap_settlements
@@ -140,6 +140,9 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--wipe", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--date", action="append", default=None,
+                     help="event_date to wipe, YYYY-MM-DD. Repeatable. "
+                          "Defaults to the original two corrupted days if omitted.")
     a = ap.parse_args()
     if not (a.check or a.wipe or a.verify):
         ap.print_help()
@@ -148,9 +151,10 @@ def main():
     if a.check:
         check(eng)
     if a.wipe:
-        confirm = input(f"Delete ALL order rows for {BAD_DAYS}? type YES: ")
+        days = a.date or DEFAULT_BAD_DAYS
+        confirm = input(f"Delete ALL order rows for {days}? type YES: ")
         if confirm.strip() == "YES":
-            wipe(eng)
+            wipe(eng, days)
         else:
             print("aborted")
     if a.verify:
