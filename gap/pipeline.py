@@ -348,11 +348,12 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
                 g = strategy.grok10_limit(p)
                 if not g:
                     continue
-                our_px = g["our_price_cents"]
+                our_px = int(g.get("our_price_cents") or strategy.our_price_cents(g["side"], g["yes_price_cents"]))
                 contracts = round(spec["notional"] / (our_px / 100.0), 2)
                 decision = {
                     "side": g["side"],
                     "yes_price_cents": g["yes_price_cents"],
+                    "our_price_cents": our_px,
                     "contracts": contracts,
                     "cost_cents": int(round(contracts * our_px)),
                     "gap_points": 0.0,
@@ -367,6 +368,10 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
                     continue
                 if rule == "fade15_gate50" and not strategy.fade_gate_ok(p, decision["side"]):
                     continue
+                if not decision.get("our_price_cents"):
+                    decision["our_price_cents"] = strategy.our_price_cents(
+                        decision["side"], decision["yes_price_cents"]
+                    )
             candidates.append({
                 "forecast_id": f.get("id"),
                 "run_id": run["id"],
@@ -375,11 +380,7 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
                 "word": f["word"],
                 "side": decision["side"],
                 "limit_price_cents": decision["yes_price_cents"],
-                # v1.4.8: carry the price of the side we hold all the way to
-                # the DB. decide() has always computed this; it used to be
-                # discarded at insert, which is what forced every downstream
-                # module to re-derive it -- and some re-derived it wrong.
-                "our_price_cents": decision["our_price_cents"],
+                "our_price_cents": int(decision["our_price_cents"]),
                 "contracts": decision["contracts"],
                 "cost_cents": decision["cost_cents"],
                 "gap_points": decision["gap_points"],
