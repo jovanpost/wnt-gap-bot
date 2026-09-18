@@ -23,12 +23,3 @@ def hold_pnl_cents(side: str, filled: float, avg_fill_cents: int,
     else:
         gross = filled * (-avg_fill_cents)
     return int(round(gross - fees))
-
-
-def scalp_pnl_cents(side: str, filled: float, entry_cents: int, exit_cents: int,
-                    entry_fee: int, exit_fee: int) -> int:
-    if filled <= 0:
-        return -(entry_fee + exit_fee)
-    # Both prices are the price of OUR side.
-    gross = filled * (exit_cents - entry_cents)
-    return int(round(gross - entry_fee - exit_fee))
