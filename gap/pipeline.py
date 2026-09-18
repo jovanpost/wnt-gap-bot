@@ -460,11 +460,12 @@ def expire_if_needed() -> None:
 
 
 def poll_once() -> dict:
-    try:
-        from . import tape
-        tape.track_tape()
-    except Exception:
-        log.exception("track_tape")
+    # v1.5.0: tape.track_tape() removed along with the scalp exit rule.
+    # It polled live quotes to decide whether an early exit had "hit" --
+    # exactly the live-quote-dependent pattern that caused every bug found
+    # in this repo's history. Nothing left needs a 60s tape poll; fills
+    # (apply_to_orders) and settlement (settle.apply_official) run from
+    # board.tonight() on each page load instead.
     if clock.is_saturday_ct():
         try:
             from . import weekly
