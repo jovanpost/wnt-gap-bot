@@ -30,7 +30,13 @@ def boot():
                 pipeline.poll_once()
             except Exception:
                 logging.getLogger("gap.poll").exception("poll_once")
-            time.sleep(5)
+            # Config says "poll ... every 60s" (see config.summary()); this was
+            # actually sleeping 5s, i.e. firing 12x more often than intended --
+            # every tick does a DB read (book_waiting_if_due) and, during the
+            # detection window, a Kalshi call too. 30s keeps responsiveness
+            # (fills/timers still checked twice a minute) while cutting that
+            # load 6x.
+            time.sleep(30)
 
     t = threading.Thread(target=_poll_loop, name="gap-poll", daemon=True)
     t.start()

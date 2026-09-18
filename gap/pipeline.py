@@ -9,7 +9,6 @@ from .kalshi import (
     KalshiClient,
     event_open_at,
     market_mid_prob,
-    market_yes_quotes,
     uniquify_words,
     word_from_market,
 )
@@ -310,16 +309,27 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
 
 
 def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
-    """One decision set, eight independent books. No shared size or cash."""
-    client = KalshiClient()
+    """One decision set, eight independent books. No shared size or cash.
+
+    Quote comes from no-fade's `depth` table (same shared Supabase project),
+    not a fresh Kalshi call -- see store.latest_nofade_depth. Falls back to
+    (None, None) if no-fade hasn't snapshotted this ticker yet, same as a
+    failed Kalshi call used to.
+    """
+    date_str = str(run.get("event_date") or "")[:10]
     signals = []
     for f in forecasts:
-        market = {}
+        bid = ask = None
         try:
-            market = client.get_market(f["market_ticker"])
+            snap = store.latest_nofade_depth(f["market_ticker"], date_str)
         except Exception as exc:
-            log.warning("quote %s: %s", f["market_ticker"], exc)
-        bid, ask = market_yes_quotes(market)
+            log.warning("depth quote %s: %s", f["market_ticker"], exc)
+            snap = None
+        if snap:
+            best_yes_bid = snap.get("best_yes_bid")
+            best_no_bid = snap.get("best_no_bid")
+            bid = best_yes_bid
+            ask = (100 - best_no_bid) if best_no_bid is not None else None
         mid = market_mid_prob(bid, ask)
         store.insert_quote(run["id"], f.get("id"), f["market_ticker"], bid, ask, mid)
         signals.append({

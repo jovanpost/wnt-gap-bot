@@ -4,6 +4,13 @@ Live: Kalshi get_fills on a resting order. Paper has no order on the matcher.
 Each poll: if the current book has YES bids at/through our Sell-YES limit,
 take min(remaining, that size) as a slice. Leave leftover resting and poll
 again. Do not invent fills from last price or volume.
+
+The book itself comes from no-fade's `depth` table (store.latest_nofade_depth),
+not a fresh Kalshi call -- no-fade already snapshots every market in the
+event every 60s, so asking Kalshi ourselves on top of that was pure
+duplication. If no-fade hasn't snapshotted a ticker yet (e.g. before 11:00
+CT), we get an empty book back and simply skip that tick, same as an
+exception used to be handled below.
 """
 from __future__ import annotations
 
@@ -12,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import clock, config as C, store
-from .kalshi import KalshiClient, book_metrics
+from .kalshi import book_metrics
 
 log = logging.getLogger("gap.fills")
 
@@ -165,14 +172,24 @@ def apply_to_orders(orders: list[dict], event_ticker: str | None = None) -> dict
             o["filled_contracts"] = 0
         store.set_state("fill_model", "dry_book_v134")
         store.log_activity("fills", "reset paper fills to dry-book model")
-    client = KalshiClient()
     tickers = sorted({o["market_ticker"] for o in orders if o.get("market_ticker")})
+    event_date = str((orders[0] or {}).get("event_date") or "")[:10]
     books: dict[str, dict] = {}
     for ticker in tickers:
         try:
-            books[ticker] = client.get_orderbook(ticker, depth=10)
+            snap = store.latest_nofade_depth(ticker, event_date)
         except Exception as exc:
-            log.warning("orderbook %s: %s", ticker, exc)
+            log.warning("depth lookup %s: %s", ticker, exc)
+            snap = None
+        if snap and (snap.get("yes_book") or snap.get("no_book")):
+            books[ticker] = {
+                "yes": snap.get("yes_book") or [],
+                "no": snap.get("no_book") or [],
+            }
+        else:
+            # No snapshot yet (e.g. before no-fade's 11:00 CT depth window
+            # opens for the day). Empty book -- apply_slice below already
+            # treats an empty book as "nothing crossed, keep resting".
             books[ticker] = {"yes": [], "no": []}
     for o in orders:
         ticker = o.get("market_ticker") or ""

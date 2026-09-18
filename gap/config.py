@@ -87,7 +87,7 @@ FILL_TAKE_FRACTION = float(_num("FILL_TAKE_FRACTION", 1.00))
 FILL_POLL_SECONDS = int(_num("FILL_POLL_SECONDS", 5))
 
 CT = ZoneInfo("America/Chicago")
-POLL_START_CT = _secret("POLL_START_CT", "10:00")
+POLL_START_CT = _secret("POLL_START_CT", "11:00")  # matches no-fade's depth window start
 JSON_DEADLINE_CT = _secret("JSON_DEADLINE_CT", "16:30")
 QUOTE_AFTER_PARSE = _flag("QUOTE_AFTER_PARSE", True)
 

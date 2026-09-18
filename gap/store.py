@@ -1,4 +1,12 @@
-"""Postgres (Supabase) store. gap_* tables only — never touch no-fade tables."""
+"""Postgres (Supabase) store. Writes only ever touch gap_* tables.
+
+Read-only exception: latest_nofade_depth() below SELECTs from no-fade's
+own `depth` table, which lives in this same shared Supabase project.
+no-fade already polls the full orderbook for every market in the event
+every 60s (11:00-18:15 CT) and stores it there -- re-polling Kalshi
+ourselves for the same ticker during that window is pure duplication.
+We never write to that table or any other no-fade table.
+"""
 from __future__ import annotations
 
 import json
@@ -511,3 +519,25 @@ def upsert_settlement(row: dict) -> None:
             """),
             row,
         )
+
+
+def latest_nofade_depth(market_ticker: str, event_date: str) -> dict | None:
+    """Read-only lookup into no-fade's `depth` table (same Supabase project,
+    different app). Returns the most recent orderbook snapshot no-fade has
+    already taken for this market today, or None if it hasn't snapshotted
+    this ticker yet (e.g. before 11:00 CT, or a ticker no-fade isn't
+    tracking). Callers must handle None -- it is not an error, just "no
+    data yet", and should fall back sensibly (an empty book, a skipped
+    tick) rather than raising.
+    """
+    with engine().connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT ts, best_yes_bid, best_no_bid, yes_book, no_book "
+                "FROM depth "
+                "WHERE market_ticker = :ticker AND event_date = :event_date "
+                "ORDER BY ts DESC LIMIT 1"
+            ),
+            {"ticker": market_ticker, "event_date": str(event_date)[:10]},
+        ).mappings().first()
+    return dict(row) if row else None
