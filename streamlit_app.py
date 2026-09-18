@@ -1,4 +1,4 @@
-"""Status light + eight-book board. No public order buttons."""
+"""Status light + six-book board. No public order buttons. No live marks."""
 from __future__ import annotations
 
 import logging
@@ -68,12 +68,13 @@ services = boot()
 
 st.title("📐 WNT Gap Bot")
 st.caption(
-    f"{C.VERSION} · eight paper books · mark-to-market from live Kalshi quotes · "
+    f"{C.VERSION} · six paper books, hold-to-settlement only · "
+    "no live marks — P&L shows once Kalshi publishes an official result · "
     "Telegram courier · Saturday weekly dump"
 )
 
 tab_live, tab_books, tab_four, tab_curve = st.tabs(
-    ["Tonight", "Eight books · P&L", "All nights · 8 books", "Cancel-window curve"]
+    ["Tonight", "Six books · P&L", "All nights · 6 books", "Cancel-window curve"]
 )
 
 # ---------------------------------------------------------------------------
@@ -145,19 +146,20 @@ with tab_books:
         date_str = st.text_input("Board date (CT)", value=clock.today_ct())
     with pick[1]:
         st.caption(
-            "A–D fade 15¢. E/F fade + Grok side ≥50.01 hold. "
-            "G/H Grok−10 hold, cancel 5:29 CT. Pick 2026-09-15 to see the rebuild."
+            "A/B fade 15¢. E/F fade + Grok side ≥50.01 hold. "
+            "G/H Grok−10 hold, cancel 5:29 CT. Scalp (C/D) removed v1.5.0."
         )
     with pick[2]:
-        if st.button("Refresh quotes", use_container_width=True):
+        if st.button("Refresh", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
     st.markdown(
-        "Live marks from Kalshi. **This** tab is the paper books. "
-        "The fixture tab is an old 128-night backtest — ignore it for last night."
+        "**No live marks.** A row shows P&L only once Kalshi has published "
+        "an official result for that market. Everything else reads *pending*. "
+        "The fixture/curve tab is an old 128-night backtest — ignore it for last night."
     )
 
-    @st.cache_data(ttl=20, show_spinner="Quoting Kalshi…")
+    @st.cache_data(ttl=20, show_spinner="Checking settlement…")
     def _tonight(d: str):
         return board.tonight(d)
 
@@ -168,29 +170,30 @@ with tab_books:
     if not rows:
         st.info("No paper orders yet for " + date_str)
     else:
-        for chunk_start in range(0, len(books), 4):
-            cards = st.columns(4)
-            for card, b in zip(cards, books[chunk_start:chunk_start + 4]):
+        for chunk_start in range(0, len(books), 3):
+            cards = st.columns(3)
+            for card, b in zip(cards, books[chunk_start:chunk_start + 3]):
                 with card:
                     st.subheader(b["label"])
-                    delta = f"{b['pct']:+.1f}%"
-                    st.metric("P&L", f"${b['pnl']:+.2f}", delta)
+                    if b["settled_n"] == 0:
+                        st.metric("P&L", "pending")
+                    else:
+                        st.metric("P&L", f"${b['pnl']:+.2f}", f"{b['pct']:+.1f}%")
                     st.caption(
-                        f"cost ${b['cost']:.2f} → mark ${b['mark']:.2f}\n\n"
-                        f"{b['filled']}/{b['n']} filled · W/L {b['wins']}/{b['losses']}"
+                        f"{b['filled']}/{b['n']} filled · {b['settled_n']}/{b['n']} settled · "
+                        f"W/L {b['wins']}/{b['losses']}"
                     )
 
         cmp = pd.DataFrame([
             {
                 "book": b["label"],
                 "size": f"${b['notional']:.0f}",
-                "exit": b["exit"],
                 "tickets": b["n"],
                 "filled": b["filled"],
+                "settled": b["settled_n"],
                 "cost $": round(b["cost"], 2),
-                "mark $": round(b["mark"], 2),
-                "P&L $": round(b["pnl"], 2),
-                "P&L %": round(b["pct"], 2),
+                "P&L $": round(b["pnl"], 2) if b["settled_n"] else None,
+                "P&L %": round(b["pct"], 2) if b["settled_n"] else None,
                 "W": b["wins"],
                 "L": b["losses"],
             }
@@ -204,15 +207,13 @@ with tab_books:
                 "P&L $": st.column_config.NumberColumn(format="$%+.2f"),
                 "P&L %": st.column_config.NumberColumn(format="%+.1f%%"),
                 "cost $": st.column_config.NumberColumn(format="$%.2f"),
-                "mark $": st.column_config.NumberColumn(format="$%.2f"),
             },
         )
 
         show_cols = [
             "word", "action", "fill_label", "intended_ct", "filled_ct",
-            "unfilled_ct", "fill_pct", "tape_ct", "book_cross_ct",
-            "entry_yes", "now_yes",
-            "cost_dollars", "mark_dollars", "pnl_dollars", "pnl_pct", "gap_points",
+            "unfilled_ct", "fill_pct", "entry_yes",
+            "cost_dollars", "pnl_dollars", "pnl_pct", "gap_points",
         ]
         labels = {
             "word": "word",
@@ -222,19 +223,14 @@ with tab_books:
             "filled_ct": "filled ct",
             "unfilled_ct": "left ct",
             "fill_pct": "fill %",
-            "tape_ct": "tape@L",
-            "book_cross_ct": "book@L",
             "entry_yes": "entry YES ¢",
-            "now_yes": "now YES bid/ask/mid",
             "cost_dollars": "cost $",
-            "mark_dollars": "mark $",
             "pnl_dollars": "P&L $",
             "pnl_pct": "P&L %",
             "gap_points": "gap ¢",
         }
         cfg = {
             "cost $": st.column_config.NumberColumn(format="$%.2f"),
-            "mark $": st.column_config.NumberColumn(format="$%.2f"),
             "P&L $": st.column_config.NumberColumn(format="$%+.2f"),
             "P&L %": st.column_config.NumberColumn(format="%+.1f%%"),
             "fill %": st.column_config.NumberColumn(format="%.0f%%"),
@@ -244,9 +240,10 @@ with tab_books:
 
         for b in books:
             sub = [r for r in rows if r.get("variant_id") == b["id"]]
+            pnl_label = "pending" if b["settled_n"] == 0 else f"${b['pnl']:+.2f} ({b['pct']:+.1f}%)"
             with st.expander(
-                f"{b['label']}  ·  ${b['pnl']:+.2f}  ({b['pct']:+.1f}%)  ·  "
-                f"{b['filled']}/{b['n']} filled",
+                f"{b['label']}  ·  {pnl_label}  ·  "
+                f"{b['filled']}/{b['n']} filled  ·  {b['settled_n']}/{b['n']} settled",
                 expanded=(b["id"] in ("A", "E", "G")),
             ):
                 if not sub:
@@ -273,52 +270,37 @@ with tab_books:
             st.code(md, language="markdown")
         st.caption(
             f"{snap['n_words']} words · {snap['n_orders']} tickets · "
-            "quotes cached 20s · Refresh quotes to force a pull"
+            "Refresh checks Kalshi for new settlements"
         )
 
 # ---------------------------------------------------------------------------
 with tab_four:
     st.markdown(
         "Running paper totals across every night in the database. "
-        "This is A–H on real booked tickets, not the old 128-night fixture."
+        "This is A/B/E/F/G/H on real booked tickets, not the old 128-night fixture. "
+        "No live marks here either — unsettled nights show *pending*."
     )
-    cols = st.columns(2)
-    with cols[0]:
-        if st.button("Rebuild Sep 15 + rescore"):
-            from gap import score
-            try:
-                store.set_state("scored_2026-09-15", "")
-                out = score.score_date("2026-09-15")
-                st.write(out)
-            except Exception as exc:
-                st.exception(exc)
-            st.cache_data.clear()
-            st.rerun()
-    with cols[1]:
-        if st.button("Apply Sep 16 official yes/no"):
-            from gap import settle
-            try:
-                out = settle.apply_official("2026-09-16")
-                st.write(out)
-            except Exception as exc:
-                st.exception(exc)
-            st.cache_data.clear()
-            st.rerun()
     hist = board.history()
     books = hist["books"]
     st.caption(f"{len(hist['nights'])} nights · {hist['n_orders']} tickets · {hist['n_words']} word-nights")
     if books:
-        for chunk_start in range(0, len(books), 4):
-            cards = st.columns(4)
-            for card, b in zip(cards, books[chunk_start:chunk_start + 4]):
+        for chunk_start in range(0, len(books), 3):
+            cards = st.columns(3)
+            for card, b in zip(cards, books[chunk_start:chunk_start + 3]):
                 with card:
                     st.subheader(b["label"])
-                    st.metric("P&L", f"${b['pnl']:+.2f}", f"{b['pct']:+.1f}%")
+                    if b["settled_n"] == 0:
+                        st.metric("P&L", "pending")
+                    else:
+                        st.metric("P&L", f"${b['pnl']:+.2f}", f"{b['pct']:+.1f}%")
                     st.caption(f"{b['filled']}/{b['n']} filled · W/L {b['wins']}/{b['losses']}")
         cmp = pd.DataFrame([{
             "book": b["label"], "tickets": b["n"], "filled": b["filled"],
-            "cost $": round(b["cost"], 2), "P&L $": round(b["pnl"], 2),
-            "P&L %": round(b["pct"], 2), "W": b["wins"], "L": b["losses"],
+            "settled": b["settled_n"],
+            "cost $": round(b["cost"], 2),
+            "P&L $": round(b["pnl"], 2) if b["settled_n"] else None,
+            "P&L %": round(b["pct"], 2) if b["settled_n"] else None,
+            "W": b["wins"], "L": b["losses"],
         } for b in books])
         st.dataframe(cmp, hide_index=True, use_container_width=True)
     else:
@@ -327,16 +309,17 @@ with tab_four:
 with tab_curve:
     st.markdown(
         "Same decision batch, same orders, cancel window extended "
-        "1 → 120 minutes. Average price paid is comparable across rows."
+        "1 → 120 minutes. Average price paid is comparable across rows. "
+        "This tab is historical fixture data, unrelated to live quotes."
     )
-    board = fixture_board()
+    board_fx = fixture_board()
     left, right = st.columns(2)
     with left:
         st.write("**$1 hold**")
-        st.dataframe(pd.DataFrame(board["curve_1"]), hide_index=True)
+        st.dataframe(pd.DataFrame(board_fx["curve_1"]), hide_index=True)
     with right:
         st.write("**$100 hold**")
-        st.dataframe(pd.DataFrame(board["curve_100"]), hide_index=True)
+        st.dataframe(pd.DataFrame(board_fx["curve_100"]), hide_index=True)
     st.caption(
         "$100 fill % still climbing at 60m on the informal table is why 90 and "
         "120 are on this curve. If it has not flattened, do not freeze 60 yet."
