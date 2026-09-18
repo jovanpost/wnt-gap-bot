@@ -47,7 +47,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.4.9"
+VERSION = "wnt-gap-v1.5.0"
 PROMPT_VERSION = _secret("PROMPT_VERSION", "gap-v1.0")
 HARNESS = _secret("HARNESS", "grok-web-expert")
 MODEL_LABEL = _secret("MODEL_LABEL", "grok-web-expert")
@@ -58,11 +58,16 @@ GAP_THRESHOLD = int(_num("GAP_THRESHOLD", 15))
 # How far we walk from the quoted mid toward the model. Not the filter.
 # Filter 15 + take 15 on a 16¢ gap leaves ~0¢ vs the tape. Default 8.
 LIMIT_OFFSET_CENTS = int(_num("LIMIT_OFFSET_CENTS", 8))
+# v1.5.0: C/D (scalp) removed entirely. Scalp required trusting a LIVE
+# Kalshi quote to decide when an early exit had "hit" -- that pattern caused
+# four independent bugs in two days (tape.py x2, score.py x2), because a
+# quote read after a market closes is not a live price, it is garbage, and
+# every consumer of it eventually got that wrong in some way. Hold-to-
+# settlement needs exactly one trustworthy signal -- Kalshi's final result --
+# and nothing else. That is the only exit rule left in this repo.
 VARIANTS = (
     {"id": "A", "notional": 1.0, "exit": "hold", "rule": "fade15", "cancel": "send60", "label": "A · $1 hold fade"},
     {"id": "B", "notional": 100.0, "exit": "hold", "rule": "fade15", "cancel": "send60", "label": "B · $100 hold fade"},
-    {"id": "C", "notional": 1.0, "exit": "scalp", "rule": "fade15", "cancel": "send60", "label": "C · $1 scalp fade"},
-    {"id": "D", "notional": 100.0, "exit": "scalp", "rule": "fade15", "cancel": "send60", "label": "D · $100 scalp fade"},
     {"id": "E", "notional": 1.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "send60", "label": "E · $1 hold fade+Grok>50"},
     {"id": "F", "notional": 100.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "send60", "label": "F · $100 hold fade+Grok>50"},
     {"id": "G", "notional": 1.0, "exit": "hold", "rule": "grok10", "cancel": "show529", "label": "G · $1 hold Grok−10"},
@@ -116,7 +121,7 @@ def summary() -> str:
         f"|gap|>{GAP_THRESHOLD}¢ | take {LIMIT_OFFSET_CENTS}¢ from mid | "
         f"poll from {POLL_START_CT} every 60s | file first-seen+{DECISION_LAG_MIN}m | "
         f"cancel send+{CANCEL_AFTER_MIN}m\n"
-        f"A/B fade hold · C/D fade scalp · E/F fade+Grok>50 hold · G/H Grok−10 hold cancel 5:29 CT\n"
+        f"A/B fade hold · E/F fade+Grok>50 hold · G/H Grok-10 hold cancel 5:29 CT · scalp removed v1.5.0\n"
         f"NO bankroll / NO night cap / NO cluster cap\n"
         f"prompt {PROMPT_VERSION} | harness {HARNESS} | addendum {ADDENDUM}\n"
         f"poll {POLL_START_CT} CT | json deadline {JSON_DEADLINE_CT} CT"
