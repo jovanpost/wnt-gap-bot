@@ -23,3 +23,18 @@ def hold_pnl_cents(side: str, filled: float, avg_fill_cents: int,
     else:
         gross = filled * (-avg_fill_cents)
     return int(round(gross - fees))
+
+
+def scalp_pnl_cents(side: str, filled: float, entry_cents: int, exit_cents: int,
+                    entry_fee: int, exit_fee: int) -> int:
+    """Used ONLY by gap/backtest.py's historical fixture curve (the old
+    128-night comparison, unrelated to live paper trading). Removing this
+    when scalp was dropped from the live bot was a mistake -- backtest.py
+    still runs its own internal hold-vs-scalp comparison on static
+    historical data for the Cancel-window curve tab. Restored verbatim from
+    the pre-v1.5.0 file so that comparison keeps working unchanged."""
+    if filled <= 0:
+        return -(entry_fee + exit_fee)
+    # Both prices are the price of OUR side.
+    gross = filled * (exit_cents - entry_cents)
+    return int(round(gross - entry_fee - exit_fee))
