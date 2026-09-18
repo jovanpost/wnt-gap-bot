@@ -36,7 +36,6 @@ def build_week_report(start: str | None = None, end: str | None = None) -> tuple
     lines.append("Do NOT read A vs B as a size study. Entry size is still untested.")
     lines.append("fills like $1. Real tape (60m): ~95% fill at $20 vs ~84% at $100.")
     lines.append("A real sweep also fills through the cap, not only at the cap.")
-    lines.append("C/D scalp: cover when YES ask (NO side) or YES bid (YES side) tags Grok.")
     lines.append("E/F: same fade as A/B but skip unless Grok p on the bought side >= 50.01.")
     lines.append("G/H: no gap. Rest 10¢ cheap to Grok on Grok's side. Cancel 5:29 CT.")
     lines.append("Do not invent fills after 1¢. Leftover at cancel = unfilled.")
@@ -127,7 +126,8 @@ def build_week_report(start: str | None = None, end: str | None = None) -> tuple
     lines.append("Read the frozen rules. Do not invent a bankroll, cluster cap, or $5 size.")
     lines.append("Compare A-H on this week only. E/F vs A/B is the 50.01 gate.")
     lines.append("G/H vs A/B is Grok-10 until 5:29, not the 15¢ fade.")
-    lines.append("C/D scalp vs A/B hold. Do not retune 15¢ or 26¢ no-fade from one night.")
+    lines.append("Scalp (C/D) removed v1.5.0 -- live-quote-dependent, caused repeated bugs. "
+                 "Six hold books only. Do not retune 15¢ or 26¢ no-fade from one night.")
     text = "\n".join(lines) + "\n"
     fname = f"gap-week-{week_id}.txt"
     return fname, text
