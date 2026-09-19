@@ -1,0 +1,41 @@
+name: Weekly dump (Saturday 7am Central)
+
+# Two schedules because GitHub uses UTC and Central time changes with the seasons:
+#   12:05 UTC = 7:05 AM in summer (CDT)    13:05 UTC = 7:05 AM in winter (CST)
+# gap/weekly.py itself refuses to send before 7:00 AM CT and refuses to send twice,
+# so the "wrong" one of the two runs just says "not due yet" or "already sent".
+on:
+  schedule:
+    - cron: "5 12 * * 6"
+    - cron: "5 13 * * 6"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Send now even if already sent (true/false)"
+        default: "false"
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install only what the report needs
+        run: pip install requests cryptography SQLAlchemy psycopg2-binary python-dotenv
+
+      - name: Send the weekly dump
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            python scripts/weekly.py --force
+          else
+            python scripts/weekly.py
+          fi
