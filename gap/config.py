@@ -1,7 +1,9 @@
 """Env / Streamlit secrets. Frozen strategy knobs live here."""
 from __future__ import annotations
 
+import hashlib
 import os
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 try:
@@ -48,7 +50,48 @@ DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
 VERSION = "wnt-gap-v1.5.0"
-PROMPT_VERSION = _secret("PROMPT_VERSION", "gap-v1.0")
+# ---------------------------------------------------------------------------
+# The system prompt lives in a plain text file you edit on GitHub:
+#     prompts/system_prompt.txt
+# Replace the whole file to change the prompt. Git history = prompt history.
+# It is read fresh every time it is needed, so a new prompt takes effect on the
+# next file the bot builds. No secret to bump: the version label is made from
+# the text itself ("gap-" + first 7 letters of its SHA-1).
+# ---------------------------------------------------------------------------
+PROMPT_FILE = Path(__file__).resolve().parent.parent / "prompts" / "system_prompt.txt"
+PROMPT_MIN_CHARS = 500  # anything shorter is almost surely an accident (empty file, half paste)
+
+
+def prompt_text() -> str:
+    """The exact system prompt, read from prompts/system_prompt.txt. Raises if unusable."""
+    try:
+        raw = PROMPT_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"prompt file missing: prompts/system_prompt.txt ({exc})") from exc
+    text = raw.replace("\r\n", "\n").strip()
+    if len(text) < PROMPT_MIN_CHARS:
+        raise RuntimeError(
+            f"prompt file too short ({len(text)} chars, need at least {PROMPT_MIN_CHARS}): "
+            "prompts/system_prompt.txt"
+        )
+    return text
+
+
+def prompt_version() -> str:
+    try:
+        text = prompt_text()
+    except RuntimeError:
+        return "gap-NO-PROMPT-FILE"
+    return "gap-" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:7]
+
+
+def __getattr__(name: str):
+    # Lets old code keep writing C.PROMPT_VERSION and always get the CURRENT label.
+    if name == "PROMPT_VERSION":
+        return prompt_version()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 HARNESS = _secret("HARNESS", "grok-web-expert")
 MODEL_LABEL = _secret("MODEL_LABEL", "grok-web-expert")
 ADDENDUM = "v1.4"
@@ -123,6 +166,6 @@ def summary() -> str:
         f"cancel send+{CANCEL_AFTER_MIN}m\n"
         f"A/B fade hold · E/F fade+Grok>50 hold · G/H Grok-10 hold cancel 5:29 CT · scalp removed v1.5.0\n"
         f"NO bankroll / NO night cap / NO cluster cap\n"
-        f"prompt {PROMPT_VERSION} | harness {HARNESS} | addendum {ADDENDUM}\n"
+        f"prompt {prompt_version()} | harness {HARNESS} | addendum {ADDENDUM}\n"
         f"poll {POLL_START_CT} CT | json deadline {JSON_DEADLINE_CT} CT"
     )
