@@ -55,6 +55,15 @@ P_BINS = tuple((lo, lo + 10) for lo in range(0, 100, 10))
 WIDE_BINS = ((0, 20, "0-19"), (20, 40, "20-39"), (40, 60, "40-59"), (60, 80, "60-79"), (80, 101, "80+"))
 MARKET_RULES = ("fade15", "fade15_gate50", "edge_exec")
 
+# ---- Slice K (pre-registered W38 review). DO NOT CHANGE THESE NUMBERS. ----
+# K = Book A orders where side = NO, Grok <= 30, quote valid at booking, |Grok - mid| strictly > 15.
+# Frozen until 30 FILLED trades or 6 weeks, whichever comes first.
+K_MAX_GROK = 30
+K_MIN_GAP = 15          # fixed at 15 on purpose: does not follow GAP_THRESHOLD if that ever changes
+K_MIN_FILLED = 30
+K_WINDOW_WEEKS = 6
+K_PASS_MARGIN = 5.0     # points
+
 _COUNT_RES = (
     re.compile(r"\d+\s*\+"),                          # "5+", "Trump (5+ times)"
     re.compile(r"\b\d+\s*(?:times|mentions)\b", re.I),  # "3 times"
@@ -383,17 +392,26 @@ def _order_row(o, s, run_date, row_by_ticker, status_label):
         "pre_rule_invalid": pre_rule,
         "hyp": hyp,
         "legacy_px": o.get("our_price_cents") in (None, ""),
+        "quote_valid": bool(Q.validate(qb, qa)[0]),
+        "is_count": bool(trow.get("is_count")),
+        "gap_exact": (strategy.gap_points_exact(int(round(trow["grok"])), int(round(qb)), int(round(qa)))
+                      if (trow.get("grok") is not None and qb is not None and qa is not None) else None),
     }
 
 
-def collect(start: str, end: str) -> dict:
-    """Pull everything into plain-Python structures (no Decimals anywhere)."""
-    for run in store.runs_between(start, end):        # H mirrors G's fills, exactly as the board does
-        try:
-            settle.sync_gh_fills(str(run["event_date"])[:10])
-        except Exception:
-            log.exception("sync_gh_fills")
-    settle_totals = settle.settle_range(start, end)   # also recomputes fees for the week
+def collect(start: str, end: str, light: bool = False) -> dict:
+    """Pull everything into plain-Python structures (no Decimals anywhere).
+    light=True is for the Streamlit page: read the database only (no settle sweep, no Kalshi
+    calls, no activity log). Results come from the permanent gap_results cache."""
+    if not light:
+        for run in store.runs_between(start, end):    # H mirrors G's fills, exactly as the board does
+            try:
+                settle.sync_gh_fills(str(run["event_date"])[:10])
+            except Exception:
+                log.exception("sync_gh_fills")
+        settle_totals = settle.settle_range(start, end)   # also recomputes fees for the week
+    else:
+        settle_totals = {"light": True}
     all_runs = store.runs_between("2000-01-01", end)
     go_live_val, go_live = store.state_meta("fill_model")
     voids = store.get_state("void_nights", {}) or {}
@@ -410,9 +428,15 @@ def collect(start: str, end: str) -> dict:
         packs.append((run, forecasts, markets, qrows))
         tickers.update(f["market_ticker"] for f in forecasts)
         tickers.update(m["market_ticker"] for m in markets)
-    outcome_by_ticker, fetch_errors = results.results_for(tickers)
+    if light:
+        cached = store.results_cached(sorted(tickers))
+        outcome_by_ticker = {t: cached.get(t) for t in tickers}
+        fetch_errors = 0
+    else:
+        outcome_by_ticker, fetch_errors = results.results_for(tickers)
 
     nights = []
+    slice_orders: list = []     # every order of every week (slice K needs the history)
     history_rows = []           # every scored forecast row from every week (for week-over-week)
     run_meta_by_week: dict = {}
     for run, forecasts, markets, qrows in packs:
@@ -427,19 +451,25 @@ def collect(start: str, end: str) -> dict:
         })
         if rows and d not in voids:
             history_rows.extend(rows)
-        if not (start <= d <= end):
-            continue
         orders = store.orders_for_run(run["id"])
-        settles = store.settlements_for_order_ids([o["id"] for o in orders])
+        settles = store.settlements_for_order_ids([o["id"] for o in orders]) if orders else {}
         status, why = _night_status(run, len(forecasts), len(orders), go_live, voids)
         row_by_ticker = {r["ticker"]: r for r in rows}
         orows = []
+        plabel = str(run.get("prompt_version") or "?")
+        if pt and _sha7(_prompt_head(pt)) not in plabel:
+            plabel += f" ({_sha7(_prompt_head(pt))})"
         for o in orders:
             s = settles.get(int(o["id"]), {})
             orow = _order_row(o, s, d, row_by_ticker, status)
+            orow["week"] = wk
+            orow["prompt"] = plabel
             orows.append(orow)
             if orow["ticker"] in row_by_ticker:
                 row_by_ticker[orow["ticker"]]["trades"].append(orow)
+        slice_orders.extend(orows)
+        if not (start <= d <= end):
+            continue
         for r in rows:
             r["night_status"] = status
         wl = _obj(run.get("word_list")) or []
@@ -454,11 +484,15 @@ def collect(start: str, end: str) -> dict:
     # activity log -> per-night timeline
     activity: dict = {}
     try:
+        if light:
+            raise StopIteration
         lo = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=C.CT).astimezone(timezone.utc)
         hi = (datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=C.CT) + timedelta(days=1, hours=12)).astimezone(timezone.utc)
         for a in store.activity_between(lo, hi):
             d = clock.parse_dt(a["at"]).astimezone(C.CT).strftime("%Y-%m-%d")
             activity.setdefault(d, []).append(a)
+    except StopIteration:
+        pass
     except Exception:
         log.exception("activity timeline skipped")
 
@@ -467,6 +501,7 @@ def collect(start: str, end: str) -> dict:
         "settle_totals": settle_totals,
         "nights": nights,
         "history_rows": history_rows,
+        "slice_orders": slice_orders,
         "run_meta_by_week": run_meta_by_week,
         "all_runs": all_runs,
         "go_live": go_live, "go_live_model": go_live_val,
@@ -684,6 +719,13 @@ def _nights_status_block(data) -> list[str]:
     return lines
 
 
+def blend(r):
+    """Simple average of Grok and the market mid (points). Needs a valid quote."""
+    if r.get("grok") is None or r.get("mid") is None:
+        return None
+    return (r["grok"] + r["mid"]) / 2.0
+
+
 def _group_stats(rows):
     n = len(rows)
     if not n:
@@ -695,6 +737,7 @@ def _group_stats(rows):
         "grok_mean": _mean([r["grok"] for r in rows]),
         "b_g": _brier([(r["grok"] / 100.0, r["y"]) for r in rows]),
         "b_m": _brier([(r["mid"] / 100.0, r["y"]) for r in rows]),
+        "b_bl": _brier([(blend(r) / 100.0, r["y"]) for r in rows]),
         "b_base": _brier([(base, r["y"]) for r in rows]),
     }
 
@@ -704,7 +747,8 @@ def _sb_line(label, st) -> str:
         return f"{label:<14}{'0':>5}   (no valid-quote words with a result)"
     diff = st["b_g"] - st["b_m"]
     return (f"{label:<14}{st['n']:>5}{100 * st['base']:>7.0f}%{_fx(st['grok_mean'], 1):>10}"
-            f"{st['b_g']:>10.4f}{st['b_m']:>10.4f}{st['b_base']:>12.4f}{diff:>+11.4f}")
+            f"{st['b_g']:>10.4f}{st['b_m']:>10.4f}{st['b_bl']:>10.4f}{st['b_base']:>12.4f}"
+            f"{diff:>+11.4f}{st['b_bl'] - st['b_m']:>+11.4f}")
 
 
 def _scoreboard_block(data) -> list[str]:
@@ -714,9 +758,10 @@ def _scoreboard_block(data) -> list[str]:
     lines = [
         f"VALID-quote words only. Excluded: {sum(1 for r in sc if not r['quote_valid'])} scored words with an "
         f"INVALID/missing quote, {sum(1 for r in wr if r['y'] is None)} words with no result yet.",
-        "The market mid is the yardstick. Brier: lower is better. Grok - market < 0 means Grok BEAT the market.",
+        "The market mid is the yardstick. Brier: lower is better. G - M < 0 means Grok BEAT the market. "
+        "BL = blend = (Grok + market mid) / 2; BL - M < 0 means the blend beat the market.",
         "",
-        f"{'group':<14}{'n':>5}{'YES%':>8}{'avg Grok':>10}{'Brier G':>10}{'Brier M':>10}{'Brier base':>12}{'G - M':>11}",
+        f"{'group':<14}{'n':>5}{'YES%':>8}{'avg Grok':>10}{'Brier G':>10}{'Brier M':>10}{'Brier BL':>10}{'Brier base':>12}{'G - M':>11}{'BL - M':>11}",
         _sb_line("all", _group_stats(vs)),
         _sb_line("count words", _group_stats([r for r in vs if r["is_count"]])),
         _sb_line("plain words", _group_stats([r for r in vs if not r["is_count"]])),
@@ -731,7 +776,7 @@ def _wow_block(data) -> list[str]:
         if r["y"] is not None and r["grok"] is not None and r["quote_valid"] and r["mid"] is not None:
             by_week.setdefault(r["week"], []).append(r)
     weeks = sorted(set(by_week) | set(data["run_meta_by_week"]))
-    lines = [f"{'week':<10}{'prompt (version / sha)':<30}{'nights':>7}{'words':>7}{'Brier G':>9}{'Brier M':>9}{'base':>8}{'G - M':>9}"]
+    lines = [f"{'week':<10}{'prompt (version / sha)':<30}{'nights':>7}{'words':>7}{'Brier G':>9}{'Brier M':>9}{'Brier BL':>9}{'base':>8}{'G - M':>9}"]
     for wk in weeks:
         meta = [m for m in data["run_meta_by_week"].get(wk, []) if m["usable"]]
         labels = []
@@ -744,9 +789,9 @@ def _wow_block(data) -> list[str]:
         mark = "  <- this week" if wk == data["week_id"] else ""
         if st:
             lines.append(f"{wk:<10}{_trunc(' / '.join(labels), 28):<30}{len(meta):>7}{st['n']:>7}{st['b_g']:>9.4f}"
-                         f"{st['b_m']:>9.4f}{st['b_base']:>8.4f}{st['b_g'] - st['b_m']:>+9.4f}{mark}")
+                         f"{st['b_m']:>9.4f}{st['b_bl']:>9.4f}{st['b_base']:>8.4f}{st['b_g'] - st['b_m']:>+9.4f}{mark}")
         else:
-            lines.append(f"{wk:<10}{_trunc(' / '.join(labels) or '-', 28):<30}{len(meta):>7}{0:>7}{'n/a':>9}{'n/a':>9}{'n/a':>8}{'n/a':>9}{mark}")
+            lines.append(f"{wk:<10}{_trunc(' / '.join(labels) or '-', 28):<30}{len(meta):>7}{0:>7}{'n/a':>9}{'n/a':>9}{'n/a':>9}{'n/a':>8}{'n/a':>9}{mark}")
     lines.append("One prompt per week, so each row is one prompt's score against the market. "
                  "'version' is what was recorded when the night was detected; sha = hash of the prompt text actually sent.")
     return lines
@@ -862,6 +907,154 @@ def _books_block(data) -> list[str]:
     for o in sorted(part, key=lambda x: (x["date"], x["variant"]))[:40]:
         lines.append(f"  {o['date']} [{o['variant']}] {o['word']} {o['side']} filled {o['filled']:.2f} of {o['intended']:.2f} "
                      f"({o['fill_pct']:.0f}%) -> {o['state']}" + (f" net {_money(o['net'])}" if o["net"] is not None else ""))
+    return lines
+
+
+def _k_member(o, book="A") -> bool:
+    """Is this order in the pre-registered slice? (Book A: NO side, Grok <= 30, valid quote, |gap| strictly > 15.
+    Book I: same but I's own edge rule already applied at booking.)"""
+    if o["variant"] != book or o["excluded"] or o["side"] != "NO":
+        return False
+    if o["grok"] is None or o["grok"] > K_MAX_GROK or not o["quote_valid"]:
+        return False
+    if book == "A":
+        g = o["gap_exact"]
+        return g is not None and abs(g) > K_MIN_GAP
+    return True
+
+
+def _k_stats(orders):
+    filled = [o for o in orders if o["filled"] > 0]
+    settled = [o for o in filled if o["state"] in ("won", "lost")]
+    won = [o for o in settled if o["state"] == "won"]
+    unf = [o for o in orders if o["state"] == "unfilled" and o["hyp"] is not None]
+    risk = sum(o["cost"] for o in settled)
+    net = sum(o["net"] or 0 for o in settled)
+    px = _mean([o["our_px"] for o in settled])
+    fee_pc = _mean([(o["fees"] or 0) / o["filled"] for o in settled if o["filled"]])
+    hit = (100.0 * len(won) / len(settled)) if settled else None
+    be = (px + fee_pc) if (px is not None and fee_pc is not None) else None
+    return {
+        "booked": len(orders), "filled": len(filled), "unfilled": sum(1 for o in orders if o["state"] == "unfilled"),
+        "w": len(won), "l": len(settled) - len(won),
+        "hit": hit,
+        "gross": sum(o["gross"] or 0 for o in settled), "fees": sum(o["fees"] or 0 for o in settled), "net": net,
+        "roi": (100.0 * net / risk) if risk else None,
+        "px": px, "be": be,
+        "margin": (hit - be) if (hit is not None and be is not None) else None,
+        "unf_hit": (100.0 * sum(1 for o in unf if o["hyp"] > 0) / len(unf)) if unf else None,
+        "unf_n": len(unf),
+    }
+
+
+def _k_status(st, weeks_in) -> str:
+    if st["filled"] < K_MIN_FILLED:
+        tag = f"TOO EARLY (fewer than {K_MIN_FILLED} filled: {st['filled']})"
+    elif st["margin"] is None:
+        tag = "UNCLEAR"
+    elif st["margin"] >= K_PASS_MARGIN:
+        tag = f"PASSING (margin {st['margin']:+.1f} points, needs >= +{K_PASS_MARGIN:.0f})"
+    elif st["margin"] < 0:
+        tag = f"FAILING (margin {st['margin']:+.1f} points)"
+    else:
+        tag = f"UNCLEAR (margin {st['margin']:+.1f} points, between 0 and +{K_PASS_MARGIN:.0f})"
+    if weeks_in >= K_WINDOW_WEEKS or st["filled"] >= K_MIN_FILLED:
+        tag += "  [FROZEN WINDOW OVER: this is the final read]"
+    else:
+        tag += f"  [week {weeks_in} of {K_WINDOW_WEEKS}; frozen until {K_MIN_FILLED} filled or {K_WINDOW_WEEKS} weeks]"
+    return tag
+
+
+def _k_panel(data, book) -> dict:
+    allo = [o for o in data["slice_orders"] if not o["excluded"]]
+    members = [o for o in allo if _k_member(o, book)]
+    weeks = sorted({o["week"] for o in allo})
+    rows = []
+    for wk in weeks:
+        wm = [o for o in members if o["week"] == wk]
+        plabels = sorted({o["prompt"] for o in allo if o["week"] == wk})
+        rows.append({"label": wk, "prompt": " / ".join(plabels), **_k_stats(wm)})
+    cum = _k_stats(members)
+    rows.append({"label": "CUMULATIVE", "prompt": "all weeks", **cum})
+    first = min((o["date"] for o in allo), default=None)
+    if first:
+        d0 = datetime.strptime(first, "%Y-%m-%d").date()
+        mon0 = d0 - timedelta(days=d0.weekday())
+        cur = datetime.strptime(data["end"] if data["start"] < "2001" else data["start"], "%Y-%m-%d").date()
+        weeks_in = max(1, (cur - mon0).days // 7 + 1)
+    else:
+        weeks_in = 1
+    detail = [{
+        "date": o["date"], "book": o["variant"], "word": o["word"], "grok": o["grok"],
+        "gap": o["gap_exact"], "our_px": o["our_px"], "fill_pct": round(o["fill_pct"], 0),
+        "state": o["state"], "net_dollars": None if o["net"] is None else round(o["net"] / 100.0, 2),
+        "is_count": o["is_count"],
+    } for o in sorted(members, key=lambda x: (x["date"], x["word"]))]
+    return {"rows": rows, "cum": cum, "weeks_in": weeks_in, "status": _k_status(cum, weeks_in), "orders": detail}
+
+
+def score_panel(data) -> dict:
+    """Grok vs market vs blend on valid-quote words, all weeks together and week by week."""
+    wr = _week_rows(data)
+    vs = _valid_scored(wr)
+
+    def line(label, rows):
+        st = _group_stats(rows)
+        if not st:
+            return None
+        return {"group": label, "n": st["n"], "yes_pct": 100 * st["base"], "avg_grok": st["grok_mean"],
+                "brier_grok": st["b_g"], "brier_market": st["b_m"], "brier_blend": st["b_bl"], "brier_base": st["b_base"],
+                "grok_minus_market": st["b_g"] - st["b_m"], "blend_minus_market": st["b_bl"] - st["b_m"]}
+
+    out = [x for x in (line("all", vs), line("count words", [r for r in vs if r["is_count"]]),
+                       line("plain words", [r for r in vs if not r["is_count"]])) if x]
+    weekly_rows = []
+    for wk in sorted({r["week"] for r in vs}):
+        x = line(wk, [r for r in vs if r["week"] == wk])
+        if x:
+            weekly_rows.append(x)
+    return {"cumulative": out, "by_week": weekly_rows}
+
+
+def slice_panel() -> dict:
+    """Everything the Streamlit 'Book K' tab shows. Database only, no network."""
+    end = clock.today_ct()
+    data = collect("2000-01-01", end, light=True)
+    return {"k": _k_panel(data, "A"), "i": _k_panel(data, "I"), "score": score_panel(data),
+            "asof": clock.fmt(clock.now_ct())}
+
+
+def _k_table(data, book, title):
+    panel = _k_panel(data, book)
+    hdr = (f"{'week':<12}{'prompt':<24}{'booked':>7}{'filled':>7}{'unfil':>6}{'W':>4}{'L':>4}{'hit%':>6}"
+           f"{'gross$':>9}{'fees$':>7}{'net$':>9}{'ROI%':>7}{'avg px':>8}{'break-even':>11}{'margin':>8}{'unf would-hit':>15}")
+    lines = [title, hdr]
+    for r in panel["rows"]:
+        uh = f"{_fx(r['unf_hit'], 0)}% ({r['unf_n']})" if r["unf_n"] else "n/a"
+        lines.append(f"{r['label']:<12}{_trunc(r['prompt'], 22):<24}{r['booked']:>7}{r['filled']:>7}{r['unfilled']:>6}{r['w']:>4}{r['l']:>4}"
+                     f"{_fx(r['hit'], 0):>6}{r['gross'] / 100:>+9.2f}{r['fees'] / 100:>7.2f}{r['net'] / 100:>+9.2f}"
+                     f"{_fx(r['roi'], 0):>7}{_fx(r['px'], 1):>8}{_fx(r['be'], 1):>11}{_fx(r['margin'], 1):>8}{uh:>15}")
+    return lines, panel
+
+
+def _book_k_block(data) -> list[str]:
+    lines = [
+        "PRE-REGISTERED SLICE. Not new orders: a filter on Book A's existing orders. The numbers below are FROZEN.",
+        f"K = a Book A order where ALL are true: side = NO | Grok <= {K_MAX_GROK} (inclusive) | quote VALID at booking | "
+        f"|Grok - mid| strictly > {K_MIN_GAP}. Count words (Trump 5+, Iran 3+) stay in.",
+        f"Frozen for {K_MIN_FILLED} filled trades or {K_WINDOW_WEEKS} weeks, whichever comes first. "
+        "Question: do Book A's NO-side fades where Grok is low make money after fees?",
+        "break-even hit% = average NO price paid + average fee per contract (both in points). margin = hit% - break-even.",
+        "unf would-hit = of K orders that never filled, the share that would have won had they filled (count in brackets).",
+        "",
+    ]
+    tab, panel = _k_table(data, "A", "BOOK K (Book A slice)")
+    lines += tab
+    lines.append("")
+    lines.append("STATUS: " + panel["status"])
+    lines.append("")
+    tab_i, _ = _k_table(data, "I", "BOOK I, same slice (side = NO, Grok <= 30, valid quote; I's own edge rule applies)")
+    lines += tab_i
     return lines
 
 
@@ -1398,6 +1591,7 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines.append(" 3 Scoreboard vs market     8 Biggest misses / wins             13 Ask for Claude")
     lines.append(" 4 Books: gross/fees/net    9 Data-quality flags")
     lines.append(" 5 Fill-selection check    10 Rules and settings")
+    lines.append(" 4B BOOK K: the pre-registered NO-side fade slice (Book A) and the same slice for Book I")
 
     _hdr(lines, "1. NIGHT STATUS")
     lines += _nights_status_block(data)
@@ -1409,6 +1603,8 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines += _wow_block(data)
     _hdr(lines, "4. BOOKS: COUNTS, GROSS / FEES / NET, PARTIAL FILLS")
     lines += _books_block(data)
+    _hdr(lines, "4B. BOOK K (pre-registered slice of Book A) AND THE SAME SLICE FOR BOOK I")
+    lines += _book_k_block(data)
     _hdr(lines, "5. FILL-SELECTION CHECK (do fills happen mostly when the market moves against us?)")
     lines += _fill_selection_block(data)
     _hdr(lines, "6. HOW GOOD IS GROK? (every word with a result; market comparisons use valid quotes only)")
@@ -1444,6 +1640,8 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
         " e) Are p_block_airs and p_said_given_airs useful, or is only the final probability informative?",
         " f) Section 5: do fills select against us? Is G/H worth keeping?",
         " g) What ONE change to the prompt or the rules is worth testing next, and what would prove it wrong?",
+        " h) Section 4B: what is Book K's status line, and is the margin above break-even? Do NOT change the K rule; only report.",
+        " i) Section 3: does the BLEND (Grok + market)/2 beat the market and Grok? Where?",
         "One week is a small sample. Say how confident each conclusion is. Do not retune from one week.",
     ]
     return "\n".join(lines).replace("is in section 11", "is in section 12") + "\n"
@@ -1454,7 +1652,7 @@ def render_csv(data: dict) -> str:
     cols = ["date", "night_status", "event_ticker", "market_ticker", "word", "is_count_market",
             "grok_p", "p_block_airs", "p_said_given_airs",
             "quote_bid", "quote_ask", "quote_time_ct", "quote_valid", "quote_invalid_reason", "quote_age_s", "quote_source",
-            "mkt_mid", "gap", "outcome", "said_yes", "cycle_temp", "has_substitute_risk",
+            "mkt_mid", "blend_p", "K_in_slice", "IK_in_slice", "gap", "outcome", "said_yes", "cycle_temp", "has_substitute_risk",
             "carrying_story", "substitute_risk"]
     for v in variants:
         cols += [f"{v}_side", f"{v}_filled_pct", f"{v}_partial", f"{v}_state",
@@ -1470,6 +1668,9 @@ def render_csv(data: dict) -> str:
                qt.astimezone(C.CT).strftime("%Y-%m-%d %H:%M:%S") if qt else "",
                int(r["quote_valid"]), r["quote_reason"] or "", r["quote_age_s"], r["quote_source"],
                None if r["mid"] is None else round(r["mid"], 2),
+               None if blend(r) is None else round(blend(r), 2),
+               int(any(_k_member(t, "A") for t in r["trades"])),
+               int(any(_k_member(t, "I") for t in r["trades"])),
                None if r["gap"] is None else round(r["gap"], 2),
                r["outcome"], r["y"], r["cycle_temp"], int(r["has_sub"]),
                _trunc(r["story"], 300), _trunc(r["substitute_risk"], 300)]

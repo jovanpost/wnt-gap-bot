@@ -8,7 +8,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from gap import backtest, board, clock, config as C, notify, pipeline, store
+from gap import backtest, board, clock, config as C, notify, pipeline, store, weekly
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +66,6 @@ if st.query_params.get("ping") == "true":
 
 if st.query_params.get("weekly") == "true":
     boot()
-    from gap import weekly
     st.write(weekly.send_week_report(force=False))
     st.stop()
 
@@ -74,13 +73,13 @@ services = boot()
 
 st.title("📐 WNT Gap Bot")
 st.caption(
-    f"{C.VERSION} · six paper books, hold-to-settlement only · "
+    f"{C.VERSION} · {len(C.VARIANTS)} paper books ({', '.join(v['id'] for v in C.VARIANTS)}), hold-to-settlement only · "
     "no live marks — P&L shows once Kalshi publishes an official result · "
     "Telegram courier · Saturday weekly dump"
 )
 
-tab_live, tab_books, tab_four, tab_curve = st.tabs(
-    ["Tonight", "Six books · P&L", "All nights · 6 books", "Cancel-window curve"]
+tab_live, tab_books, tab_four, tab_k, tab_curve = st.tabs(
+    ["Tonight", "Books · P&L", "All nights · books", "Book K + blend", "Cancel-window curve"]
 )
 
 # ---------------------------------------------------------------------------
@@ -311,6 +310,110 @@ with tab_four:
         st.dataframe(cmp, hide_index=True, use_container_width=True)
     else:
         st.info("No paper tickets stored yet.")
+
+# ---------------------------------------------------------------------------
+with tab_k:
+    st.markdown(
+        "**Book K is a pre-registered slice of Book A** — not new orders. "
+        "It asks: *do Book A's NO-side fades where Grok is low make money after fees?* "
+        f"Rule (FROZEN): side = NO, Grok ≤ {weekly.K_MAX_GROK}, quote valid at booking, "
+        f"|Grok − mid| strictly > {weekly.K_MIN_GAP}. "
+        f"Frozen until {weekly.K_MIN_FILLED} filled trades or {weekly.K_WINDOW_WEEKS} weeks, whichever comes first. "
+        "Same numbers as the Saturday dump (section 4B)."
+    )
+
+    @st.cache_data(ttl=120, show_spinner="Reading every night from the database…")
+    def _slice():
+        return weekly.slice_panel()
+
+    if st.button("Refresh Book K", key="k_refresh"):
+        st.cache_data.clear()
+        st.rerun()
+    try:
+        panel = _slice()
+    except Exception as exc:  # never let this tab break the rest of the app
+        st.error(f"Book K could not load: {exc}")
+        panel = None
+
+    if panel:
+        kp, ip = panel["k"], panel["i"]
+        cum = kp["cum"]
+        status = kp["status"]
+        if status.startswith("PASSING"):
+            st.success("STATUS: " + status)
+        elif status.startswith("FAILING"):
+            st.error("STATUS: " + status)
+        else:
+            st.info("STATUS: " + status)
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Filled (cumulative)", f"{cum['filled']} / {weekly.K_MIN_FILLED}")
+        m2.metric("Hit rate", "n/a" if cum["hit"] is None else f"{cum['hit']:.0f}%",
+                  None if cum["be"] is None else f"break-even {cum['be']:.1f}%")
+        m3.metric("Margin (points)", "n/a" if cum["margin"] is None else f"{cum['margin']:+.1f}")
+        m4.metric("Net after fees", f"${cum['net'] / 100:+.2f}")
+        m5.metric("Unfilled would-hit", "n/a" if cum["unf_hit"] is None else f"{cum['unf_hit']:.0f}% ({cum['unf_n']})")
+        st.caption(
+            "break-even hit % = average NO price paid + average fee per contract (points). "
+            "margin = hit % − break-even. PASSING needs margin ≥ +5. "
+            f"as of {panel['asof']} · settlements update when a night settles (loading the Books tab settles today)."
+        )
+
+        def _k_df(rows):
+            return pd.DataFrame([{
+                "week": r["label"], "prompt": r["prompt"], "booked": r["booked"], "filled": r["filled"],
+                "unfilled": r["unfilled"], "W": r["w"], "L": r["l"], "hit %": r["hit"],
+                "gross $": r["gross"] / 100.0, "fees $": r["fees"] / 100.0, "net $": r["net"] / 100.0,
+                "ROI %": r["roi"], "avg NO px ¢": r["px"], "break-even": r["be"], "margin": r["margin"],
+                "unfilled would-hit %": r["unf_hit"],
+            } for r in rows])
+
+        cfg_k = {
+            "hit %": st.column_config.NumberColumn(format="%.0f"),
+            "gross $": st.column_config.NumberColumn(format="$%+.2f"),
+            "fees $": st.column_config.NumberColumn(format="$%.2f"),
+            "net $": st.column_config.NumberColumn(format="$%+.2f"),
+            "ROI %": st.column_config.NumberColumn(format="%+.0f"),
+            "avg NO px ¢": st.column_config.NumberColumn(format="%.1f"),
+            "break-even": st.column_config.NumberColumn(format="%.1f"),
+            "margin": st.column_config.NumberColumn(format="%+.1f"),
+            "unfilled would-hit %": st.column_config.NumberColumn(format="%.0f"),
+        }
+        st.subheader("Book K (Book A slice) · one row per week + cumulative")
+        st.dataframe(_k_df(kp["rows"]), hide_index=True, use_container_width=True, column_config=cfg_k)
+
+        st.subheader("Same slice for Book I (NO, Grok ≤ 30, valid quote)")
+        st.dataframe(_k_df(ip["rows"]), hide_index=True, use_container_width=True, column_config=cfg_k)
+
+        with st.expander(f"The {len(kp['orders'])} Book K orders", expanded=False):
+            if kp["orders"]:
+                st.dataframe(pd.DataFrame(kp["orders"]), hide_index=True, use_container_width=True)
+            else:
+                st.write("none yet")
+
+        st.subheader("Grok vs market vs blend (valid-quote words only)")
+        st.caption(
+            "blend = (Grok + market mid) / 2. Brier: lower is better. "
+            "Grok − market < 0 means Grok beat the market; blend − market < 0 means the blend beat the market."
+        )
+
+        def _s_df(rows):
+            return pd.DataFrame([{
+                "group": r["group"], "n": r["n"], "YES %": r["yes_pct"], "avg Grok": r["avg_grok"],
+                "Brier Grok": r["brier_grok"], "Brier market": r["brier_market"], "Brier blend": r["brier_blend"],
+                "Brier base rate": r["brier_base"], "Grok − market": r["grok_minus_market"],
+                "blend − market": r["blend_minus_market"],
+            } for r in rows])
+
+        cfg_s = {c: st.column_config.NumberColumn(format="%.4f") for c in
+                 ("Brier Grok", "Brier market", "Brier blend", "Brier base rate")}
+        cfg_s["Grok − market"] = st.column_config.NumberColumn(format="%+.4f")
+        cfg_s["blend − market"] = st.column_config.NumberColumn(format="%+.4f")
+        cfg_s["YES %"] = st.column_config.NumberColumn(format="%.0f")
+        cfg_s["avg Grok"] = st.column_config.NumberColumn(format="%.1f")
+        st.write("**All weeks together**")
+        st.dataframe(_s_df(panel["score"]["cumulative"]), hide_index=True, use_container_width=True, column_config=cfg_s)
+        st.write("**Week by week (all words)**")
+        st.dataframe(_s_df(panel["score"]["by_week"]), hide_index=True, use_container_width=True, column_config=cfg_s)
 
 with tab_curve:
     st.markdown(
