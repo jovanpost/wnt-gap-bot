@@ -193,7 +193,26 @@ def _sha7(text: str) -> str:
 # --------------------------------------------------------------------------
 # collecting data
 # --------------------------------------------------------------------------
-def _quote_for(ticker, frozen_by_t, legacy_by_t):
+def _booking_row(rows, booked_at):
+    """Old-style quotes: pick the row written when the night was BOOKED (the row nearest the
+    parse time), not the first or last row. Older code also logged quotes in sweeps before
+    booking (e.g. 14:03 for a 14:21 booking) and all evening after it (up to 11:59 PM)."""
+    if booked_at is None:
+        return rows[0]
+
+    def when(q):
+        return clock.parse_dt(q.get("quoted_at"))
+
+    inside = [q for q in rows if when(q) and booked_at - timedelta(seconds=30) <= when(q) <= booked_at + timedelta(minutes=5)]
+    if inside:
+        return inside[0]
+    before = [q for q in rows if when(q) and when(q) < booked_at]
+    if before:
+        return before[-1]
+    return rows[0]
+
+
+def _quote_for(ticker, frozen_by_t, legacy_by_t, booked_at=None):
     """Best quote we have for a ticker: the frozen decision-time one, else (old rows)
     the last row on file. Returns a dict with a real validity verdict."""
     fq = frozen_by_t.get(ticker)
@@ -208,10 +227,10 @@ def _quote_for(ticker, frozen_by_t, legacy_by_t):
         }
     rows = legacy_by_t.get(ticker) or []
     if rows:
-        # The FIRST row on file is the quote taken when the night was booked. Older code kept
-        # appending live quotes all evening (some at 5:40 PM, 6:25 PM, even 11:59 PM, after the
-        # book had collapsed), so the LAST row is often a post-close book. Ignore those.
-        q = rows[0]
+        # Older code logged quotes in several sweeps: before booking, AT booking, and all evening
+        # after it (5:40 PM, 6:25 PM, even 11:59 PM, after the book had collapsed). Use the
+        # sweep written when booking ran.
+        q = _booking_row(rows, booked_at)
         bid, ask = _f(q.get("yes_bid_cents")), _f(q.get("yes_ask_cents"))
         ok, why = Q.validate(bid, ask)
         return {
@@ -234,7 +253,7 @@ def _build_rows(run, forecasts, quote_rows, outcome_by_ticker):
     rows = []
     for f in forecasts:
         t = f["market_ticker"]
-        q = _quote_for(t, frozen_by_t, legacy_by_t)
+        q = _quote_for(t, frozen_by_t, legacy_by_t, clock.parse_dt(run.get("parsed_at")))
         grok = _f(f.get("probability"))
         mid = ((q["bid"] + q["ask"]) / 2.0) if q["valid"] else None  # NO fake mid for invalid quotes
         outcome = outcome_by_ticker.get(t)
@@ -1073,13 +1092,13 @@ def _quality_block(data) -> list[str]:
     legacy = [r for r in rows if r["quote_source"] == "legacy"]
     frozen = [r for r in rows if r["quote_source"] == "frozen"]
     multi = [r for r in legacy if r["quote_rows"] > 1]
-    lines.append(f"quotes: {len(frozen)} frozen at decision time, {len(legacy)} old-style (first row on file = when booking ran, "
+    lines.append(f"quotes: {len(frozen)} frozen at decision time, {len(legacy)} old-style (the row written when booking ran, "
                  f"which can be 30+ minutes after the decision time), {sum(1 for r in rows if r['quote_source'] == 'none')} none")
     if multi:
         flags += 1
-        lines.append(f"! {len(multi)} old-style quotes have MORE THAN ONE row. The FIRST row (taken at booking) is used; "
-                     "the later rows were appended by older code during the evening (often after the show, when the book "
-                     "had collapsed) and are ignored.")
+        lines.append(f"! {len(multi)} old-style quotes have MORE THAN ONE row. The row written when booking ran is used; "
+                     "older code also logged quotes before booking and all evening after it (often after the show, when "
+                     "the book had collapsed). Those other rows are ignored.")
     ages = [r["quote_age_s"] for r in frozen if r["quote_age_s"] is not None]
     if ages:
         lines.append(f"frozen quote age (decision moment minus snapshot time): min {min(ages)}s, avg {sum(ages) / len(ages):.0f}s, max {max(ages)}s")
