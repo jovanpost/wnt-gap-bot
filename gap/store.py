@@ -12,11 +12,11 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.engine import Engine
 
 from . import config as C
@@ -27,6 +27,10 @@ _engine: Engine | None = None
 _lock = threading.Lock()
 
 SCHEMA_FILE = Path(__file__).resolve().parent.parent / "sql" / "001_gap_schema.sql"
+# Extra idempotent migrations applied at boot (safe to re-run).
+MIGRATION_FILES = [
+    Path(__file__).resolve().parent.parent / "sql" / "005_v151.sql",
+]
 
 
 def _now() -> datetime:
@@ -67,9 +71,8 @@ def engine() -> Engine:
         return _engine
 
 
-def init_db() -> None:
-    sql = SCHEMA_FILE.read_text(encoding="utf-8")
-    # Split on semicolons but keep it simple — skip comments-only chunks.
+def _split_statements(sql: str) -> list[str]:
+    """Split on semicolons at end of line; skip comment-only lines."""
     statements = []
     buf: list[str] = []
     for line in sql.splitlines():
@@ -82,10 +85,21 @@ def init_db() -> None:
             if stmt:
                 statements.append(stmt)
             buf = []
-    with engine().begin() as conn:
+    return statements
+
+
+def init_db() -> None:
+    for path in [SCHEMA_FILE, *MIGRATION_FILES]:
+        if not path.exists():
+            log.warning("schema file missing: %s", path)
+            continue
+        statements = _split_statements(path.read_text(encoding="utf-8"))
         for stmt in statements:
+            # One transaction per statement: in Postgres one failed statement would
+            # otherwise poison every statement after it.
             try:
-                conn.execute(text(stmt))
+                with engine().begin() as conn:
+                    conn.execute(text(stmt))
             except Exception as exc:
                 # SQLite cannot do some PG-only bits; keep going for local paper.
                 log.warning("init_db statement skipped: %s | %s", exc, stmt[:80])
@@ -118,6 +132,24 @@ def get_state(key: str, default: Any = None) -> Any:
         except ValueError:
             return val
     return val
+
+
+def state_meta(key: str) -> tuple[Any, datetime | None]:
+    """(value, updated_at) for a gap_state key, or (None, None)."""
+    with engine().connect() as conn:
+        row = conn.execute(
+            text("select value, updated_at from gap_state where key = :k"),
+            {"k": key},
+        ).mappings().first()
+    if not row:
+        return None, None
+    val = row["value"]
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except ValueError:
+            pass
+    return val, row["updated_at"]
 
 
 def set_state(key: str, value: Any) -> None:
@@ -356,6 +388,10 @@ def insert_order(row: dict) -> None:
         "exit_rule": row.get("exit_rule"),
         "notional_dollars": row.get("notional_dollars"),
         "execution_model": row.get("execution_model", C.EXECUTION_MODEL),
+        "quote_bid_cents": row.get("quote_bid_cents"),
+        "quote_ask_cents": row.get("quote_ask_cents"),
+        "quote_captured_at": row.get("quote_captured_at"),
+        "book_rule": row.get("book_rule"),
     }
     with engine().begin() as conn:
         conn.execute(
@@ -365,13 +401,15 @@ def insert_order(row: dict) -> None:
                     limit_price_cents, our_price_cents, avg_fill_price_cents, fees_cents,
                     contracts, cost_cents, gap_points, threshold,
                     cluster_key, paper, status,
-                    variant_id, exit_rule, notional_dollars, execution_model
+                    variant_id, exit_rule, notional_dollars, execution_model,
+                    quote_bid_cents, quote_ask_cents, quote_captured_at, book_rule
                 ) values (
                     :forecast_id, :run_id, cast(:event_date as date), :market_ticker, :word,
                     :side, :limit_price_cents, :our_price_cents, :avg_fill_price_cents,
                     :fees_cents, :contracts, :cost_cents, :gap_points,
                     :threshold, :cluster_key, :paper, :status,
-                    :variant_id, :exit_rule, :notional_dollars, :execution_model
+                    :variant_id, :exit_rule, :notional_dollars, :execution_model,
+                    :quote_bid_cents, :quote_ask_cents, :quote_captured_at, :book_rule
                 )
                 -- gap_orders_one_per_book is a PARTIAL unique index
                 -- (excludes rejected/cancelled rows, so a word can be
@@ -394,7 +432,11 @@ def insert_order(row: dict) -> None:
                     gap_points = excluded.gap_points,
                     status = excluded.status,
                     exit_rule = excluded.exit_rule,
-                    notional_dollars = excluded.notional_dollars
+                    notional_dollars = excluded.notional_dollars,
+                    quote_bid_cents = excluded.quote_bid_cents,
+                    quote_ask_cents = excluded.quote_ask_cents,
+                    quote_captured_at = excluded.quote_captured_at,
+                    book_rule = excluded.book_rule
             """),
             payload,
         )
@@ -521,23 +563,145 @@ def upsert_settlement(row: dict) -> None:
         )
 
 
-def latest_nofade_depth(market_ticker: str, event_date: str) -> dict | None:
+def latest_nofade_depth(market_ticker: str, event_date: str,
+                        as_of: datetime | None = None,
+                        max_age_s: int | None = None) -> dict | None:
     """Read-only lookup into no-fade's `depth` table (same Supabase project,
     different app). Returns the most recent orderbook snapshot no-fade has
-    already taken for this market today, or None if it hasn't snapshotted
-    this ticker yet (e.g. before 11:00 CT, or a ticker no-fade isn't
-    tracking). Callers must handle None -- it is not an error, just "no
-    data yet", and should fall back sensibly (an empty book, a skipped
-    tick) rather than raising.
+    already taken for this market, or None if there is none.
+
+    as_of:     only consider snapshots taken AT OR BEFORE this moment. This is what
+               makes a quote reproducible: asking "what did the book look like at the
+               decision time" gives the same answer no matter when you ask.
+    max_age_s: with as_of, ignore snapshots older than as_of - max_age_s (stale).
+
+    Callers must handle None -- it is not an error, just "no data".
     """
+    sql = (
+        "SELECT ts, best_yes_bid, best_no_bid, yes_book, no_book "
+        "FROM depth "
+        "WHERE market_ticker = :ticker AND event_date = :event_date"
+    )
+    params: dict[str, Any] = {"ticker": market_ticker, "event_date": str(event_date)[:10]}
+    if as_of is not None:
+        sql += " AND ts <= :as_of"
+        params["as_of"] = as_of
+        if max_age_s:
+            sql += " AND ts >= :oldest"
+            params["oldest"] = as_of - timedelta(seconds=int(max_age_s))
+    sql += " ORDER BY ts DESC LIMIT 1"
     with engine().connect() as conn:
-        row = conn.execute(
-            text(
-                "SELECT ts, best_yes_bid, best_no_bid, yes_book, no_book "
-                "FROM depth "
-                "WHERE market_ticker = :ticker AND event_date = :event_date "
-                "ORDER BY ts DESC LIMIT 1"
-            ),
-            {"ticker": market_ticker, "event_date": str(event_date)[:10]},
-        ).mappings().first()
+        row = conn.execute(text(sql), params).mappings().first()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# v1.5.1: frozen decision-time quotes, results cache, history helpers
+# ---------------------------------------------------------------------------
+def insert_frozen_quote(row: dict) -> None:
+    """One frozen quote per (run, market). A second call for the same market is ignored."""
+    with engine().begin() as conn:
+        conn.execute(
+            text("""
+                insert into gap_quotes (
+                    run_id, market_ticker, yes_bid_cents, yes_ask_cents, market_prob,
+                    source, captured_at, decision_at, valid, invalid_reason, age_s, frozen
+                ) values (
+                    :run_id, :market_ticker, :yes_bid_cents, :yes_ask_cents, :market_prob,
+                    :source, :captured_at, :decision_at, :valid, :invalid_reason, :age_s, true
+                )
+                on conflict (run_id, market_ticker) where frozen is true do nothing
+            """),
+            row,
+        )
+
+
+def frozen_quotes_for_run(run_id: int) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_quotes where run_id = :id and frozen is true order by id"),
+            {"id": run_id},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def delete_frozen_quotes(run_id: int) -> None:
+    with engine().begin() as conn:
+        conn.execute(
+            text("delete from gap_quotes where run_id = :id and frozen is true"),
+            {"id": run_id},
+        )
+
+
+def results_cached(tickers) -> dict[str, str]:
+    tickers = [t for t in tickers if t]
+    if not tickers:
+        return {}
+    stmt = text(
+        "select market_ticker, result from gap_results where market_ticker in :t"
+    ).bindparams(bindparam("t", expanding=True))
+    out: dict[str, str] = {}
+    with engine().connect() as conn:
+        for i in range(0, len(tickers), 500):
+            for r in conn.execute(stmt, {"t": tickers[i:i + 500]}).mappings().all():
+                out[r["market_ticker"]] = r["result"]
+    return out
+
+
+def results_save(rows: dict[str, str]) -> None:
+    rows = {t: r for t, r in rows.items() if t and r in ("yes", "no", "void")}
+    if not rows:
+        return
+    with engine().begin() as conn:
+        for t, r in rows.items():
+            conn.execute(
+                text("""
+                    insert into gap_results (market_ticker, result) values (:t, :r)
+                    on conflict (market_ticker) do update
+                      set result = excluded.result, fetched_at = now()
+                """),
+                {"t": t, "r": r},
+            )
+
+
+def markets_history(before_date: str, n_dates: int = 10, span_days: int = 45) -> list[dict]:
+    """Markets from the last n_dates event dates STRICTLY BEFORE before_date
+    (newest date first). One row per (date, word); a later run wins."""
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("""
+                select r.event_date as event_date, m.word as word,
+                       m.market_ticker as market_ticker, r.id as run_id
+                from gap_markets m
+                join gap_runs r on r.id = m.run_id
+                where r.event_date < cast(:d as date)
+                  and r.event_date >= cast(:d as date) - cast(:span as integer)
+                order by r.event_date desc, r.id desc
+                limit 8000
+            """),
+            {"d": str(before_date)[:10], "span": int(span_days)},
+        ).mappings().all()
+    seen = set()
+    dates: list[str] = []
+    out: list[dict] = []
+    for r in rows:
+        d = str(r["event_date"])[:10]
+        key = (d, str(r["word"]).strip().lower())
+        if key in seen:
+            continue
+        if d not in dates:
+            if len(dates) >= n_dates:
+                continue
+            dates.append(d)
+        seen.add(key)
+        out.append({"event_date": d, "word": r["word"], "market_ticker": r["market_ticker"]})
+    return out
+
+
+def activity_between(start: datetime, end: datetime) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select at, kind, message from gap_activity where at >= :a and at < :b order by at"),
+            {"a": start, "b": end},
+        ).mappings().all()
+    return [dict(r) for r in rows]

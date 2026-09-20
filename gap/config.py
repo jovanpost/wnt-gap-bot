@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.5.0"
+VERSION = "wnt-gap-v1.5.1"
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -108,14 +108,30 @@ LIMIT_OFFSET_CENTS = int(_num("LIMIT_OFFSET_CENTS", 8))
 # every consumer of it eventually got that wrong in some way. Hold-to-
 # settlement needs exactly one trustworthy signal -- Kalshi's final result --
 # and nothing else. That is the only exit rule left in this repo.
-VARIANTS = (
+ALL_VARIANTS = (
     {"id": "A", "notional": 1.0, "exit": "hold", "rule": "fade15", "cancel": "send60", "label": "A · $1 hold fade"},
     {"id": "B", "notional": 100.0, "exit": "hold", "rule": "fade15", "cancel": "send60", "label": "B · $100 hold fade"},
     {"id": "E", "notional": 1.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "send60", "label": "E · $1 hold fade+Grok>50"},
     {"id": "F", "notional": 100.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "send60", "label": "F · $100 hold fade+Grok>50"},
     {"id": "G", "notional": 1.0, "exit": "hold", "rule": "grok10", "cancel": "show529", "label": "G · $1 hold Grok−10"},
     {"id": "H", "notional": 100.0, "exit": "hold", "rule": "grok10", "cancel": "show529", "label": "H · $100 hold Grok−10"},
+    # v1.5.1 NEW book (does not replace anything): edge measured against the price you
+    # would really pay (the ask to buy YES, the bid to buy NO), not the mid. See
+    # strategy.decide_exec. Threshold: EDGE_EXEC_THRESHOLD below.
+    {"id": "I", "notional": 1.0, "exit": "hold", "rule": "edge_exec", "cancel": "send60", "label": "I · $1 hold edge vs ask/bid"},
 )
+# To retire books without touching code, set the Streamlit secret DISABLED_BOOKS, e.g. "G,H".
+# Old rows stay in the database; the books just stop being booked and shown.
+DISABLED_BOOKS = {x.strip().upper() for x in _secret("DISABLED_BOOKS", "").split(",") if x.strip()}
+VARIANTS = tuple(v for v in ALL_VARIANTS if v["id"] not in DISABLED_BOOKS)
+# Book I: executable edge (points) must be strictly greater than this.
+EDGE_EXEC_THRESHOLD = int(_num("EDGE_EXEC_THRESHOLD", 10))
+# Quotes: newest depth snapshot at/before the decision time, at most this old (seconds).
+QUOTE_MAX_AGE_S = int(_num("QUOTE_MAX_AGE_S", 600))
+# WORD HISTORY block sent to Grok: how many past nights (0 = off).
+WORD_HISTORY_NIGHTS = int(_num("WORD_HISTORY_NIGHTS", 10))
+# Paper fills are checked every poll tick (not only when someone opens the app).
+BACKGROUND_FILLS = _flag("BACKGROUND_FILLS", True)
 SHOW_CANCEL_CT = _secret("SHOW_CANCEL_CT", "17:29")
 GROK10_OFFSET = int(_num("GROK10_OFFSET", 10))
 # Addendum clocks
@@ -164,7 +180,10 @@ def summary() -> str:
         f"|gap|>{GAP_THRESHOLD}¢ | take {LIMIT_OFFSET_CENTS}¢ from mid | "
         f"poll from {POLL_START_CT} every 60s | file first-seen+{DECISION_LAG_MIN}m | "
         f"cancel send+{CANCEL_AFTER_MIN}m\n"
-        f"A/B fade hold · E/F fade+Grok>50 hold · G/H Grok-10 hold cancel 5:29 CT · scalp removed v1.5.0\n"
+        f"A/B fade hold (gap strictly > {GAP_THRESHOLD}) · E/F fade+Grok>50 hold · G/H Grok-10 hold cancel 5:29 CT · "
+        f"I edge vs ask/bid > {EDGE_EXEC_THRESHOLD} · scalp removed v1.5.0\n"
+        f"books on: {','.join(v['id'] for v in VARIANTS)} · quotes frozen at decision time · "
+        f"invalid quote (bid<=1, ask<=1, bid>=99, bid>ask, spread>25) = no trade\n"
         f"NO bankroll / NO night cap / NO cluster cap\n"
         f"prompt {prompt_version()} | harness {HARNESS} | addendum {ADDENDUM}\n"
         f"poll {POLL_START_CT} CT | json deadline {JSON_DEADLINE_CT} CT"

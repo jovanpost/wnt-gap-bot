@@ -15,7 +15,7 @@ from .kalshi import KalshiClient, market_result
 
 log = logging.getLogger("gap.settle")
 
-FILL_MODEL = "paper_filled_only_v135"
+FILL_MODEL = "paper_filled_only_v135"  # fees: formula on filled size (v1.5.1)
 
 
 def settle_order(order: dict, outcome: str) -> dict:
@@ -86,6 +86,10 @@ def settle_run(run: dict, client: KalshiClient | None = None) -> dict:
             realized_pnl_cents=row["net_cents"],
         )
         settled += 1
+    try:  # published results never change: remember them (weekly dump, WORD HISTORY)
+        store.results_save({t: r for t, r in by_ticker.items() if r in ("yes", "no", "void")})
+    except Exception as exc:
+        log.warning("results cache write failed: %s", exc)
     store.log_activity(
         "settled",
         f"run {run['id']} {run.get('event_date')} settled={settled} open={open_n} void={void_n}",

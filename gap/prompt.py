@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import time
 
-from . import config as C, notify
+from . import config as C, history, notify
 
 log = logging.getLogger("gap.prompt")
 
@@ -47,7 +47,8 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def build_user_message(event_date: str, event_ticker: str, words: list[dict]) -> str:
+def build_user_message(event_date: str, event_ticker: str, words: list[dict],
+                       history_block: str = "") -> str:
     lines = [
         f"Date: {event_date}",
         f"Event: {event_ticker}",
@@ -56,6 +57,8 @@ def build_user_message(event_date: str, event_ticker: str, words: list[dict]) ->
     ]
     for i, w in enumerate(words, start=1):
         lines.append(f"{i}. {w['word']}")
+    if history_block:
+        lines.append(history_block)
     lines += [
         "",
         "Output valid JSON only, matching the schema. No preamble, no markdown fences.",
@@ -65,7 +68,14 @@ def build_user_message(event_date: str, event_ticker: str, words: list[dict]) ->
 
 def build_paste_file(event_date: str, event_ticker: str, words: list[dict]) -> str:
     """One blob for a new Expert chat. Consumer Grok has no system-role box."""
-    user = build_user_message(event_date, event_ticker, words)
+    hist = ""
+    if C.WORD_HISTORY_NIGHTS > 0:
+        try:
+            hist = history.word_history_block(event_date, words, C.WORD_HISTORY_NIGHTS)
+        except Exception:
+            # Never let a history problem stop tonight's file. Grok works without it.
+            log.exception("word history skipped")
+    user = build_user_message(event_date, event_ticker, words, hist)
     return (
         get_system_prompt().rstrip()
         + "\n\n---\n\n"

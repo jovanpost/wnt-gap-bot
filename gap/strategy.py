@@ -54,6 +54,19 @@ def sweep_limit_cents(side: str, model_prob: int, threshold: int | None = None,
     return our_price_cents(side, yes_px)
 
 
+def gap_points_exact(probability: int, bid: int | None, ask: int | None,
+                     market_prob: float | None = None) -> float | None:
+    """Grok minus market mid, in points. Exact: with a bid and an ask it is done in
+    integers (2p - (bid+ask)) / 2, so 'exactly 15.0' really is exactly 15.0. The old
+    float version, (p/100 - mid) * 100, produced 15.000000000000002 for 100 different
+    (p, mid) pairs and booked them even though 15.0 is not > 15."""
+    if bid is not None and ask is not None:
+        return (2 * int(probability) - (int(bid) + int(ask))) / 2.0
+    if market_prob is None:
+        return None
+    return round(int(probability) - float(market_prob) * 100.0, 6)
+
+
 def decide(
     probability: int,
     market_prob: float | None,
@@ -63,10 +76,10 @@ def decide(
     notional: float | None = None,
 ) -> dict | None:
     threshold = C.GAP_THRESHOLD if threshold is None else threshold
-    if market_prob is None:
+    gap_points = gap_points_exact(probability, yes_bid_cents, yes_ask_cents, market_prob)
+    if gap_points is None:
         return None
-    gap_points = (probability / 100.0 - market_prob) * 100.0
-    if abs(gap_points) <= threshold:
+    if not abs(gap_points) > threshold:  # strictly greater. 15.0 is NOT a signal at 15.
         return None
 
     # Economic side. Kalshi only lists YES.
@@ -75,7 +88,7 @@ def decide(
     if yes_bid_cents is not None and yes_ask_cents is not None:
         mid_cents = int(round((yes_bid_cents + yes_ask_cents) / 2.0))
     else:
-        mid_cents = int(round(market_prob * 100.0))
+        mid_cents = int(round(float(market_prob) * 100.0))
     yes_limit = yes_limit_cents(side, probability, mid_cents=mid_cents)
     our_px = our_price_cents(side, yes_limit)
     if yes_limit <= 0 or yes_limit >= 100 or our_px <= 0 or our_px >= 100:
@@ -107,6 +120,51 @@ def decide(
         "execution_model": C.EXECUTION_MODEL,
         "marketable_now": bool(marketable),
         "touch_cents": touch,
+        "notional_dollars": notional,
+    }
+
+
+def decide_exec(
+    probability: int,
+    yes_bid_cents: int | None,
+    yes_ask_cents: int | None,
+    threshold: int | None = None,
+    notional: float | None = None,
+) -> dict | None:
+    """Book I. Edge against the price you would REALLY pay, not the mid.
+      buy YES  costs the ask:            edge = Grok - ask
+      buy NO   (sell YES) gets the bid:  edge = bid - Grok
+    Trade only if edge is strictly greater than the threshold. Order is placed AT the
+    touch (the ask, or the bid), so it is marketable immediately."""
+    threshold = C.EDGE_EXEC_THRESHOLD if threshold is None else threshold
+    if yes_bid_cents is None or yes_ask_cents is None:
+        return None
+    p, bid, ask = int(probability), int(yes_bid_cents), int(yes_ask_cents)
+    edge_yes = p - ask
+    edge_no = bid - p
+    if edge_yes > threshold and edge_yes >= edge_no:
+        side, yes_limit, edge = "YES", ask, edge_yes
+    elif edge_no > threshold:
+        side, yes_limit, edge = "NO", bid, edge_no
+    else:
+        return None
+    our_px = our_price_cents(side, yes_limit)
+    if yes_limit <= 0 or yes_limit >= 100 or our_px <= 0 or our_px >= 100:
+        return None
+    sized = notional is not None and notional > 0
+    contracts = round(notional / (our_px / 100.0), 2) if sized else 0.0
+    return {
+        "side": side,
+        "kalshi_action": "buy_yes" if side == "YES" else "sell_yes",
+        "yes_price_cents": yes_limit,
+        "our_price_cents": our_px,
+        "limit_price_cents": yes_limit,
+        "contracts": contracts,
+        "cost_cents": int(round(contracts * our_px)) if sized else 0,
+        "gap_points": float(edge),  # for book I this is the executable edge
+        "threshold": threshold,
+        "execution_model": C.EXECUTION_MODEL,
+        "touch_cents": yes_limit,
         "notional_dollars": notional,
     }
 
@@ -157,3 +215,42 @@ def grok10_limit(probability: int) -> dict | None:
         "threshold": 0,
         "kalshi_action": "buy_yes" if side == "YES" else "sell_yes",
     }
+
+
+def order_for_rule(rule: str, probability: int, bid: int | None, ask: int | None,
+                   valid: bool, notional: float) -> dict | None:
+    """What a book with this rule SHOULD book for one word. The booking code and the
+    weekly RULE AUDIT both call this, so they can never drift apart.
+    Returns None = no order."""
+    p = int(probability)
+    if rule == "grok10":  # ignores the market completely
+        g = grok10_limit(p)
+        if not g:
+            return None
+        our_px = int(g.get("our_price_cents") or our_price_cents(g["side"], g["yes_price_cents"]))
+        contracts = round(notional / (our_px / 100.0), 2)
+        return {
+            "side": g["side"],
+            "yes_price_cents": g["yes_price_cents"],
+            "our_price_cents": our_px,
+            "contracts": contracts,
+            "cost_cents": int(round(contracts * our_px)),
+            "gap_points": 0.0,
+            "threshold": 0,
+        }
+    # Every other rule needs a real market. Invalid or one-sided quote = no order.
+    if not valid or bid is None or ask is None:
+        return None
+    if rule in ("fade15", "fade15_gate50"):
+        mid = ((int(bid) + int(ask)) / 2.0) / 100.0
+        d = decide(p, mid, int(bid), int(ask), notional=notional)
+        if not d:
+            return None
+        if rule == "fade15_gate50" and not fade_gate_ok(p, d["side"]):
+            return None
+        if not d.get("our_price_cents"):
+            d["our_price_cents"] = our_price_cents(d["side"], d["yes_price_cents"])
+        return d
+    if rule == "edge_exec":
+        return decide_exec(p, int(bid), int(ask), notional=notional)
+    return None

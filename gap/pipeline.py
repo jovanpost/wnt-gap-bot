@@ -4,11 +4,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import clock, config as C, notify, parser, prompt, store, strategy
+from . import clock, config as C, fills, notify, parser, prompt, quotes, settle, store, strategy
 from .kalshi import (
     KalshiClient,
-    event_open_at,
-    market_mid_prob,
     uniquify_words,
     word_from_market,
 )
@@ -117,6 +115,8 @@ def maybe_upgrade_event(client: KalshiClient | None = None) -> dict:
         telegram_msg_id=None,
         parse_error=None,
     )
+    store.delete_frozen_quotes(run["id"])  # decision time moved: freeze again at the new one
+    _FROZEN_SEEN.discard(run["id"])
     store.log_activity(
         "upgraded",
         f"{old_ticker} n={old_n} -> {new_ticker} n={new_n} send_at={clock.fmt(send_at)}",
@@ -233,7 +233,11 @@ def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> 
 
     msg_id = notify.send_document(f"gap-{date_str}.txt", paste, caption)
     store.update_run(run["id"], telegram_msg_id=msg_id, status="awaiting_json")
-    store.log_activity("prompt_sent", f"{event['event_ticker']} n={len(words)} msg={msg_id}")
+    store.log_activity(
+        "prompt_sent",
+        f"{event['event_ticker']} n={len(words)} msg={msg_id} force={force} "
+        f"scheduled_send={clock.fmt(due) if due else 'n/a'}",
+    )
     return {"ok": True, "reason": "sent", "run": store.get_run_for_date(date_str), "n": len(words)}
 
 
@@ -257,6 +261,16 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
     if clock.past_json_deadline(date_str) and run.get("status") != "parsed":
         store.update_run(run["id"], status="expired", parse_error="past json deadline")
         return f"past {C.JSON_DEADLINE_CT} CT deadline — no trade today"
+
+    # v1.5.1 guards. A forecast pasted after the show has started is not a forecast, and
+    # a re-book after fills exist would delete those orders and re-create them from a
+    # different quote. Both were ways a "later" quote could replace the real one.
+    if clock.now_ct() > clock._at(date_str, C.SHOW_CANCEL_CT):
+        store.log_activity("parse_reject", f"late paste after {C.SHOW_CANCEL_CT} CT ignored")
+        return f"too late: past {C.SHOW_CANCEL_CT} CT the show is on. Not booking."
+    if any(float(o.get("filled_contracts") or 0) > 0 for o in store.orders_for_date(date_str)):
+        store.log_activity("parse_reject", "re-paste ignored: orders already have paper fills")
+        return "orders already have paper fills — not re-booking (that would erase them)."
 
     words = run.get("word_list") or []
     if isinstance(words, str):
@@ -304,39 +318,47 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
         run["id"], date_str, run["event_ticker"],
         C.HARNESS, C.PROMPT_VERSION, forecast_rows,
     )
-    booked = book_from_forecasts(run, saved)
-    return _book_summary(saved, booked, expected)
+    notes: list[str] = []
+    booked = book_from_forecasts(run, saved, notes)
+    return _book_summary(saved, booked, expected, notes)
 
 
-def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
-    """One decision set, eight independent books. No shared size or cash.
+def _i(x):
+    if x is None or x == "":
+        return None
+    try:
+        return int(round(float(x)))
+    except (TypeError, ValueError):
+        return None
 
-    Quote comes from no-fade's `depth` table (same shared Supabase project),
-    not a fresh Kalshi call -- see store.latest_nofade_depth. Falls back to
-    (None, None) if no-fade hasn't snapshotted this ticker yet, same as a
-    failed Kalshi call used to.
+
+def book_from_forecasts(run: dict, forecasts: list[dict], notes: list[str] | None = None) -> list[dict]:
+    """One decision set, independent books. No shared size or cash.
+
+    v1.5.1: quotes are the FROZEN decision-time quotes (gap/quotes.py). This function
+    never reads the live book. An INVALID quote (bid<=1, ask<=1, bid>=99, bid>ask,
+    spread>25, or a missing side) means every rule that needs the market skips that
+    word; Grok-10 books ignore the market and are not affected.
+    What each book books for a word comes from strategy.order_for_rule -- the same
+    function the weekly RULE AUDIT uses to check us.
     """
-    date_str = str(run.get("event_date") or "")[:10]
+    frozen = quotes.ensure_frozen(run)
     signals = []
     for f in forecasts:
-        bid = ask = None
-        try:
-            snap = store.latest_nofade_depth(f["market_ticker"], date_str)
-        except Exception as exc:
-            log.warning("depth quote %s: %s", f["market_ticker"], exc)
-            snap = None
-        if snap:
-            best_yes_bid = snap.get("best_yes_bid")
-            best_no_bid = snap.get("best_no_bid")
-            bid = best_yes_bid
-            ask = (100 - best_no_bid) if best_no_bid is not None else None
-        mid = market_mid_prob(bid, ask)
-        store.insert_quote(run["id"], f.get("id"), f["market_ticker"], bid, ask, mid)
+        q = frozen.get(f["market_ticker"]) or {}
+        bid, ask = _i(q.get("yes_bid_cents")), _i(q.get("yes_ask_cents"))
+        valid = bool(q.get("valid"))
+        if not valid and notes is not None:
+            notes.append(
+                f"INVALID QUOTE {f['word']}: bid {bid} / ask {ask} "
+                f"({q.get('invalid_reason') or 'no quote'}) - market-based books skip it"
+            )
         signals.append({
             "forecast": f,
             "bid": bid,
             "ask": ask,
-            "mid": mid,
+            "valid": valid,
+            "captured_at": q.get("captured_at"),
             "cluster_key": strategy.cluster_key(f["word"], f.get("carrying_story")),
         })
 
@@ -361,39 +383,15 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
 
     kept_all: list[dict] = []
     for spec in C.VARIANTS:
+        rule = spec.get("rule") or "fade15"
         candidates = []
         for sig in signals:
             f = sig["forecast"]
-            p = int(f["probability"])
-            rule = spec.get("rule") or "fade15"
-            if rule == "grok10":
-                g = strategy.grok10_limit(p)
-                if not g:
-                    continue
-                our_px = int(g.get("our_price_cents") or strategy.our_price_cents(g["side"], g["yes_price_cents"]))
-                contracts = round(spec["notional"] / (our_px / 100.0), 2)
-                decision = {
-                    "side": g["side"],
-                    "yes_price_cents": g["yes_price_cents"],
-                    "our_price_cents": our_px,
-                    "contracts": contracts,
-                    "cost_cents": int(round(contracts * our_px)),
-                    "gap_points": 0.0,
-                    "threshold": 0,
-                }
-            else:
-                decision = strategy.decide(
-                    p, sig["mid"], sig["bid"], sig["ask"],
-                    notional=spec["notional"],
-                )
-                if not decision:
-                    continue
-                if rule == "fade15_gate50" and not strategy.fade_gate_ok(p, decision["side"]):
-                    continue
-                if not decision.get("our_price_cents"):
-                    decision["our_price_cents"] = strategy.our_price_cents(
-                        decision["side"], decision["yes_price_cents"]
-                    )
+            decision = strategy.order_for_rule(
+                rule, int(f["probability"]), sig["bid"], sig["ask"], sig["valid"], spec["notional"],
+            )
+            if not decision:
+                continue
             candidates.append({
                 "forecast_id": f.get("id"),
                 "run_id": run["id"],
@@ -414,6 +412,10 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
                 "exit_rule": spec["exit"],
                 "notional_dollars": spec["notional"],
                 "execution_model": C.EXECUTION_MODEL,
+                "quote_bid_cents": sig["bid"],
+                "quote_ask_cents": sig["ask"],
+                "quote_captured_at": sig["captured_at"],
+                "book_rule": rule,
             })
         kept = strategy.apply_caps(candidates, notional=spec["notional"])
         for row in kept:
@@ -422,15 +424,15 @@ def book_from_forecasts(run: dict, forecasts: list[dict]) -> list[dict]:
     return kept_all
 
 
-def _book_summary(saved, booked, expected) -> str:
+def _book_summary(saved, booked, expected, notes: list[str] | None = None) -> str:
     store.log_activity(
         "parsed",
-        f"{len(saved)} forecasts, {len(booked)} paper rows across A-H",
+        f"{len(saved)} forecasts, {len(booked)} paper rows across {','.join(v['id'] for v in C.VARIANTS)}",
     )
     lines = [
         f"parsed {len(saved)}/{len(expected)}",
         f"|gap|>{C.GAP_THRESHOLD}¢ | take {C.LIMIT_OFFSET_CENTS}¢ from mid | cancel +{C.CANCEL_AFTER_MIN}m",
-        "eight books, no shared size:",
+        f"{len(C.VARIANTS)} books, no shared size:",
     ]
     for spec in C.VARIANTS:
         rows = [o for o in booked if o.get("variant_id") == spec["id"]]
@@ -442,6 +444,12 @@ def _book_summary(saved, booked, expected) -> str:
             f"{len(rows)} ({n_no} NO / {n_yes} YES) booked ${spent:.2f}"
         )
     lines.append(f"live: {'on' if C.may_place_live() else 'off'}")
+    if notes:
+        lines.append("")
+        lines.append(f"{len(notes)} INVALID QUOTE(S) — no market-based trade on these:")
+        lines += notes[:12]
+        if len(notes) > 12:
+            lines.append(f"... and {len(notes) - 12} more")
     return "\n".join(lines)
 
 
@@ -453,9 +461,54 @@ def book_waiting_if_due() -> None:
     if not run or run.get("status") != "parsed_waiting_decision":
         return
     forecasts = store.forecasts_for_run(run["id"])
-    booked = book_from_forecasts(run, forecasts)
+    notes: list[str] = []
+    booked = book_from_forecasts(run, forecasts, notes)
     store.update_run(run["id"], status="parsed")
-    notify.send(_book_summary(forecasts, booked, [f["word"] for f in forecasts]))
+    notify.send(_book_summary(forecasts, booked, [f["word"] for f in forecasts], notes))
+
+
+_FROZEN_SEEN: set[int] = set()
+
+
+def freeze_if_due() -> None:
+    """At the decision time, freeze today's quotes once. (Booking also freezes on demand
+    if this never ran, using the same as-of-decision-time lookup, so the answer is the same.)"""
+    date_str = clock.today_ct()
+    run = store.get_run_for_date(date_str)
+    if not run or run["id"] in _FROZEN_SEEN:
+        return
+    dec = clock.parse_dt(run.get("decision_at"))
+    if dec is None or clock.now_ct() < dec.astimezone(C.CT):
+        return
+    out = quotes.freeze_run_quotes(run)
+    if out["added"]:
+        store.log_activity(
+            "quotes_frozen",
+            f"{date_str} moment={clock.fmt(out['moment'])} valid={out['valid']} invalid={out['invalid']}",
+        )
+    _FROZEN_SEEN.add(run["id"])
+
+
+def fills_tick() -> None:
+    """Advance paper fills every poll tick while any order's window is open.
+    Before v1.5.1 fills moved ONLY when someone opened the Streamlit page, and then
+    only against whatever the book looked like at that instant."""
+    if not C.BACKGROUND_FILLS:
+        return
+    date_str = clock.today_ct()
+    orders = store.orders_for_date(date_str)
+    if not orders:
+        return
+    live = [
+        o for o in orders
+        if fills.window_open(o)
+        and float(o.get("filled_contracts") or 0) < float(o.get("contracts") or 0) - 1e-6
+    ]
+    if not live:
+        return
+    run = store.get_run_for_date(date_str)
+    fills.apply_to_orders(orders, event_ticker=(run or {}).get("event_ticker"))
+    settle.sync_gh_fills(date_str)  # H mirrors G, exactly as the board does on a page load
 
 
 def expire_if_needed() -> None:
@@ -470,12 +523,10 @@ def expire_if_needed() -> None:
 
 
 def poll_once() -> dict:
-    # v1.5.0: tape.track_tape() removed along with the scalp exit rule.
-    # It polled live quotes to decide whether an early exit had "hit" --
-    # exactly the live-quote-dependent pattern that caused every bug found
-    # in this repo's history. Nothing left needs a 60s tape poll; fills
-    # (apply_to_orders) and settlement (settle.apply_official) run from
-    # board.tonight() on each page load instead.
+    # v1.5.0: tape.track_tape() removed along with the scalp exit rule (it polled live
+    # quotes, the pattern behind every bug in this repo's history).
+    # v1.5.1: paper fills advance from fills_tick() below, so they no longer depend on
+    # someone having the Streamlit page open. Settlement still runs from board.tonight().
     if clock.is_saturday_ct():
         try:
             from . import weekly
@@ -487,6 +538,14 @@ def poll_once() -> dict:
     if not clock.weekday_ct():
         return {"ok": True, "reason": "weekend"}
     book_waiting_if_due()
+    try:
+        freeze_if_due()
+    except Exception:
+        log.exception("freeze_if_due")
+    try:
+        fills_tick()
+    except Exception:
+        log.exception("fills_tick")
     if not clock.in_poll_window() and store.get_run_for_date(clock.today_ct()):
         expire_if_needed()
         return {"ok": True, "reason": "outside_window"}
@@ -575,6 +634,39 @@ def register_commands() -> None:
         from . import weekly
         return weekly.send_week_report(force=True)
 
+    def _void(args, _msg):
+        import re as _re
+        if not args or not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", args[0]):
+            return "usage: /gap_void YYYY-MM-DD reason words"
+        v = dict(store.get_state("void_nights", {}) or {})
+        v[args[0]] = " ".join(args[1:]) or "manual"
+        store.set_state("void_nights", v)
+        return f"{args[0]} marked VOID ({v[args[0]]}). Weekly dump will label it VOID and leave it out of the books."
+
+    def _unvoid(args, _msg):
+        v = dict(store.get_state("void_nights", {}) or {})
+        if not args or args[0] not in v:
+            return f"void nights: {', '.join(sorted(v)) or 'none'}. usage: /gap_unvoid YYYY-MM-DD"
+        v.pop(args[0])
+        store.set_state("void_nights", v)
+        return f"{args[0]} is no longer void."
+
+    def _quotes(_args, _msg):
+        run = store.get_run_for_date(clock.today_ct())
+        if not run:
+            return "no run today"
+        rows = store.frozen_quotes_for_run(run["id"])
+        if not rows:
+            return "no frozen quotes yet (they freeze at the decision time)"
+        bad = [r for r in rows if not r.get("valid")]
+        lines = [f"{len(rows)} frozen quotes, {len(rows) - len(bad)} valid, {len(bad)} INVALID"]
+        for r in bad[:15]:
+            lines.append(f"INVALID {r['market_ticker'].split('-')[-1]}: bid {r.get('yes_bid_cents')} / ask {r.get('yes_ask_cents')} ({r.get('invalid_reason')})")
+        return "\n".join(lines)
+
+    notify.register("gap_void", _void)
+    notify.register("gap_unvoid", _unvoid)
+    notify.register("gap_quotes", _quotes)
     notify.register("gap_pnl", _pnl)
     notify.register("gap_today", _pnl)
     notify.register("gap_settle", _settle)

@@ -82,13 +82,24 @@ def filled_contracts(order: dict) -> float:
 
 
 def entry_fee_cents(order: dict) -> int:
-    """Fees the exchange charged, else the Kalshi formula on our price."""
-    recorded = order.get("fees_cents")
-    if recorded not in (None, ""):
-        try:
-            return int(round(float(recorded)))
-        except (TypeError, ValueError):
-            pass
+    """Fee in cents.
+
+    PAPER orders (everything today): always the Kalshi formula on the filled size and
+    our price -- 0.07 x contracts x P x (1-P), rounded up to the cent.
+
+    REAL exchange orders (paper is explicitly False): what the exchange charged.
+
+    v1.5.1 fix: the fees_cents column has DEFAULT 0, and the old code treated that
+    default as "the exchange charged $0.00" and never applied the formula, so every
+    paper order showed fees=0.00 and net P&L was overstated.
+    """
+    if order.get("paper") is False:
+        recorded = order.get("fees_cents")
+        if recorded not in (None, ""):
+            try:
+                return int(round(float(recorded)))
+            except (TypeError, ValueError):
+                pass
     return _fees.fee_cents(filled_contracts(order), entry_price_cents(order))
 
 
