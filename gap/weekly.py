@@ -335,10 +335,14 @@ def _order_row(o, s, run_date, row_by_ticker, status_label):
     if not own_quote:
         qb, qa = trow.get("bid"), trow.get("ask")
     excluded = None
+    pre_rule = False
     if status_label != "TRADED":
         excluded = f"night is {status_label}"
     elif rule in MARKET_RULES and not trow.get("quote_valid"):
-        excluded = "INVALID QUOTE"
+        if own_quote:
+            excluded = "INVALID QUOTE"   # booked under the new rule and still traded a bad quote
+        else:
+            pre_rule = True              # booked before the rule existed: a real trade, keep it, flag it
     gross = _f(s.get("gross_cents")) if s else None
     fees = _f(s.get("fees_cents")) if s else None
     net = _f(s.get("net_cents")) if s else None
@@ -376,6 +380,7 @@ def _order_row(o, s, run_date, row_by_ticker, status_label):
         "q_bid": qb, "q_ask": qa, "own_quote": own_quote,
         "q_time": o.get("quote_captured_at"),
         "excluded": excluded,
+        "pre_rule_invalid": pre_rule,
         "hyp": hyp,
         "legacy_px": o.get("our_price_cents") in (None, ""),
     }
@@ -522,6 +527,11 @@ def _audit(data) -> dict:
     viol: list = []
     checked = expected_n = unaudited = 0
     spec_by_id = {s["id"]: s for s in C.VARIANTS}
+    first_night: dict = {}      # a book that has never booked anything (or started later) cannot be "missing" earlier orders
+    for n_ in data["nights"]:
+        for o_ in n_["orders"]:
+            if o_["variant"] not in first_night or n_["date"] < first_night[o_["variant"]]:
+                first_night[o_["variant"]] = n_["date"]
     for n in data["nights"]:
         if n["status"] != "TRADED":
             unaudited += len(n["orders"])
@@ -560,7 +570,9 @@ def _audit(data) -> dict:
             exp = strategy.order_for_rule(rule, p, qbi, qai, ok, spec["notional"])
             tag = f"{o['side']} @our {o['our_px']}¢"
             if exp is None:
-                kind = "INVALID QUOTE" if (rule in MARKET_RULES and not ok) else "SHOULD NOT EXIST"
+                kind = "SHOULD NOT EXIST"
+                if rule in MARKET_RULES and not ok:
+                    kind = "INVALID QUOTE" if o["own_quote"] else "PRE-RULE INVALID QUOTE"
                 viol.append({"night": n["date"], "book": o["variant"], "word": o["word"], "kind": kind,
                              "detail": f"{tag}; " + _why_no_order(rule, p, qbi, qai, ok, why)
                                        + (f" [order's own booked gap {o['gap_booked']:+.1f}]" if o["gap_booked"] is not None and rule in MARKET_RULES else "")})
@@ -589,6 +601,8 @@ def _audit(data) -> dict:
 
         # orders that SHOULD exist but do not, and duplicates
         for spec in C.VARIANTS:
+            if n["date"] < first_night.get(spec["id"], "9999-12-31"):
+                continue            # this book did not exist yet on this night
             for r in n["rows"]:
                 if r["grok"] is None:
                     continue
@@ -606,11 +620,14 @@ def _audit(data) -> dict:
                     expected_n += 1
                     viol.append({"night": n["date"], "book": spec["id"], "word": r["word"], "kind": "MISSING ORDER",
                                  "detail": f"rule says {exp['side']} @our {exp['our_price_cents']}¢ but no order exists"})
-    return {"checked": checked, "expected": expected_n, "violations": viol, "unaudited": unaudited}
+    real = [x for x in viol if x["kind"] != "PRE-RULE INVALID QUOTE"]
+    return {"checked": checked, "expected": expected_n, "violations": viol, "real": real, "unaudited": unaudited}
 
 
 def _audit_block(a) -> list[str]:
     v = a["violations"]
+    real = a.get("real", v)
+    pre = [x for x in v if x["kind"] == "PRE-RULE INVALID QUOTE"]
     lines = [
         f"orders checked: {a['checked']} (on TRADED nights, every book) | orders the rules call for: {a['expected']} | "
         f"not audited (old-night orders or retired books): {a['unaudited']}",
@@ -621,10 +638,17 @@ def _audit_block(a) -> list[str]:
     if not v:
         lines.append("VIOLATIONS: 0   <- this is what it should say")
         return lines
+    if pre:
+        lines.append(f"PRE-RULE: {len(pre)} old orders traded a quote that today's rule calls INVALID (usually spread > 25). "
+                     "They were booked BEFORE that rule existed, so they are expected, not bugs. They stay in the books.")
+    if not real:
+        lines.append("REAL VIOLATIONS: 0   <- this is what it should say")
+    else:
+        lines.append(f"REAL VIOLATIONS: {len(real)}   <- should be 0")
     by_kind: dict = {}
     for x in v:
         by_kind[x["kind"]] = by_kind.get(x["kind"], 0) + 1
-    lines.append(f"VIOLATIONS: {len(v)}   <- should be 0.  " + ", ".join(f"{k} x{c}" for k, c in sorted(by_kind.items())))
+    lines.append("all kinds: " + ", ".join(f"{k} x{c}" for k, c in sorted(by_kind.items())))
     lines.append("kinds: INVALID QUOTE = market-based book traded a bad quote | SHOULD NOT EXIST = rule books nothing | "
                  "GAP DIFFERS FROM QUOTE ON FILE = quote on file is not the quote the order was booked on | "
                  "OTHER THRESHOLD = booked under a different threshold | MISSING ORDER = rule wanted a trade that is not there")
@@ -762,6 +786,10 @@ def _books_block(data) -> list[str]:
     lines.append("Only TRADED nights and VALID-quote orders are counted. Win = the side we held was right.")
     lines.append("Unfilled = paper order never filled (no P&L). Pending = filled, no official result yet. "
                  "Partial = filled less than 98% of the intended size.")
+    pre = [o for o in inc if o.get("pre_rule_invalid")]
+    if pre:
+        lines.append(f"included, but booked on a quote today's rule would skip (booked before the rule existed): "
+                     f"{len(pre)} orders, net ${sum(o['net'] or 0 for o in pre) / 100:+.2f} across all books")
     if exc:
         by: dict = {}
         for o in exc:
@@ -1361,7 +1389,7 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines.append(f"generated {clock.fmt(clock.now_ct())} | week {week_id} | nights {data['start']} → {data['end']} | {C.VERSION}")
     lines.append("nights: " + (", ".join(f"{c} {k}" for k, c in sorted(counts.items())) or "none")
                  + f" | words: {len(rows)} | paper orders: {len(orders)} (kept in books: {len(_included_orders(data))}) | "
-                 f"RULE AUDIT violations: {len(audit['violations'])}")
+                 f"RULE AUDIT real violations: {len(audit['real'])} (+{len(audit['violations']) - len(audit['real'])} pre-rule)")
     lines.append(f"settle sweep: {_dumps(data['settle_totals'])}")
     lines.append("")
     lines.append("WHAT IS IN THIS FILE")
@@ -1483,7 +1511,7 @@ def build_week_bundle(start: str | None = None, end: str | None = None) -> dict:
         "night_counts": counts,
         "n_words": len(rows),
         "n_orders": len(orders),
-        "n_violations": len(audit["violations"]),
+        "n_violations": len(audit["real"]),
         "net_cents": net,
     }
 
