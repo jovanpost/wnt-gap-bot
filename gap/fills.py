@@ -24,6 +24,7 @@ from .kalshi import book_metrics
 log = logging.getLogger("gap.fills")
 
 POLL_KEY = "fill_slice_at:{oid}"
+CREDIT_KEY = "fill_credit:{oid}"
 
 
 def _as_dt(raw) -> datetime | None:
@@ -116,8 +117,23 @@ def apply_slice(order: dict, book: dict, now: datetime | None = None) -> dict[st
     took = 0.0
     open_win = window_open(order, now)
 
+    # v1.5.6 liquidity credit. The book shows the SAME resting size on every poll. Counting
+    # it again each poll would let a 200-contract order "fill" against one 10-contract bid
+    # 20 times over. Real liquidity is consumed when you take it, so an order can only ever
+    # take (first size seen) + (later INCREASES in size at or through its limit).
+    credit_key = CREDIT_KEY.format(oid=order["id"]) if order.get("id") is not None else None
+    cstate = (store.get_state(credit_key) if credit_key else None) or {}
+    last_size = float(cstate.get("last") or 0.0)
+    credit = float(cstate.get("credit") or 0.0)
+    if open_win and credit_key and size != last_size:
+        credit += size if not cstate else max(0.0, size - last_size)
+        store.set_state(credit_key, {"last": size, "credit": credit})
+
     if open_win and remaining > 0 and size > 0 and _due(order["id"], now):
-        took = min(remaining, size)
+        took = min(remaining, size, max(0.0, credit - already))
+        if took <= 0:
+            took = 0.0
+    if took > 0:
         already = already + took
         remaining = max(0.0, intended - already)
         store.update_order(order["id"], filled_contracts=round(already, 4))

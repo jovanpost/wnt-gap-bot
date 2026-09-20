@@ -128,6 +128,10 @@ def freeze_run_quotes(run: dict, now: datetime | None = None) -> dict:
             snap = None
         row = build_row(run_id, t, snap, moment, decision_at)
         store.insert_frozen_quote(row)
+        try:  # keep the full book at the decision moment (the shared depth table gets pruned)
+            store.insert_decision_book(run_id, t, decision_at or moment, snap, "freeze")
+        except Exception as exc:
+            log.warning("decision book %s: %s", t, exc)
         added += 1
         valid += 1 if row["valid"] else 0
         invalid += 0 if row["valid"] else 1

@@ -30,6 +30,7 @@ SCHEMA_FILE = Path(__file__).resolve().parent.parent / "sql" / "001_gap_schema.s
 # Extra idempotent migrations applied at boot (safe to re-run).
 MIGRATION_FILES = [
     Path(__file__).resolve().parent.parent / "sql" / "005_v151.sql",
+    Path(__file__).resolve().parent.parent / "sql" / "006_lab.sql",
 ]
 
 
@@ -705,3 +706,99 @@ def activity_between(start: datetime, end: datetime) -> list[dict]:
             {"a": start, "b": end},
         ).mappings().all()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# v1.5.6: decision-time order books (strategy lab)
+# ---------------------------------------------------------------------------
+def _book_list(v):
+    if v is None:
+        return []
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return []
+    return [[int(p), float(c)] for p, c in v] if v else []
+
+
+def depth_near(market_ticker: str, event_date: str, target: datetime, window_s: int = 900) -> dict | None:
+    """The depth snapshot closest in time to `target` (within +/- window_s), or None."""
+    with engine().connect() as conn:
+        row = conn.execute(
+            text("""
+                select ts, best_yes_bid, best_no_bid, yes_book, no_book
+                from depth
+                where market_ticker = :t and event_date = :d
+                  and ts between :lo and :hi
+                order by abs(extract(epoch from (ts - :target))) asc
+                limit 1
+            """),
+            {"t": market_ticker, "d": str(event_date)[:10], "target": target,
+             "lo": target - timedelta(seconds=window_s), "hi": target + timedelta(seconds=window_s)},
+        ).mappings().first()
+    if not row:
+        return None
+    out = dict(row)
+    out["yes_book"] = _book_list(out.get("yes_book"))
+    out["no_book"] = _book_list(out.get("no_book"))
+    return out
+
+
+def depth_series(market_ticker: str, event_date: str, start: datetime, end: datetime) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("""
+                select ts, best_yes_bid, best_no_bid, yes_book, no_book
+                from depth
+                where market_ticker = :t and event_date = :d and ts >= :a and ts <= :b
+                order by ts asc
+            """),
+            {"t": market_ticker, "d": str(event_date)[:10], "a": start, "b": end},
+        ).mappings().all()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["yes_book"] = _book_list(d.get("yes_book"))
+        d["no_book"] = _book_list(d.get("no_book"))
+        out.append(d)
+    return out
+
+
+def insert_decision_book(run_id: int, ticker: str, decision_at, snap: dict | None, source: str) -> None:
+    if not snap:
+        return
+    cap = snap.get("ts")
+    age = None
+    try:
+        if cap is not None and decision_at is not None:
+            age = int(abs((decision_at - cap).total_seconds()))
+    except TypeError:
+        age = None
+    with engine().begin() as conn:
+        conn.execute(
+            text("""
+                insert into gap_decision_books
+                    (run_id, market_ticker, decision_at, captured_at, age_s, yes_book, no_book, source)
+                values (:r, :t, :d, :c, :a, cast(:yb as jsonb), cast(:nb as jsonb), :s)
+                on conflict (run_id, market_ticker) do nothing
+            """),
+            {"r": run_id, "t": ticker, "d": decision_at, "c": cap, "a": age,
+             "yb": json.dumps(snap.get("yes_book") or []), "nb": json.dumps(snap.get("no_book") or []), "s": source},
+        )
+
+
+def decision_books_for_runs(run_ids: list[int]) -> dict[tuple[int, str], dict]:
+    run_ids = [int(r) for r in run_ids if r is not None]
+    if not run_ids:
+        return {}
+    stmt = text("select * from gap_decision_books where run_id in :r").bindparams(bindparam("r", expanding=True))
+    with engine().connect() as conn:
+        rows = conn.execute(stmt, {"r": run_ids}).mappings().all()
+    out = {}
+    for r in rows:
+        d = dict(r)
+        d["yes_book"] = _book_list(d.get("yes_book"))
+        d["no_book"] = _book_list(d.get("no_book"))
+        out[(int(d["run_id"]), d["market_ticker"])] = d
+    return out
