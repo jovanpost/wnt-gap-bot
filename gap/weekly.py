@@ -208,13 +208,16 @@ def _quote_for(ticker, frozen_by_t, legacy_by_t):
         }
     rows = legacy_by_t.get(ticker) or []
     if rows:
-        q = rows[-1]  # old behaviour: last row wins
+        # The FIRST row on file is the quote taken when the night was booked. Older code kept
+        # appending live quotes all evening (some at 5:40 PM, 6:25 PM, even 11:59 PM, after the
+        # book had collapsed), so the LAST row is often a post-close book. Ignore those.
+        q = rows[0]
         bid, ask = _f(q.get("yes_bid_cents")), _f(q.get("yes_ask_cents"))
         ok, why = Q.validate(bid, ask)
         return {
             "bid": bid, "ask": ask, "valid": ok, "reason": why,
             "time": q.get("quoted_at"), "age_s": None,
-            "source": "legacy", "n_rows": len(rows),
+            "source": "legacy", "n_rows": len(rows),  # n_rows > 1 = extra later rows, ignored
         }
     return {"bid": None, "ask": None, "valid": False, "reason": "no quote row",
             "time": None, "age_s": None, "source": "none", "n_rows": 0}
@@ -277,6 +280,9 @@ def _night_status(run, n_forecasts, n_orders, go_live, voids):
         )
     if go_live is None and not n_orders:
         return "FORECAST-ONLY", "no fill-model go-live time on record and no orders"
+    if not n_orders:
+        return "FORECAST-ONLY", ("no orders on file for this night (wiped, or never booked): "
+                                 "the forecast is good data, there is no trade record")
     return "TRADED", "paper books were live when this night was booked"
 
 
@@ -1067,12 +1073,13 @@ def _quality_block(data) -> list[str]:
     legacy = [r for r in rows if r["quote_source"] == "legacy"]
     frozen = [r for r in rows if r["quote_source"] == "frozen"]
     multi = [r for r in legacy if r["quote_rows"] > 1]
-    lines.append(f"quotes: {len(frozen)} frozen at decision time, {len(legacy)} old-style (time = when booking ran, "
-                 f"not necessarily the decision time), {sum(1 for r in rows if r['quote_source'] == 'none')} none")
+    lines.append(f"quotes: {len(frozen)} frozen at decision time, {len(legacy)} old-style (first row on file = when booking ran, "
+                 f"which can be 30+ minutes after the decision time), {sum(1 for r in rows if r['quote_source'] == 'none')} none")
     if multi:
         flags += 1
-        lines.append(f"! {len(multi)} old-style quotes have MORE THAN ONE row: booking ran more than once for that night "
-                     "(re-paste or re-run). Only the last row is shown.")
+        lines.append(f"! {len(multi)} old-style quotes have MORE THAN ONE row. The FIRST row (taken at booking) is used; "
+                     "the later rows were appended by older code during the evening (often after the show, when the book "
+                     "had collapsed) and are ignored.")
     ages = [r["quote_age_s"] for r in frozen if r["quote_age_s"] is not None]
     if ages:
         lines.append(f"frozen quote age (decision moment minus snapshot time): min {min(ages)}s, avg {sum(ages) / len(ages):.0f}s, max {max(ages)}s")
@@ -1227,7 +1234,7 @@ def _prompt_block(data) -> list[str]:
 # ONE NIGHT IN FULL
 # --------------------------------------------------------------------------
 _TIMELINE_KINDS = ("detected", "upgraded", "prompt_sent", "quotes_frozen", "parse_reject", "parsed",
-                   "expired", "no_event", "void", "weekly")
+                   "expired", "void", "weekly")
 
 
 def _night_block(n, activity) -> list[str]:
@@ -1248,10 +1255,13 @@ def _night_block(n, activity) -> list[str]:
                  "decision time with /gap_sendnow.)")
     ev = [a for a in activity.get(n["date"], []) if a.get("kind") in _TIMELINE_KINDS]
     fills_n = sum(1 for a in activity.get(n["date"], []) if a.get("kind") == "paper_fill")
+    noev_n = sum(1 for a in activity.get(n["date"], []) if a.get("kind") == "no_event")
     if ev or fills_n:
         lines.append("ACTIVITY LOG (CT):")
         for a in ev[:30]:
             lines.append(f"  {_hm(a['at'])}  {a['kind']:<14} {_trunc(a.get('message'), 170)}")
+        if noev_n:
+            lines.append(f"  ({noev_n} 'no open event yet' polls not listed)")
         if fills_n:
             lines.append(f"  ({fills_n} paper_fill events not listed)")
     if run.get("grok_share_url"):
