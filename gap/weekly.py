@@ -1004,7 +1004,8 @@ def _k_panel(data, book, sub=None) -> dict:
         "state": o["state"], "net_dollars": None if o["net"] is None else round(o["net"] / 100.0, 2),
         "is_count": o["is_count"],
     } for o in sorted(members, key=lambda x: (x["date"], x["word"]))]
-    return {"rows": rows, "cum": cum, "weeks_in": weeks_in, "status": _k_status(cum, weeks_in), "orders": detail}
+    return {"rows": rows, "cum": cum, "weeks_in": weeks_in, "status": _k_status(cum, weeks_in), "orders": detail,
+            "last_date": max((o["date"] for o in members), default=None)}
 
 
 def score_panel(data) -> dict:
@@ -1100,8 +1101,15 @@ def recompute_table(data) -> list[dict]:
     return lab.recompute_fills(k_orders_ab(data))
 
 
-def ab_verdict(a, b) -> str:
-    """Does the edge survive at size? B's margin within ~5 pts of A's AND B's contract fill % not >10 pts lower."""
+AB_FIX_DATE = "2026-09-21"   # first night with the no-double-counting fill rule (v1.5.6+)
+
+
+def ab_verdict(a, b, b_last_date=None) -> str:
+    """Does the edge survive at size? B's margin within ~5 pts of A's AND B's contract fill % not >10 pts lower.
+    Not measurable while every B order in the slice came from the old paper fill model."""
+    if b_last_date is not None and b_last_date < AB_FIX_DATE:
+        return ("NOT MEASURABLE YET: every B order here came from the old paper fill model (before " + AB_FIX_DATE +
+                "), so B just mirrors A x 100. Use the RECOMPUTED table and the real-size sweep.")
     if a["filled"] >= 1 and b["filled"] >= 1 and a["margin"] is not None and b["margin"] is not None:
         close = abs(b["margin"] - a["margin"]) <= 5.0
         fill_ok = (b["fill_ct"] or 0) >= (a["fill_ct"] or 0) - 10.0
@@ -1120,7 +1128,8 @@ def _ab_compare(data) -> list[str]:
         st = {}
         for book in ("A", "B"):
             st[book] = _k_stats([o for o in allo if _k_member(o, book, sub)])
-        verdict = ab_verdict(st["A"], st["B"])
+        b_last = max((o["date"] for o in allo if _k_member(o, "B", sub)), default=None)
+        verdict = ab_verdict(st["A"], st["B"], b_last)
         for book in ("A", "B"):
             r = st[book]
             lines.append(f"{_slice_name(sub)[:25]:<26}{book:<6}{r['booked']:>7}{r['filled']:>7}{_fx(r['fill_ct'], 0):>9}"

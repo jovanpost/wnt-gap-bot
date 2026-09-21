@@ -33,7 +33,11 @@ def _cell(v):
     if isinstance(v, bool):
         return "yes" if v else "no"
     if isinstance(v, float):
-        return f"{v:,.2f}".rstrip("0").rstrip(".") if abs(v) < 1e9 else str(v)
+        if abs(v) >= 1e9:
+            return str(v)
+        if abs(v) >= 10:
+            return f"{v:,.2f}".rstrip("0").rstrip(".")
+        return f"{v:.4f}".rstrip("0").rstrip(".") if v != 0 else "0"   # Brier scores and other small numbers keep 4 decimals
     return str(v).replace("|", "/").replace("\n", " ")
 
 
@@ -554,7 +558,7 @@ with tab_k:
                 for book, r in (("A ($1)", a), ("B ($100)", b)):
                     recs.append({"slice": name, "book": book, "booked": r["booked"], "filled": r["filled"], "fill % (contracts)": r["fill_ct"],
                                  "avg NO px ¢": r["px"], "hit %": r["hit"], "margin": r["margin"], "net $": r["net"] / 100.0})
-                show_p(md, f"**{name}:** {weekly.ab_verdict(a, b)}")
+                show_p(md, f"**{name}:** {weekly.ab_verdict(a, b, PANEL[kb]['last_date'])}")
             show_df(md, pd.DataFrame(recs), column_config={
                 "fill % (contracts)": st.column_config.NumberColumn(format="%.0f"), "avg NO px ¢": st.column_config.NumberColumn(format="%.1f"),
                 "hit %": st.column_config.NumberColumn(format="%.0f"), "margin": st.column_config.NumberColumn(format="%+.1f"),
@@ -567,6 +571,13 @@ with tab_k:
                     "night": r["date"], "book": r["book"], "word": r["word"], "want ct": r["intended"], "paper filled ct": r["paper_filled"],
                     "real filled ct": r.get("real_filled"), "paper net $": r["paper_net"], "real net $": r.get("real_net"),
                     "note": r.get("note", "")} for r in rc]))
+                ra = [r for r in rc if r["book"] == "A" and not r.get("note")]
+                if ra:
+                    _f = [r for r in ra if (r.get("real_filled") or 0) > 0]
+                    _w = [r for r in _f if (r.get("real_net") or 0) > 0]
+                    show_note(md, "info", f"Book A K orders replayed with the depth history: {len(_f)} would have filled ({len(_w)} wins), "
+                                          f"against {sum(1 for r in ra if (r['paper_filled'] or 0) > 0)} filled in the paper books. "
+                                          "Paper fills on a night when the app was not polling (9/18 had 14 fill events) can miss fills.")
             else:
                 show_note(md, "info", "No K orders to recompute yet.")
 
@@ -749,8 +760,8 @@ with tab_lab:
         g = lab.growth_summary(words, fn)
         gs = g["stats"]
         show_p(md, "**Forward Monte Carlo** — what could happen if this keeps going")
-        if gs["trades"] < 3 or gs["avg_px"] is None:
-            show_note(md, "info", "Too few trades in this selection to simulate.")
+        if gs["trades"] < 10 or gs["avg_px"] is None:
+            show_note(md, "info", f"Only {gs['trades']} trade(s) in this selection. The simulator needs at least 10 before its hit-rate range means anything.")
         else:
             opts = {
                 f"Observed hit rate ({gs['hit']:.0f}%)": gs["hit"],

@@ -615,26 +615,27 @@ def replay(words: list[dict], fn, bankroll0: float, mode: str, value: float, nig
 
 def monte_carlo(hit_pct: float, avg_px: float, fee_pc: float, trades_per_night: float, nights: int,
                 bankroll0: float, stake_pct: float, paths: int = 2000, seed: int = 7) -> dict:
-    """Forward simulation: each night has ~trades_per_night trades, each risking stake_pct of the
-    bankroll at avg_px, winning with probability hit_pct. Shows the SPREAD of outcomes (luck), and is
-    only as good as the hit rate you feed it."""
+    """Forward simulation. Each night has a RANDOM number of trades (Poisson around trades_per_night, so 0.6 a
+    night really means most nights have none), each risking stake_pct of the bankroll at avg_px cents and
+    winning with probability hit_pct. Shows the SPREAD of outcomes (luck); only as good as the hit rate you feed it."""
     import numpy as np
     rng = np.random.default_rng(seed)
-    per_night = max(0, int(round(trades_per_night)))
     bank = np.full(paths, float(bankroll0))
     q = avg_px / 100.0
     fee_frac = fee_pc / 100.0            # dollars of fee per contract
     for _ in range(nights):
-        for _t in range(per_night):
+        ks = rng.poisson(max(0.0, trades_per_night), paths)
+        for t in range(int(ks.max()) if paths else 0):
+            active = ks > t
             stake = bank * stake_pct / 100.0
             contracts = stake / q
             win = rng.random(paths) < (hit_pct / 100.0)
             pnl = np.where(win, contracts * (1.0 - q), -stake) - contracts * fee_frac
-            bank = np.maximum(bank + pnl, 0.0)
+            bank = np.where(active, np.maximum(bank + pnl, 0.0), bank)
     pct = lambda x: float(np.percentile(bank, x))
     return {"p10": pct(10), "p50": pct(50), "p90": pct(90), "mean": float(bank.mean()),
             "prob_loss": float((bank < bankroll0).mean()), "prob_2x": float((bank >= 2 * bankroll0).mean()),
-            "per_night": per_night}
+            "per_night": round(float(trades_per_night), 2)}
 
 
 def growth_summary(words: list[dict], fn) -> dict:
