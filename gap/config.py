@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.5.8"
+VERSION = "wnt-gap-v1.5.9"
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -128,6 +128,9 @@ VARIANTS = tuple(v for v in ALL_VARIANTS if v["id"] not in DISABLED_BOOKS)
 EDGE_EXEC_THRESHOLD = int(_num("EDGE_EXEC_THRESHOLD", 10))
 # Quotes: newest depth snapshot at/before the decision time, at most this old (seconds).
 QUOTE_MAX_AGE_S = int(_num("QUOTE_MAX_AGE_S", 600))
+# v1.5.9: wide spreads are TRADED. 0 = no spread rule. (It was 25 in v1.5.1-v1.5.8.) Only broken quotes
+# (bid<=1, ask<=1, bid>=99, bid>ask, a missing side) are skipped. Set the secret QUOTE_MAX_SPREAD to bring a limit back.
+QUOTE_MAX_SPREAD = int(_num("QUOTE_MAX_SPREAD", 0))
 # WORD HISTORY block sent to Grok: how many past nights (0 = off).
 WORD_HISTORY_NIGHTS = int(_num("WORD_HISTORY_NIGHTS", 10))
 # Paper fills are checked every poll tick (not only when someone opens the app).
@@ -183,7 +186,8 @@ def summary() -> str:
         f"A/B fade hold (gap strictly > {GAP_THRESHOLD}) · E/F fade+Grok>50 hold · G/H Grok-10 hold cancel 5:29 CT · "
         f"I edge vs ask/bid > {EDGE_EXEC_THRESHOLD} · scalp removed v1.5.0\n"
         f"books on: {','.join(v['id'] for v in VARIANTS)} · quotes frozen at decision time · "
-        f"invalid quote (bid<=1, ask<=1, bid>=99, bid>ask, spread>25) = no trade\n"
+        f"broken quote (bid<=1, ask<=1, bid>=99, bid>ask{f', spread>{QUOTE_MAX_SPREAD}' if QUOTE_MAX_SPREAD else ''}) = no trade · wide spreads "
+        f"{'skipped' if QUOTE_MAX_SPREAD else 'are traded'}\n"
         f"NO bankroll / NO night cap / NO cluster cap\n"
         f"prompt {prompt_version()} | harness {HARNESS} | addendum {ADDENDUM}\n"
         f"poll {POLL_START_CT} CT | json deadline {JSON_DEADLINE_CT} CT"

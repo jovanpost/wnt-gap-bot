@@ -25,7 +25,7 @@ from . import clock, config as C, store
 
 log = logging.getLogger("gap.quotes")
 
-MAX_SPREAD_CENTS = 25
+MAX_SPREAD_CENTS = C.QUOTE_MAX_SPREAD   # 0 = wide spreads are traded (v1.5.9). Was 25 before.
 SOURCE = "depth_asof_decision"
 
 
@@ -39,8 +39,9 @@ def _int(x):
 
 
 def validate(bid, ask) -> tuple[bool, str | None]:
-    """(is_valid, reason). Invalid: bid<=1, ask<=1, bid>=99, bid>ask, spread>25,
-    or either side missing."""
+    """(is_valid, reason). Invalid = a BROKEN quote: bid<=1, ask<=1, bid>=99, bid>ask, or either side missing.
+    A wide spread is NOT invalid (v1.5.9): in this small market a wide spread is often exactly where the
+    mispricing is. If the secret QUOTE_MAX_SPREAD is set above 0, spread above it is skipped again."""
     bid, ask = _int(bid), _int(ask)
     if bid is None and ask is None:
         return False, "no quote"
@@ -57,7 +58,7 @@ def validate(bid, ask) -> tuple[bool, str | None]:
         reasons.append("bid>=99")
     if bid > ask:
         reasons.append("bid>ask")
-    if ask - bid > MAX_SPREAD_CENTS:
+    if MAX_SPREAD_CENTS and ask - bid > MAX_SPREAD_CENTS:
         reasons.append(f"spread>{MAX_SPREAD_CENTS}")
     if reasons:
         return False, ",".join(reasons)

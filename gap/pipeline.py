@@ -336,8 +336,8 @@ def book_from_forecasts(run: dict, forecasts: list[dict], notes: list[str] | Non
     """One decision set, independent books. No shared size or cash.
 
     v1.5.1: quotes are the FROZEN decision-time quotes (gap/quotes.py). This function
-    never reads the live book. An INVALID quote (bid<=1, ask<=1, bid>=99, bid>ask,
-    spread>25, or a missing side) means every rule that needs the market skips that
+    never reads the live book. A BROKEN quote (bid<=1, ask<=1, bid>=99, bid>ask, or a
+    missing side; wide spreads are traded since v1.5.9) means every rule that needs the market skips that
     word; Grok-10 books ignore the market and are not affected.
     What each book books for a word comes from strategy.order_for_rule -- the same
     function the weekly RULE AUDIT uses to check us.

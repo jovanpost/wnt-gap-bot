@@ -10,8 +10,8 @@ changes a trade.
 What is new in v1.5.1 (from the W38 review)
   * RULE AUDIT at the top: every order re-checked against its own book's rule.
   * Night status: TRADED / FORECAST-ONLY / VOID, plus the fill-model go-live time.
-  * Market comparisons use VALID quotes only (bid<=1, ask<=1, bid>=99, bid>ask,
-    spread>25 are INVALID and show "INVALID QUOTE" instead of a fake mid).
+  * Market comparisons use VALID quotes only (bid<=1, ask<=1, bid>=99, bid>ask, or a missing side
+    are BROKEN and show "INVALID QUOTE" instead of a fake mid). Wide spreads are valid since v1.5.9.
   * Gross / fees / net everywhere. Fees now really are 0.07 x ct x P x (1-P), rounded up.
   * Partial fills flagged; dollar-weighted and full-fill-only hit rates.
   * Headline Grok-vs-market scoreboard (all / count / plain) + week-over-week table
@@ -51,6 +51,7 @@ THRESHOLDS = (10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90
 GAP_BINS = ((-101, -40), (-40, -25), (-25, -15), (-15, -5), (-5, 5),
             (5, 15), (15, 25), (25, 40), (40, 101))
 ABS_GAP_BINS = ((15, 20), (20, 25), (25, 35), (35, 101))
+SPREAD_BINS = ((0, 11), (11, 26), (26, 101))    # quote spread at booking: 0-10 / 11-25 / 26+ points
 P_BINS = tuple((lo, lo + 10) for lo in range(0, 100, 10))
 WIDE_BINS = ((0, 20, "0-19"), (20, 40, "20-39"), (40, 60, "40-59"), (60, 80, "60-79"), (80, 101, "80+"))
 MARKET_RULES = ("fade15", "fade15_gate50", "edge_exec")
@@ -681,7 +682,7 @@ def _audit_block(a) -> list[str]:
         lines.append("VIOLATIONS: 0   <- this is what it should say")
         return lines
     if pre:
-        lines.append(f"PRE-RULE: {len(pre)} old orders traded a quote that today's rule calls INVALID (usually spread > 25). "
+        lines.append(f"PRE-RULE: {len(pre)} old orders traded a quote that today's rule calls INVALID (broken quotes). "
                      "They were booked BEFORE that rule existed, so they are expected, not bugs. They stay in the books.")
     if not real:
         lines.append("REAL VIOLATIONS: 0   <- this is what it should say")
@@ -1458,6 +1459,12 @@ def _trade_slices_block(data) -> list[str]:
             table(f"BOOK {vid}: by size of the gap/edge at booking (points)", os_, ABS_GAP_BINS,
                   lambda o: abs(o["gap_booked"]) if o["gap_booked"] is not None else None,
                   lambda lo, hi: f"{lo}-{min(hi, 100) - 1}")
+    for vid in ("A", "E", "I"):
+        os_ = [o for o in orders if o["variant"] == vid and o.get("q_bid") is not None and o.get("q_ask") is not None]
+        if os_:
+            table(f"BOOK {vid}: by quote SPREAD at booking (points). Are wide-spread trades worse or better?", os_, SPREAD_BINS,
+                  lambda o: o["q_ask"] - o["q_bid"],
+                  lambda lo, hi: f"spread {lo}-{min(hi, 100) - 1}" if hi <= 100 else f"spread {lo}+")
     for vid in ("A", "E", "G", "I"):
         os_ = [o for o in orders if o["variant"] == vid]
         if os_:
@@ -1615,7 +1622,8 @@ def _config_block() -> list[str]:
         "  grok10        : ignore the market. Rest 10¢ cheaper than Grok on Grok's side. Cancel 5:29 PM CT.",
         f"  edge_exec (I) : VALID quote required. edge = Grok - ask (to buy YES) or bid - Grok (to buy NO). Trade if strictly > {C.EDGE_EXEC_THRESHOLD}; "
         "order placed AT the ask (or the bid), so it fills right away if size is there.",
-        "  Quote validity: INVALID if bid<=1, ask<=1, bid>=99, bid>ask, spread>25, or a side is missing.",
+        "  Quote validity: INVALID (broken) if bid<=1, ask<=1, bid>=99, bid>ask, or a side is missing"
+        + (f", or spread>{C.QUOTE_MAX_SPREAD}." if C.QUOTE_MAX_SPREAD else ". Wide spreads are TRADED (v1.5.9; the spread>25 rule was removed)."),
         "  All books hold to Kalshi settlement. Fee = 0.07 x contracts x P x (1-P), rounded up to the cent.",
     ]
     return lines
@@ -1891,7 +1899,7 @@ def render_csv(data: dict) -> str:
     variants = [v["id"] for v in C.VARIANTS]
     cols = ["date", "night_status", "event_ticker", "market_ticker", "word", "is_count_market",
             "grok_p", "p_block_airs", "p_said_given_airs",
-            "quote_bid", "quote_ask", "quote_time_ct", "quote_valid", "quote_invalid_reason", "quote_age_s", "quote_source",
+            "quote_bid", "quote_ask", "quote_spread", "quote_time_ct", "quote_valid", "quote_invalid_reason", "quote_age_s", "quote_source",
             "mkt_mid", "blend_p", "K_in_slice", "K_HIGH_in_slice", "K_LOW_in_slice", "IK_in_slice", "M_in_slice",
             "dec_bid", "dec_ask", "no_dollars_yesbid60plus", "no_dollars_yesbid65plus", "no_dollars_yesbid70plus",
             "gap", "outcome", "said_yes", "cycle_temp", "has_substitute_risk",
@@ -1908,7 +1916,7 @@ def render_csv(data: dict) -> str:
         qt = clock.parse_dt(r["quote_time"])
         row = [r["date"], r.get("night_status"), r["event_ticker"], r["ticker"], r["word"], int(r["is_count"]),
                r["grok"], r["p_block"], r["p_said"],
-               r["bid"], r["ask"],
+               r["bid"], r["ask"], (r["ask"] - r["bid"]) if (r["bid"] is not None and r["ask"] is not None) else None,
                qt.astimezone(C.CT).strftime("%Y-%m-%d %H:%M:%S") if qt else "",
                int(r["quote_valid"]), r["quote_reason"] or "", r["quote_age_s"], r["quote_source"],
                None if r["mid"] is None else round(r["mid"], 2),
