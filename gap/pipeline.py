@@ -332,6 +332,36 @@ def _i(x):
         return None
 
 
+def order_row_from_decision(run: dict, spec: dict, rule: str, sig: dict, decision: dict) -> dict:
+    """The one place an order row is assembled (booking and gap/rebook.py both use it)."""
+    f = sig["forecast"]
+    return {
+        "forecast_id": f.get("id"),
+        "run_id": run["id"],
+        "event_date": str(run["event_date"])[:10],
+        "market_ticker": f["market_ticker"],
+        "word": f["word"],
+        "side": decision["side"],
+        "limit_price_cents": decision["yes_price_cents"],
+        "our_price_cents": int(decision["our_price_cents"]),
+        "contracts": decision["contracts"],
+        "cost_cents": decision["cost_cents"],
+        "gap_points": decision["gap_points"],
+        "threshold": decision["threshold"],
+        "cluster_key": sig["cluster_key"],
+        "paper": True,
+        "status": "paper_sweep",
+        "variant_id": spec["id"],
+        "exit_rule": spec["exit"],
+        "notional_dollars": spec["notional"],
+        "execution_model": C.EXECUTION_MODEL,
+        "quote_bid_cents": sig["bid"],
+        "quote_ask_cents": sig["ask"],
+        "quote_captured_at": sig["captured_at"],
+        "book_rule": rule,
+    }
+
+
 def book_from_forecasts(run: dict, forecasts: list[dict], notes: list[str] | None = None) -> list[dict]:
     """One decision set, independent books. No shared size or cash.
 
@@ -392,31 +422,7 @@ def book_from_forecasts(run: dict, forecasts: list[dict], notes: list[str] | Non
             )
             if not decision:
                 continue
-            candidates.append({
-                "forecast_id": f.get("id"),
-                "run_id": run["id"],
-                "event_date": str(run["event_date"])[:10],
-                "market_ticker": f["market_ticker"],
-                "word": f["word"],
-                "side": decision["side"],
-                "limit_price_cents": decision["yes_price_cents"],
-                "our_price_cents": int(decision["our_price_cents"]),
-                "contracts": decision["contracts"],
-                "cost_cents": decision["cost_cents"],
-                "gap_points": decision["gap_points"],
-                "threshold": decision["threshold"],
-                "cluster_key": sig["cluster_key"],
-                "paper": True,
-                "status": "paper_sweep",
-                "variant_id": spec["id"],
-                "exit_rule": spec["exit"],
-                "notional_dollars": spec["notional"],
-                "execution_model": C.EXECUTION_MODEL,
-                "quote_bid_cents": sig["bid"],
-                "quote_ask_cents": sig["ask"],
-                "quote_captured_at": sig["captured_at"],
-                "book_rule": rule,
-            })
+            candidates.append(order_row_from_decision(run, spec, rule, sig, decision))
         kept = strategy.apply_caps(candidates, notional=spec["notional"])
         for row in kept:
             store.insert_order(row)

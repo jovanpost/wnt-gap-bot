@@ -514,7 +514,7 @@ def _replay_one(o: dict, until) -> dict | None:
         won = (o["side"] == "NO" and o["outcome"] == "no") or (o["side"] == "YES" and o["outcome"] == "yes")
         gross = filled * (100 - avg) if won else -filled * avg
         net = (gross - fee) / 100.0
-    return {"filled": round(filled, 2), "avg_px": avg, "net": net, "note": ""}
+    return {"filled": round(filled, 2), "avg_px": avg, "net": net, "note": "", "credit": credit, "last": (last or 0.0)}
 
 
 def long_rest_shadow(orders: list[dict], until_hhmm: str = "17:28") -> list[dict]:

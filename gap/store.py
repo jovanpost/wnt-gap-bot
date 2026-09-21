@@ -802,3 +802,23 @@ def decision_books_for_runs(run_ids: list[int]) -> dict[tuple[int, str], dict]:
         d["no_book"] = _book_list(d.get("no_book"))
         out[(int(d["run_id"]), d["market_ticker"])] = d
     return out
+
+
+# ---------------------------------------------------------------------------
+# v1.5.9: re-booking a night whose quotes were judged under an older rule
+# ---------------------------------------------------------------------------
+def update_frozen_quote(run_id: int, ticker: str, valid: bool, reason: str | None, market_prob: float | None) -> None:
+    """Re-judge one FROZEN quote (bid/ask/captured_at are never touched, only the verdict and the mid)."""
+    with engine().begin() as conn:
+        conn.execute(
+            text("""
+                update gap_quotes set valid = :v, invalid_reason = :r, market_prob = :m
+                where run_id = :id and market_ticker = :t and frozen is true
+            """),
+            {"v": bool(valid), "r": reason, "m": market_prob, "id": run_id, "t": ticker},
+        )
+
+
+def set_order_placed_at(order_id: int, ts) -> None:
+    with engine().begin() as conn:
+        conn.execute(text("update gap_orders set placed_at = :t where id = :id"), {"t": ts, "id": order_id})
