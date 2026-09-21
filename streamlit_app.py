@@ -18,6 +18,110 @@ logging.basicConfig(
 st.set_page_config(page_title="WNT Gap Bot", page_icon="📐", layout="wide")
 
 
+# ---------------------------------------------------------------------------
+# Copy-as-Markdown for every tab: each show_* helper draws the thing AND records it,
+# so the whole tab can be copied with one click and pasted into a chat (no screenshots).
+# ---------------------------------------------------------------------------
+def _cell(v):
+    if v is None:
+        return ""
+    try:
+        if v != v:  # NaN
+            return ""
+    except Exception:
+        pass
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, float):
+        return f"{v:,.2f}".rstrip("0").rstrip(".") if abs(v) < 1e9 else str(v)
+    return str(v).replace("|", "/").replace("\n", " ")
+
+
+def df_to_md(df: pd.DataFrame) -> str:
+    if df is None or len(df) == 0:
+        return "_(empty)_"
+    df = df.reset_index() if (df.index.name or not isinstance(df.index, pd.RangeIndex)) else df
+    cols = [str(c) for c in df.columns]
+    out = ["| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
+    for row in df.itertuples(index=False):
+        out.append("| " + " | ".join(_cell(v) for v in row) + " |")
+    return "\n".join(out)
+
+
+class Raw:
+    """Wraps ready-made Markdown text so copy_box can take it."""
+    def __init__(self, text):
+        self._t = text
+
+    def text(self):
+        return self._t
+
+
+class MD:
+    def __init__(self, title: str):
+        self.title = title
+        self.parts = [f"# {title}", f"_{C.VERSION} · as of {clock.fmt(clock.now_ct())}_"]
+
+    def h(self, text):
+        self.parts.append(f"\n## {text}")
+
+    def p(self, text):
+        self.parts.append(str(text))
+
+    def df(self, df):
+        self.parts.append(df_to_md(df))
+
+    def code(self, text):
+        self.parts.append("```\n" + str(text) + "\n```")
+
+    def text(self):
+        return "\n\n".join(self.parts)
+
+
+def show_h(md, text):
+    st.subheader(text)
+    md.h(text)
+
+
+def show_p(md, text):
+    st.markdown(text)
+    md.p(text)
+
+
+def show_cap(md, text):
+    st.caption(text)
+    md.p("_" + str(text) + "_")
+
+
+def show_df(md, df, **kw):
+    kw.setdefault("hide_index", True)
+    kw.setdefault("use_container_width", True)
+    st.dataframe(df, **kw)
+    md.df(df)
+
+
+def show_note(md, kind, text):
+    getattr(st, kind)(text)
+    md.p(f"> **{kind.upper()}:** {text}")
+
+
+def show_metrics(md, items):
+    """items = [(label, value, delta_or_None), ...] drawn as one row of metrics."""
+    cols = st.columns(len(items))
+    for col, (label, value, delta) in zip(cols, items):
+        col.metric(label, value, delta)
+    md.p("  \n".join(f"**{label}:** {value}" + (f" ({delta})" if delta else "") for label, value, delta in items))
+
+
+def copy_box(slot, md, key, filename):
+    """The copy button lives at the TOP of the tab (slot), filled after the tab has been drawn."""
+    with slot:
+        text = md.text()
+        with st.expander("📋 Copy this whole page as Markdown (click the copy icon in the box, then paste)", expanded=False):
+            st.code(text, language="markdown")
+        st.download_button("Download this page as .md", data=text, file_name=filename, mime="text/markdown", key=key)
+
+
 @st.cache_resource
 def boot():
     store.init_db()
@@ -108,68 +212,52 @@ tab_live, tab_books, tab_four, tab_k, tab_lab, tab_curve = st.tabs(
 
 # ---------------------------------------------------------------------------
 with tab_live:
+    slot_live = st.container()
+    md = MD("Tonight")
     if C.PAPER:
-        st.info("**PAPER** — capped-sweep rows only. No Kalshi place_order.")
+        show_note(md, "info", "**PAPER** — capped-sweep rows only. No Kalshi place_order.")
     elif C.may_place_live():
-        st.error("**LIVE** — Phase 1 should not be here.")
+        show_note(md, "error", "**LIVE** — Phase 1 should not be here.")
     else:
-        st.warning("Live flags mixed. Placement blocked.")
+        show_note(md, "warning", "Live flags mixed. Placement blocked.")
 
     st.code(C.summary())
+    md.code(C.summary())
     date_str = clock.today_ct()
     run = store.get_run_for_date(date_str)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Today CT", date_str)
     send_label = clock.fmt(clock.decision_at(date_str))
     if run:
         due = clock.send_due_at(run.get("market_open_at") or run.get("created_at"))
         if due:
             send_label = clock.fmt(due)
-    c2.metric("File send", send_label)
-    if run:
-        c3.metric("Run", str(run.get("status")))
-        c4.metric("Markets", str(run.get("markets_n") or 0))
-    else:
-        c3.metric("Run", "none")
-        c4.metric("Markets", "—")
+    show_metrics(md, [
+        ("Today CT", date_str, None),
+        ("File send", send_label, None),
+        ("Run", str(run.get("status")) if run else "none", None),
+        ("Markets", str(run.get("markets_n") or 0) if run else "—", None),
+    ])
 
     if not run:
-        st.write(
-            "No event yet. Poll starts", C.POLL_START_CT,
-            "CT. File sends", C.DECISION_LAG_MIN, "min after first detect."
-        )
+        show_p(md, f"No event yet. Poll starts {C.POLL_START_CT} CT. File sends {C.DECISION_LAG_MIN} min after first detect.")
     elif run.get("status") == "detected":
-        st.warning(
-            "Event seen. Telegram file waits until "
-            + send_label
-            + ". /gap_sendnow skips the wait."
-        )
+        show_note(md, "warning", "Event seen. Telegram file waits until " + send_label + ". /gap_sendnow skips the wait.")
     else:
-        st.write(
-            f"`{run.get('event_ticker')}` · `{run.get('harness')}` · "
-            f"`{run.get('prompt_version')}`"
-        )
+        show_p(md, f"`{run.get('event_ticker')}` · `{run.get('harness')}` · `{run.get('prompt_version')}`")
         if run.get("parse_error"):
-            st.error(run["parse_error"])
+            show_note(md, "error", run["parse_error"])
         markets = store.markets_for_run(run["id"])
         if markets:
-            st.dataframe(
-                pd.DataFrame(markets)[["word", "market_ticker", "title"]],
-                hide_index=True,
-                use_container_width=True,
-            )
+            show_df(md, pd.DataFrame(markets)[["word", "market_ticker", "title"]])
 
     act = store.recent_activity(20)
     if act:
-        st.subheader("Activity")
-        st.dataframe(
-            pd.DataFrame(act)[["at", "kind", "message"]],
-            hide_index=True,
-            use_container_width=True,
-        )
+        show_h(md, "Activity")
+        show_df(md, pd.DataFrame(act)[["at", "kind", "message"]])
+    copy_box(slot_live, md, "md_live", f"gap-tonight-{clock.today_ct()}.md")
 
 # ---------------------------------------------------------------------------
 with tab_books:
+    slot_books = st.container()
     pick = st.columns([2, 2, 1])
     with pick[0]:
         date_str = st.text_input("Board date (CT)", value=clock.today_ct())
@@ -287,37 +375,31 @@ with tab_books:
                     column_config=cfg,
                 )
 
-        md = board.as_markdown(snap)
-        st.download_button(
-            "Download board.md",
-            data=md,
-            file_name=f"gap-board-{date_str}.md",
-            mime="text/markdown",
-        )
-        with st.expander("Copy as Markdown", expanded=False):
-            st.caption("Select all, copy, paste back here.")
-            st.code(md, language="markdown")
         st.caption(
             f"{snap['n_words']} words · {snap['n_orders']} tickets · "
             "Refresh checks Kalshi for new settlements"
         )
+        copy_box(slot_books, Raw(board.as_markdown(snap)), "md_books", f"gap-board-{date_str}.md")
+    if not rows:
+        copy_box(slot_books, Raw(f"# Books · P&L\n\nNo paper orders yet for {date_str}."), "md_books_empty", f"gap-board-{date_str}.md")
 
 # ---------------------------------------------------------------------------
 with tab_four:
-    st.markdown(
-        "Running paper totals across every night in the database. "
-        "This is A/B/E/F/G/H on real booked tickets, not the old 128-night fixture. "
-        "No live marks here either — unsettled nights show *pending*."
-    )
+    slot_four = st.container()
+    md = MD("All nights · books" + ("" if SEL == "All weeks" else f" · {SEL}"))
+    show_p(md, "Running paper totals across every night in the database. "
+               "This is the paper books on real booked tickets, not the old 128-night fixture. "
+               "No live marks here either — unsettled nights show *pending*. "
+               "**Book B/F/H are the $100 copies: in W38 their fills came from the old paper model (see the Book K tab) and are NOT proof that $100 fills.**")
     hist = board.history()
     if SEL != "All weeks":
         _rows = [r for r in hist["rows"] if r.get("event_date") and weekly._week_id(str(r["event_date"])[:10]) == SEL]
         hist = {**hist, "rows": _rows, "books": board.summarize(_rows),
                 "nights": sorted({str(r["event_date"])[:10] for r in _rows}), "n_orders": len(_rows),
                 "n_words": len({(str(r["event_date"])[:10], r.get("word")) for r in _rows})}
-        st.info(f"Showing only week {SEL} (change it in the sidebar).")
+        show_note(md, "info", f"Showing only week {SEL} (change it in the sidebar).")
     books = hist["books"]
-    st.caption(f"{len(hist['nights'])} nights · {hist['n_orders']} tickets · {hist['n_words']} word-nights")
+    show_cap(md, f"{len(hist['nights'])} nights · {hist['n_orders']} tickets · {hist['n_words']} word-nights")
     if books:
         for chunk_start in range(0, len(books), 3):
             cards = st.columns(3)
@@ -337,9 +419,10 @@ with tab_four:
             "P&L %": round(b["pct"], 2) if b["settled_n"] else None,
             "W": b["wins"], "L": b["losses"],
         } for b in books])
-        st.dataframe(cmp, hide_index=True, use_container_width=True)
+        show_df(md, cmp)
     else:
-        st.info("No paper tickets stored yet.")
+        show_note(md, "info", "No paper tickets stored yet.")
+    copy_box(slot_four, md, "md_four", f"gap-all-nights-{SEL}.md")
 
 # ---------------------------------------------------------------------------
 def _pick(rows):
@@ -372,29 +455,49 @@ CFG_K = {
     "unfilled would-hit %": st.column_config.NumberColumn(format="%.0f"),
 }
 
-
-def _status_banner(text):
-    if text.startswith("PASSING"):
-        st.success("STATUS: " + text)
-    elif text.startswith("FAILING"):
-        st.error("STATUS: " + text)
-    else:
-        st.info("STATUS: " + text)
+CFG_SWEEP = {
+    "filled %": st.column_config.NumberColumn(format="%.0f"), "avg NO px ¢": st.column_config.NumberColumn(format="%.1f"),
+    "fee/contract ¢": st.column_config.NumberColumn(format="%.1f"), "break-even %": st.column_config.NumberColumn(format="%.1f"),
+    "hit %": st.column_config.NumberColumn(format="%.0f"), "margin (pts)": st.column_config.NumberColumn(format="%+.1f"),
+    "net $": st.column_config.NumberColumn(format="$%+.2f"),
+}
 
 
-def _metrics(cum):
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Filled", f"{cum['filled']} / {weekly.K_MIN_FILLED}")
-    m2.metric("Hit rate", "n/a" if cum["hit"] is None else f"{cum['hit']:.0f}%",
-              None if cum["be"] is None else f"break-even {cum['be']:.1f}%")
-    m3.metric("Margin (points)", "n/a" if cum["margin"] is None else f"{cum['margin']:+.1f}")
-    m4.metric("Net after fees", f"${cum['net'] / 100:+.2f}")
-    m5.metric("Unfilled would-hit", "n/a" if cum["unf_hit"] is None else f"{cum['unf_hit']:.0f}% ({cum['unf_n']})")
+def _sweep_df(rows):
+    return pd.DataFrame([{
+        "size $": r["size"], "signals": r["signals"], "trades": r["trades"], "filled %": r["filled_pct"], "avg NO px ¢": r["avg_px"],
+        "fee/contract ¢": r["fee_pc"], "break-even %": r["be"], "hit %": r["hit"],
+        "90% range": "n/a" if r["lo"] is None else f"{r['lo']:.0f}–{r['hi']:.0f}", "margin (pts)": r["margin"], "net $": r["net"]} for r in rows])
 
+
+def _status_banner(md, text):
+    kind = "success" if text.startswith("PASSING") else ("error" if text.startswith(("FAILING", "NOT PASSING")) else "info")
+    show_note(md, kind, "STATUS: " + text)
+
+
+def _metrics(md, cum):
+    show_metrics(md, [
+        ("Filled", f"{cum['filled']} / {weekly.K_MIN_FILLED}", None),
+        ("Hit rate", "n/a" if cum["hit"] is None else f"{cum['hit']:.0f}%", None if cum["be"] is None else f"break-even {cum['be']:.1f}%"),
+        ("Margin (points)", "n/a" if cum["margin"] is None else f"{cum['margin']:+.1f}", None),
+        ("Net after fees", f"${cum['net'] / 100:+.2f}", None),
+        ("Unfilled would-hit", "n/a" if cum["unf_hit"] is None else f"{cum['unf_hit']:.0f}% ({cum['unf_n']})", None),
+    ])
+
+
+B_WARNING = (
+    "**Book B ($100) is NOT proof that $100 fills.** In W38 the old paper model counted the same displayed liquidity on every "
+    "poll, so B 'filled' huge sizes against a thin book — that is why it looks exactly like A × 100. From v1.5.6 an order can only take "
+    "the size it actually sees. **Second reason B mirrors A:** every paper order is priced at its own limit price whatever its size, "
+    "so dollars just scale. A real $100 order eats several price levels and pays worse prices as it goes. "
+    "**The real-size test is the table 'taking at market, walking the order book' on each tab.**"
+)
 
 with tab_k:
-    st.markdown(
-        "**Book K is a pre-registered slice of Book A** (and B, the $100 copy) — not new orders. "
+    slot_k = st.container()
+    md = MD("Book K + blend" + ("" if SEL == "All weeks" else f" · {SEL}"))
+    show_p(md,
+        "**Book K is a pre-registered slice of Book A** — not new orders. "
         "It asks: *do NO-side fades where Grok is low make money after fees?* "
         f"Rule (FROZEN): side = NO, Grok ≤ {weekly.K_MAX_GROK}, quote valid at booking, "
         f"|Grok − mid| strictly > {weekly.K_MIN_GAP}. "
@@ -402,61 +505,90 @@ with tab_k:
         f"Frozen until {weekly.K_MIN_FILLED} filled trades or {weekly.K_WINDOW_WEEKS} weeks."
     )
     if PANEL is None:
-        st.error(f"Book K could not load: {PANEL_ERR}")
+        show_note(md, "error", f"Book K could not load: {PANEL_ERR}")
     else:
-        kt = st.tabs(["K", "K_HIGH", "K_LOW", "A vs B at size", "Fills by Grok bucket", "Blend"])
+        kt = st.tabs(["K", "K_HIGH", "K_LOW", "A vs B at size", "Fills by Grok bucket", "Blend", "Book M vs K_HIGH"])
         for tab, key_a, key_b, name in ((kt[0], "k", "kb", "K"), (kt[1], "k_high", "kb_high", "K_HIGH"), (kt[2], "k_low", "kb_low", "K_LOW")):
             with tab:
                 pa, pb = PANEL[key_a], PANEL[key_b]
-                _status_banner(pa["status"])
-                _metrics(pa["cum"] if SEL == "All weeks" else next((r for r in pa["rows"] if r["label"] == SEL), pa["cum"]))
-                st.caption(
+                md.h(f"{name}")
+                _status_banner(md, pa["status"])
+                _metrics(md, pa["cum"] if SEL == "All weeks" else next((r for r in pa["rows"] if r["label"] == SEL), pa["cum"]))
+                show_cap(md,
                     "break-even hit % = average NO price paid + average fee per contract (points). margin = hit % − break-even. "
                     "PASSING needs margin ≥ +5. " + (f"Showing week {SEL}. " if SEL != "All weeks" else "")
-                    + f"as of {PANEL['asof']}."
-                )
-                st.subheader(f"{name} · Book A ($1)")
-                st.dataframe(_k_df(_pick(pa["rows"])), hide_index=True, use_container_width=True, column_config=CFG_K)
-                st.subheader(f"{name} · Book B ($100 copy)")
-                st.dataframe(_k_df(_pick(pb["rows"])), hide_index=True, use_container_width=True, column_config=CFG_K)
+                    + f"as of {PANEL['asof']}.")
+                show_h(md, f"{name} · Book A ($1) — what the paper orders did")
+                show_df(md, _k_df(_pick(pa["rows"])), column_config=CFG_K)
+
+                show_h(md, f"{name} at REAL SIZE — taking at market, walking the order book")
+                show_cap(md,
+                    "This is the honest size test. For every qualifying word we take NO from the order book at the decision time: "
+                    "best price first, then worse, until the dollars run out or the top 10 levels are gone. "
+                    "'filled %' below 100 means the book could not hold that size; the price paid rises as it walks.")
+                scope = "CUMULATIVE" if SEL == "All weeks" else SEL
+                sw = [r for r in PANEL["lab"]["sweeps"][name] if r["scope"] == scope]
+                if sw:
+                    show_df(md, _sweep_df(sw), column_config=CFG_SWEEP)
+                else:
+                    show_note(md, "info", "No candidates with a decision-time order book for this selection yet.")
+
+                with st.expander(f"{name} · Book B ($100 copy) — paper model, NOT real size", expanded=False):
+                    show_note(md, "warning", B_WARNING)
+                    show_df(md, _k_df(_pick(pb["rows"])), column_config=CFG_K)
                 if name == "K":
-                    st.subheader("Same slice for Book I (NO, Grok ≤ 30, valid quote)")
-                    st.dataframe(_k_df(_pick(PANEL["i"]["rows"])), hide_index=True, use_container_width=True, column_config=CFG_K)
+                    show_h(md, "Same slice for Book I (NO, Grok ≤ 30, valid quote)")
+                    show_df(md, _k_df(_pick(PANEL["i"]["rows"])), column_config=CFG_K)
                     with st.expander(f"The {len(pa['orders'])} Book K orders (Book A)", expanded=False):
-                        st.dataframe(pd.DataFrame(pa["orders"]), hide_index=True, use_container_width=True) if pa["orders"] else st.write("none yet")
+                        if pa["orders"]:
+                            show_df(md, pd.DataFrame(pa["orders"]))
+                        else:
+                            show_p(md, "none yet")
 
         with kt[3]:
-            st.markdown("**Does the edge survive at size?** Book B is the same trades as Book A at $100 instead of $1. "
-                        "'Survives' = B's margin within about 5 points of A's **and** B's fill % not more than 10 points lower.")
+            md.h("A vs B at size")
+            show_note(md, "warning", B_WARNING)
             recs = []
             for name, ka, kb in (("K", "k", "kb"), ("K_HIGH", "k_high", "kb_high"), ("K_LOW", "k_low", "kb_low")):
                 a, b = PANEL[ka]["cum"], PANEL[kb]["cum"]
                 for book, r in (("A ($1)", a), ("B ($100)", b)):
                     recs.append({"slice": name, "book": book, "booked": r["booked"], "filled": r["filled"], "fill % (contracts)": r["fill_ct"],
                                  "avg NO px ¢": r["px"], "hit %": r["hit"], "margin": r["margin"], "net $": r["net"] / 100.0})
-                st.write(f"**{name}:** {weekly.ab_verdict(a, b)}")
-            st.dataframe(pd.DataFrame(recs), hide_index=True, use_container_width=True, column_config={
+                show_p(md, f"**{name}:** {weekly.ab_verdict(a, b)}")
+            show_df(md, pd.DataFrame(recs), column_config={
                 "fill % (contracts)": st.column_config.NumberColumn(format="%.0f"), "avg NO px ¢": st.column_config.NumberColumn(format="%.1f"),
                 "hit %": st.column_config.NumberColumn(format="%.0f"), "margin": st.column_config.NumberColumn(format="%+.1f"),
                 "net $": st.column_config.NumberColumn(format="$%+.2f")})
+            show_p(md, "**Recomputed:** the same K orders replayed against the stored depth history, taking only the size the book showed "
+                       "(booking time + the cancel window). If B's 'real ct' is far below its 'paper ct', the paper fills were inflated.")
+            rc = PANEL.get("recompute") or []
+            if rc:
+                show_df(md, pd.DataFrame([{
+                    "night": r["date"], "book": r["book"], "word": r["word"], "want ct": r["intended"], "paper filled ct": r["paper_filled"],
+                    "real filled ct": r.get("real_filled"), "paper net $": r["paper_net"], "real net $": r.get("real_net"),
+                    "note": r.get("note", "")} for r in rc]))
+            else:
+                show_note(md, "info", "No K orders to recompute yet.")
 
         with kt[4]:
-            st.markdown("Every **filled, settled** order after fees, split by Grok's probability. "
-                        "(In the live no-fade bot the same table showed 8 of 12 wins for Grok ≤ 30 against 10 of 37 above 30.)")
+            md.h("Fills by Grok bucket")
+            show_p(md, "Every **filled, settled** order after fees, split by Grok's probability. "
+                       "(In the live no-fade bot the same table showed 8 of 12 wins for Grok ≤ 30 against 10 of 37 above 30.)")
             scope = "CUMULATIVE" if SEL == "All weeks" else SEL
             brs = [r for r in PANEL["lab"]["buckets"] if r["scope"] == scope]
             if brs:
-                st.dataframe(pd.DataFrame([{
+                show_df(md, pd.DataFrame([{
                     "book": r["book"], "bucket": r["bucket"], "fills": r["fills"], "wins": r["wins"], "hit %": r["hit"],
-                    "avg price ¢": r["avg_px"], "net $": r["net"]} for r in brs]), hide_index=True, use_container_width=True,
+                    "avg price ¢": r["avg_px"], "net $": r["net"]} for r in brs]),
                     column_config={"hit %": st.column_config.NumberColumn(format="%.0f"), "avg price ¢": st.column_config.NumberColumn(format="%.1f"),
                                    "net $": st.column_config.NumberColumn(format="$%+.2f")})
             else:
-                st.info("No filled orders for this selection yet.")
+                show_note(md, "info", "No filled orders for this selection yet.")
 
         with kt[5]:
-            st.caption("blend = (Grok + market mid) / 2. Brier: lower is better. Grok − market < 0: Grok beat the market. "
-                       "blend − market < 0: the blend beat the market. Valid-quote words only.")
+            md.h("Blend")
+            show_cap(md, "blend = (Grok + market mid) / 2. Brier: lower is better. Grok − market < 0: Grok beat the market. "
+                         "blend − market < 0: the blend beat the market. Valid-quote words only.")
 
             def _s_df(rows):
                 return pd.DataFrame([{
@@ -468,38 +600,69 @@ with tab_k:
             cfg_s = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Brier Grok", "Brier market", "Brier blend", "Brier base rate")}
             cfg_s.update({"Grok − market": st.column_config.NumberColumn(format="%+.4f"), "blend − market": st.column_config.NumberColumn(format="%+.4f"),
                           "YES %": st.column_config.NumberColumn(format="%.0f"), "avg Grok": st.column_config.NumberColumn(format="%.1f")})
-            st.write("**All weeks together**")
-            st.dataframe(_s_df(PANEL["score"]["cumulative"]), hide_index=True, use_container_width=True, column_config=cfg_s)
+            show_p(md, "**All weeks together**")
+            show_df(md, _s_df(PANEL["score"]["cumulative"]), column_config=cfg_s)
             wk = [r for r in PANEL["score"]["by_week"] if SEL == "All weeks" or r["group"] == SEL]
-            st.write("**Week by week**")
-            st.dataframe(_s_df(wk), hide_index=True, use_container_width=True, column_config=cfg_s)
+            show_p(md, "**Week by week**")
+            show_df(md, _s_df(wk), column_config=cfg_s)
+        with kt[6]:
+            md.h("Book M vs K_HIGH")
+            show_p(md,
+                f"**Book M** (pre-registered, nothing to tune): buy NO at market on **every** word with a valid frozen YES bid ≥ {lab.M_MIN_YES_BID}, "
+                "**regardless of Grok**. Fill = walk the YES-bid book from the best bid down, fees included, $1 per trade. "
+                "It sits next to K_HIGH (the Grok-low words). **M_GROKLOW** = M words where Grok is also low; **M_REST** = M words where Grok is not low.")
+            show_note(md, "info", "How to read it: if M is at break-even and K_HIGH is above it, Grok is what makes taking at market work. "
+                                   "If M also clears break-even, there is a bigger, deeper edge that does not need Grok.")
+            mreading = PANEL["lab"]["m_reading"]
+            show_note(md, "success" if mreading.startswith("M clears") else "info", "READING: " + mreading)
+            mscope = "CUMULATIVE" if SEL == "All weeks" else SEL
+            mrows = [r for r in PANEL["lab"]["m"] if r["scope"] == mscope]
+            if mrows and any(r["trades"] for r in mrows):
+                show_df(md, pd.DataFrame([{
+                    "variant": r["variant"], "trades": r["trades"], "avg NO px ¢": r["avg_px"], "fee/contract ¢": r["fee_pc"],
+                    "break-even %": r["be"], "hit %": r["hit"], "90% range": "n/a" if r["lo"] is None else f"{r['lo']:.0f}–{r['hi']:.0f}",
+                    "margin (pts)": r["margin"], "net $": r["net"], "ROI %": r["roi"], "verdict": r["verdict"]} for r in mrows]),
+                    column_config={"avg NO px ¢": st.column_config.NumberColumn(format="%.1f"), "fee/contract ¢": st.column_config.NumberColumn(format="%.1f"),
+                                   "break-even %": st.column_config.NumberColumn(format="%.1f"), "hit %": st.column_config.NumberColumn(format="%.0f"),
+                                   "margin (pts)": st.column_config.NumberColumn(format="%+.1f"), "net $": st.column_config.NumberColumn(format="$%+.2f"),
+                                   "ROI %": st.column_config.NumberColumn(format="%+.0f")})
+            else:
+                show_note(md, "info", "No words with a decision-time order book and a YES bid ≥ 60 for this selection yet.")
+            show_h(md, "Book M at REAL SIZE — taking at market, walking the order book")
+            msw = [r for r in PANEL["lab"]["sweeps"]["M"] if r["scope"] == mscope]
+            if msw:
+                show_df(md, _sweep_df(msw), column_config=CFG_SWEEP)
+    copy_box(slot_k, md, "md_k", f"gap-book-k-{SEL}.md")
 
 # ---------------------------------------------------------------------------
 with tab_lab:
-    st.markdown(
+    slot_lab = st.container()
+    md = MD("Strategy lab" + ("" if SEL == "All weeks" else f" · {SEL}"))
+    show_p(md,
         "### Strategy lab — how could this grow an account, and how sure are we?\n"
         "Every row is a **report-only simulation**: it *takes at market* on the order book at the decision time "
         "(so fill timing does not matter), walks the book level by level, and charges Kalshi's fee. No orders are placed."
     )
-    st.warning(
+    show_note(md, "warning",
         f"**Read this first.** The data so far is a handful of nights. Weeks before **{lab.FROZEN_FROM}** are **in-sample** "
         "(these variants were designed while looking at them) — they cannot prove anything. Only later weeks are out-of-sample. "
         "The hit-rate range (90%) is wide on purpose; a strategy needs **30+ trades** before a verdict means much. "
         "The grid below is *hypotheses for next week*, not results."
     )
     if PANEL is None:
-        st.error(f"Strategy lab could not load: {PANEL_ERR}")
+        show_note(md, "error", f"Strategy lab could not load: {PANEL_ERR}")
     else:
         L = PANEL["lab"]
         words_all = L["words"]
         words = words_all if SEL == "All weeks" else [w for w in words_all if w["week"] == SEL]
         cov = L["coverage"]
-        st.caption(f"{len(words)} words in view · {cov['with_book']} of {cov['words']} words have a decision-time book · "
-                   f"{cov['valid']} with a valid quote · {'all weeks' if SEL == 'All weeks' else 'week ' + SEL}")
+        show_cap(md, f"{len(words)} words in view · {cov['with_book']} of {cov['words']} words have a decision-time book · "
+                     f"{cov['valid']} with a valid quote · {'all weeks' if SEL == 'All weeks' else 'week ' + SEL}")
 
         size = st.select_slider("Dollars per trade", options=list(lab.SIZES), value=25, key="lab_size")
+        md.p(f"**Dollars per trade:** ${size}")
         board_rows = lab.leaderboard(words, float(size))
-        st.subheader("1 · Leaderboard")
+        show_h(md, "1 · Leaderboard")
         recs = []
         for r in board_rows:
             a = r["all"]
@@ -511,60 +674,52 @@ with tab_lab:
                 "in-sample trades": r["in_sample"]["trades"], "out-of-sample trades": r["out_of_sample"]["trades"],
                 "note": r["note"],
             })
-        st.dataframe(pd.DataFrame(recs), hide_index=True, use_container_width=True, column_config={
+        show_df(md, pd.DataFrame(recs), column_config={
             "fill %": st.column_config.NumberColumn(format="%.0f"), "hit %": st.column_config.NumberColumn(format="%.0f"),
             "break-even %": st.column_config.NumberColumn(format="%.1f"), "margin (pts)": st.column_config.NumberColumn(format="%+.1f"),
             "net $": st.column_config.NumberColumn(format="$%+.2f"), "ROI %": st.column_config.NumberColumn(format="%+.0f")})
-        st.caption("margin = hit % − break-even %. break-even = average price paid + fee per contract. "
-                   "Baselines: GROK_ONLY ignores the market; ALL_NO buys NO on everything — the real strategies must beat these.")
+        show_cap(md, "margin = hit % − break-even %. break-even = average price paid + fee per contract. "
+                     "Baselines: GROK_ONLY ignores the market; ALL_NO buys NO on everything — the real strategies must beat these.")
 
-        st.subheader("2 · K_HIGH size sweep (pre-registered)")
-        st.caption(f"Pass = at ${lab.SWEEP_PASS_SIZE}: filled ≥ {lab.SWEEP_PASS_FILL:.0f}% **and** margin ≥ +{lab.SWEEP_PASS_MARGIN:.0f} points.")
-        _status_banner(L["sweep_pass"]["status"]) if L["sweep_pass"]["status"].startswith(("PASSING", "NOT")) else st.info("STATUS: " + L["sweep_pass"]["status"])
+        show_h(md, "2 · K_HIGH size sweep (pre-registered) — the real-size test")
+        show_cap(md, f"Pass = at ${lab.SWEEP_PASS_SIZE}: filled ≥ {lab.SWEEP_PASS_FILL:.0f}% **and** margin ≥ +{lab.SWEEP_PASS_MARGIN:.0f} points. "
+                     "The book is walked level by level, so bigger sizes pay worse prices and may not fully fill.")
+        _status_banner(md, L["sweep_pass"]["status"])
         scope = "CUMULATIVE" if SEL == "All weeks" else SEL
         sw = [r for r in L["sweep"] if r["scope"] == scope]
         if sw:
-            st.dataframe(pd.DataFrame([{
-                "size $": r["size"], "signals": r["signals"], "trades": r["trades"], "filled %": r["filled_pct"], "avg NO px ¢": r["avg_px"],
-                "fee/contract ¢": r["fee_pc"], "break-even %": r["be"], "hit %": r["hit"],
-                "90% range": "n/a" if r["lo"] is None else f"{r['lo']:.0f}–{r['hi']:.0f}", "margin (pts)": r["margin"], "net $": r["net"]} for r in sw]),
-                hide_index=True, use_container_width=True, column_config={
-                    "filled %": st.column_config.NumberColumn(format="%.0f"), "avg NO px ¢": st.column_config.NumberColumn(format="%.1f"),
-                    "fee/contract ¢": st.column_config.NumberColumn(format="%.1f"), "break-even %": st.column_config.NumberColumn(format="%.1f"),
-                    "hit %": st.column_config.NumberColumn(format="%.0f"), "margin (pts)": st.column_config.NumberColumn(format="%+.1f"),
-                    "net $": st.column_config.NumberColumn(format="$%+.2f")})
+            show_df(md, _sweep_df(sw), column_config=CFG_SWEEP)
         else:
-            st.info("No K_HIGH candidates with a decision-time book for this selection yet.")
+            show_note(md, "info", "No K_HIGH candidates with a decision-time book for this selection yet.")
 
-        st.subheader("3 · Capacity: how much can the book absorb?")
-        st.caption("Dollars of NO you could buy from YES bids at or above each floor (top 10 levels). Blank = no book. "
-                   "This is the ceiling on account size for this segment.")
-        cap = [r for r in L["capacity"]]
-        st.dataframe(pd.DataFrame([{"group": r["group"], "YES bid ≥": r["floor"], "words": r["n"], "median $": r["median"],
-                                    "p75 $": r["p75"], "p90 $": r["p90"]} for r in cap]), hide_index=True, use_container_width=True)
+        show_h(md, "3 · Capacity: how much can the book absorb?")
+        show_cap(md, "Dollars of NO you could buy from YES bids at or above each floor (top 10 levels). Blank = no book. "
+                     "This is the ceiling on account size for this segment.")
+        show_df(md, pd.DataFrame([{"group": r["group"], "YES bid ≥": r["floor"], "words": r["n"], "median $": r["median"],
+                                   "p75 $": r["p75"], "p90 $": r["p90"]} for r in L["capacity"]]))
         seg = [r for r in L["segments"] if SEL == "All weeks" or weekly._week_id(r["date"]) == SEL]
-        st.write("**K_HIGH candidates per night** (Grok ≤ 30 and a valid decision-time mid ≥ 55):")
-        st.dataframe(pd.DataFrame([{"night": r["date"], "candidates": r["candidates"], "booked by A": r["booked_by_A"],
-                                    "filled": r["filled"], "words": r["words"], "words without a book": r["no_book"]} for r in seg]),
-                     hide_index=True, use_container_width=True)
+        show_p(md, "**K_HIGH candidates per night** (Grok ≤ 30 and a valid decision-time mid ≥ 55):")
+        show_df(md, pd.DataFrame([{"night": r["date"], "candidates": r["candidates"], "booked by A": r["booked_by_A"],
+                                   "filled": r["filled"], "words": r["words"], "words without a book": r["no_book"]} for r in seg]))
 
-        st.subheader("4 · Exploratory grid: NO when Grok ≤ g and the market is high")
-        st.caption("$25 per trade, market must be more than 15 above Grok. **Exploratory** — 20 cells will always show some winners by luck.")
-        grid = lab.grid_no(words)
-        gdf = pd.DataFrame(grid)
+        show_h(md, "4 · Exploratory grid: NO when Grok ≤ g and the market is high")
+        show_cap(md, "$25 per trade, market must be more than 15 above Grok. **Exploratory** — 20 cells will always show some winners by luck.")
+        gdf = pd.DataFrame(lab.grid_no(words))
         if not gdf.empty and gdf["trades"].sum():
-            piv = gdf.pivot(index="grok_max", columns="mid_min", values="margin")
-            cnt = gdf.pivot(index="grok_max", columns="mid_min", values="trades")
-            st.write("margin (points above break-even)")
-            st.dataframe(piv.rename_axis("Grok ≤").rename_axis("market mid ≥", axis=1).round(1), use_container_width=True)
-            st.write("number of trades in each cell")
-            st.dataframe(cnt.rename_axis("Grok ≤").rename_axis("market mid ≥", axis=1), use_container_width=True)
+            piv = gdf.pivot(index="grok_max", columns="mid_min", values="margin").rename_axis("Grok ≤").rename_axis("market mid ≥", axis=1).round(1)
+            cnt = gdf.pivot(index="grok_max", columns="mid_min", values="trades").rename_axis("Grok ≤").rename_axis("market mid ≥", axis=1)
+            show_p(md, "margin (points above break-even)")
+            st.dataframe(piv, use_container_width=True)
+            md.df(piv)
+            show_p(md, "number of trades in each cell")
+            st.dataframe(cnt, use_container_width=True)
+            md.df(cnt)
         else:
-            st.info("Not enough data for the grid yet.")
+            show_note(md, "info", "Not enough data for the grid yet.")
 
-        st.subheader("5 · Account growth simulator")
-        st.caption("Two views: (a) replay the real nights in order with compounding, (b) a forward Monte Carlo that shows the SPREAD of outcomes "
-                   "for a hit rate you choose. Neither predicts the future — they show how much depends on the edge being real.")
+        show_h(md, "5 · Account growth simulator")
+        show_cap(md, "Two views: (a) replay the real nights in order with compounding, (b) a forward Monte Carlo that shows the SPREAD of outcomes "
+                     "for a hit rate you choose. Neither predicts the future — they show how much depends on the edge being real.")
         ids = [r["id"] for r in board_rows]
         c1, c2, c3 = st.columns(3)
         vid = c1.selectbox("Strategy", ids, index=ids.index("K_HIGH") if "K_HIGH" in ids else 0)
@@ -576,22 +731,26 @@ with tab_lab:
         else:
             val = s1.slider("% of bankroll per trade", 0.5, 25.0, 5.0, 0.5)
         night_cap = s2.slider("Max % of bankroll at risk in one night", 5, 100, 50, 5)
+        md.p(f"**Simulator settings:** strategy {vid} · start ${bank0:,.0f} · {mode}: {val} · night cap {night_cap}%")
         fn = next(r for r in lab.REGISTRY if r[0] == vid)[2]
         rp = lab.replay(words, fn, bank0, "flat" if mode.startswith("Flat") else "pct", float(val), float(night_cap))
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Final bankroll", f"${rp['final']:,.2f}", f"{rp['return_pct']:+.1f}%" if rp["return_pct"] is not None else None)
-        m2.metric("Trades", rp["trades"])
-        m3.metric("Worst night", f"${rp['worst_night']:+,.2f}")
-        m4.metric("Max drawdown", f"{rp['max_drawdown_pct']:.1f}%")
-        st.line_chart(pd.DataFrame(rp["curve"]).set_index("date")["bankroll"])
-        st.caption("Each trade is walked through the real decision-time book, so a big size only fills what the book holds "
-                   "(that is the capacity ceiling in action).")
+        show_metrics(md, [
+            ("Final bankroll", f"${rp['final']:,.2f}", f"{rp['return_pct']:+.1f}%" if rp["return_pct"] is not None else None),
+            ("Trades", str(rp["trades"]), None),
+            ("Worst night", f"${rp['worst_night']:+,.2f}", None),
+            ("Max drawdown", f"{rp['max_drawdown_pct']:.1f}%", None),
+        ])
+        curve_df = pd.DataFrame(rp["curve"])
+        st.line_chart(curve_df.set_index("date")["bankroll"])
+        md.df(curve_df)
+        show_cap(md, "Each trade is walked through the real decision-time book, so a big size only fills what the book holds "
+                     "(that is the capacity ceiling in action).")
 
         g = lab.growth_summary(words, fn)
         gs = g["stats"]
-        st.markdown("**Forward Monte Carlo** — what could happen if this keeps going")
+        show_p(md, "**Forward Monte Carlo** — what could happen if this keeps going")
         if gs["trades"] < 3 or gs["avg_px"] is None:
-            st.info("Too few trades in this selection to simulate.")
+            show_note(md, "info", "Too few trades in this selection to simulate.")
         else:
             opts = {
                 f"Observed hit rate ({gs['hit']:.0f}%)": gs["hit"],
@@ -604,36 +763,38 @@ with tab_lab:
             nights_f = m_b.slider("Nights to simulate", 10, 260, 130, 10)
             stake = m_c.slider("% of bankroll per trade", 0.5, 25.0, 3.0, 0.5, key="mc_stake")
             tpn = st.number_input("Trades per night", min_value=0.1, value=float(max(0.5, round(g["trades_per_night"], 1))), step=0.5)
+            md.p(f"**Monte Carlo settings:** {pick_h} · {nights_f} nights · {stake}% per trade · {tpn} trades/night")
             mc = lab.monte_carlo(opts[pick_h], gs["avg_px"], gs["fee_pc"] or 0.0, tpn, int(nights_f), float(bank0), float(stake))
-            q1, q2, q3, q4 = st.columns(4)
-            q1.metric("Typical (median)", f"${mc['p50']:,.0f}")
-            q2.metric("Bad luck (10th pct)", f"${mc['p10']:,.0f}")
-            q3.metric("Good luck (90th pct)", f"${mc['p90']:,.0f}")
-            q4.metric("Chance of ending below start", f"{100 * mc['prob_loss']:.0f}%")
+            show_metrics(md, [
+                ("Typical (median)", f"${mc['p50']:,.0f}", None),
+                ("Bad luck (10th pct)", f"${mc['p10']:,.0f}", None),
+                ("Good luck (90th pct)", f"${mc['p90']:,.0f}", None),
+                ("Chance of ending below start", f"{100 * mc['prob_loss']:.0f}%", None),
+            ])
             kel = lab.kelly_fraction(opts[pick_h], gs["avg_px"], gs["fee_pc"] or 0.0)
-            st.caption(
+            show_cap(md,
                 f"At that hit rate the fastest-growing bet (full Kelly) would be **{100 * kel:.0f}%** of the bankroll per trade; "
                 f"a quarter of that is **{25 * kel:.1f}%**. Full Kelly is very aggressive and assumes the hit rate is known exactly. "
                 f"Chance of at least doubling: {100 * mc['prob_2x']:.0f}%. Simulated with {mc['per_night']} trade(s) per night at about "
-                f"{gs['avg_px']:.0f}¢ per contract, fees included."
-            )
+                f"{gs['avg_px']:.0f}¢ per contract, fees included.")
             if opts[pick_h] <= (gs["be"] or 0):
-                st.warning("At this hit rate there is no edge, so expect the account to shrink over time.")
+                show_note(md, "warning", "At this hit rate there is no edge, so expect the account to shrink over time.")
 
-        st.subheader("6 · What would settle it")
-        st.markdown(
+        show_h(md, "6 · What would settle it")
+        show_p(md,
             "- **K / K_HIGH** need **30 filled trades** (about 6 weeks at the current pace) — the status line on the *Book K* tab is the verdict.\n"
             f"- Every variant here is scored on **new weeks only** from {lab.FROZEN_FROM}; the week picker in the sidebar shows one week at a time.\n"
             "- Growth is capped by the book: see *Capacity*. Sizing up beyond what the book holds does not scale.\n"
             "- The two baselines (GROK_ONLY, ALL_NO) are the yardsticks: a variant that does not beat them is not adding anything."
         )
+    copy_box(slot_lab, md, "md_lab", f"gap-strategy-lab-{SEL}.md")
 
 with tab_curve:
-    st.markdown(
-        "Same decision batch, same orders, cancel window extended "
-        "1 → 120 minutes. Average price paid is comparable across rows. "
-        "This tab is historical fixture data, unrelated to live quotes."
-    )
+    slot_curve = st.container()
+    md = MD("Cancel-window curve (old fixture)")
+    show_p(md, "Same decision batch, same orders, cancel window extended "
+               "1 → 120 minutes. Average price paid is comparable across rows. "
+               "This tab is historical fixture data, unrelated to live quotes.")
     board_fx = fixture_board()
     left, right = st.columns(2)
     with left:
@@ -642,9 +803,12 @@ with tab_curve:
     with right:
         st.write("**$100 hold**")
         st.dataframe(pd.DataFrame(board_fx["curve_100"]), hide_index=True)
-    st.caption(
-        "$100 fill % still climbing at 60m on the informal table is why 90 and "
-        "120 are on this curve. If it has not flattened, do not freeze 60 yet."
-    )
+    md.h("$1 hold")
+    md.df(pd.DataFrame(board_fx["curve_1"]))
+    md.h("$100 hold")
+    md.df(pd.DataFrame(board_fx["curve_100"]))
+    show_cap(md, "$100 fill % still climbing at 60m on the informal table is why 90 and "
+                 "120 are on this curve. If it has not flattened, do not freeze 60 yet.")
+    copy_box(slot_curve, md, "md_curve", "gap-cancel-window-curve.md")
 
 st.caption(f"boot {services['started_at']} · Telegram commands only")

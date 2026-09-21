@@ -229,6 +229,24 @@ def v_k_low(w):
     return "NO" if v_k(w) and w["mid"] < SPLIT_MID else None
 
 
+M_MIN_YES_BID = 60   # Book M (pre-registered): buy NO at market on EVERY word with a valid frozen YES bid >= 60
+
+
+def v_m(w):
+    """Book M: ignore Grok completely. NO on every word whose (valid) decision-time YES bid is >= 60."""
+    return "NO" if _ok(w) and int(w["bid"]) >= M_MIN_YES_BID else None
+
+
+def v_m_groklow(w):
+    """M words where Grok is also low (Grok <= 30 and market > 15 above): M and K together."""
+    return "NO" if v_m(w) and v_k(w) else None
+
+
+def v_m_rest(w):
+    """M words where Grok is NOT low: the part of M that Grok would have skipped."""
+    return "NO" if v_m(w) and not v_k(w) else None
+
+
 def v_yes_mirror(w):
     return "YES" if _ok(w) and w["grok"] >= 70 and _gap2(w) > 30 else None
 
@@ -278,6 +296,9 @@ REGISTRY = [
     ("K", "K: NO when Grok<=30 and market >15 above", v_k, "pre-registered", "The W38-review slice."),
     ("K_HIGH", "K_HIGH: same, market mid >= 55", v_k_high, "pre-registered", "Cheap NO tickets (<= ~45c): break-even under ~47%."),
     ("K_LOW", "K_LOW: same, market mid < 55", v_k_low, "pre-registered", "The thin segment: NO costs 60c+. Kept apart on purpose."),
+    ("M", "Book M: NO on EVERY word with YES bid >= 60 (ignore Grok)", v_m, "pre-registered", "Does taking at market work without Grok at all?"),
+    ("M_GROKLOW", "M words where Grok is low (Grok <= 30, gap > 15)", v_m_groklow, "exploratory", "The Grok-low part of M."),
+    ("M_REST", "M words where Grok is NOT low", v_m_rest, "exploratory", "The part of M Grok would skip."),
     ("YES_MIRROR", "YES mirror: YES when Grok>=70 and Grok >15 above market", v_yes_mirror, "exploratory", "Does the low-side edge also exist on the high side?"),
     ("YES_MIRROR_LOW", "YES mirror, market mid <= 45", v_yes_mirror_low, "exploratory", "Cheap YES tickets."),
     ("FADE_BOTH", "Fade both ways at market (|gap|>15)", v_fade_both, "exploratory", "Book A's rule, but taking at market."),
@@ -335,17 +356,52 @@ def k_high_words(words):
     return [w for w in words if v_k_high(w)]
 
 
-def size_sweep(words: list[dict], sizes=SIZES) -> list[dict]:
-    """Take NO at the decision-time book on every K_HIGH candidate, at each dollar size."""
-    cands = k_high_words(words)
+SWEEP_VARIANTS = (("K_HIGH", "v_k_high"), ("K", "v_k"), ("K_LOW", "v_k_low"), ("M", "v_m"))
+
+
+def size_sweep(words: list[dict], sizes=SIZES, variant: str = "K_HIGH") -> list[dict]:
+    """Take NO at the decision-time book on every candidate of a variant, at each dollar size.
+    This is the honest test of REAL SIZE: it walks the displayed book, so a big size only fills
+    what is really there (and pays worse prices as it goes)."""
+    fn = {"K_HIGH": v_k_high, "K": v_k, "K_LOW": v_k_low, "M": v_m}[variant]
+    cands = [w for w in words if fn(w)]
     weeks = sorted({w["week"] for w in cands})
     rows = []
     for scope in weeks + ["CUMULATIVE"]:
         ws = cands if scope == "CUMULATIVE" else [w for w in cands if w["week"] == scope]
         for d in sizes:
-            st = evaluate(ws, v_k_high, d)
-            rows.append({"scope": scope, "size": d, **st})
+            st = evaluate(ws, fn, d)
+            rows.append({"scope": scope, "size": d, "variant": variant, **st})
     return rows
+
+
+def m_vs_khigh(words: list[dict], dollars: float = 1.0) -> list[dict]:
+    """Book M next to K_HIGH (and the Grok-low / not-Grok-low halves of M), $1 per trade, week by week + cumulative."""
+    weeks = sorted({w["week"] for w in words})
+    rows = []
+    for scope in weeks + ["CUMULATIVE"]:
+        ws = words if scope == "CUMULATIVE" else [w for w in words if w["week"] == scope]
+        for vid, fn in (("M", v_m), ("K_HIGH", v_k_high), ("M_GROKLOW", v_m_groklow), ("M_REST", v_m_rest)):
+            rows.append({"scope": scope, "variant": vid, **evaluate(ws, fn, dollars)})
+    return rows
+
+
+def m_reading(rows: list[dict]) -> str:
+    """Plain-words reading of M vs K_HIGH (cumulative). Deliberately cautious about small n."""
+    cum = {r["variant"]: r for r in rows if r["scope"] == "CUMULATIVE"}
+    m, k = cum.get("M"), cum.get("K_HIGH")
+    if not m or not k or m["trades"] < 10 or k["trades"] < 10:
+        return (f"TOO EARLY: M has {m['trades'] if m else 0} trades and K_HIGH has {k['trades'] if k else 0}; "
+                "each needs about 30 before this comparison means anything.")
+    m_clear = m["lo"] is not None and m["be"] is not None and m["lo"] > m["be"]
+    if m_clear:
+        return (f"M clears break-even by itself (hit {m['hit']:.0f}% vs {m['be']:.0f}%, low end {m['lo']:.0f}%): "
+                "a bigger, deeper edge exists even without Grok. Check whether K_HIGH adds on top of it.")
+    if (m["margin"] or 0) <= 3 and (k["margin"] or 0) >= 5:
+        return (f"M sits at break-even (margin {m['margin']:+.1f}) while K_HIGH is above it (margin {k['margin']:+.1f}): "
+                "Grok is what makes taking at market work.")
+    return (f"No clear reading: M margin {m['margin']:+.1f}, K_HIGH margin {k['margin']:+.1f}. "
+            "Neither pattern (M flat + K_HIGH up, or M clearly up) is showing yet.")
 
 
 def sweep_pass(rows: list[dict]) -> dict:
@@ -425,48 +481,81 @@ def fills_by_bucket(slice_orders: list[dict], books=("A", "B", "I")) -> list[dic
 # ---------------------------------------------------------------------------
 # long-rest shadow (item 12): would K_HIGH orders that keep resting until 17:28 CT fill more?
 # ---------------------------------------------------------------------------
+def _replay_one(o: dict, until) -> dict | None:
+    """Replay one order against the stored depth history with the no-double-counting rule:
+    it can take the FIRST displayed size at its limit, plus later INCREASES. Returns None if unusable."""
+    placed = clock.parse_dt(o.get("placed_at"))
+    if placed is None or not o.get("ticker") or o.get("yes_ticket") is None:
+        return None
+    try:
+        series = store.depth_series(o["ticker"], o["date"], placed, until)
+    except Exception as exc:
+        log.warning("depth series: %s", exc)
+        series = []
+    if not series:
+        return {"note": "no depth history left for this market"}
+    yes_limit = int(o["yes_ticket"])
+    remaining, filled, credit, last, cost = float(o["intended"]), 0.0, 0.0, None, 0.0
+    for snap in series:
+        size, best_yes = fills.crossing({"yes": snap["yes_book"], "no": snap["no_book"]}, o["side"], yes_limit)
+        if size != (last if last is not None else 0.0):
+            credit += size if last is None else max(0.0, size - last)
+            last = size
+        take_c = min(remaining, max(0.0, credit - filled))
+        if take_c > 0:
+            px = fills.slice_price(o["side"], yes_limit, best_yes)
+            filled += take_c
+            remaining -= take_c
+            cost += take_c * px
+    avg = (cost / filled) if filled > 0 else None
+    fee = fees.fee_cents(filled, int(round(avg))) if avg else 0
+    net = None
+    if avg is not None and o.get("outcome") in ("yes", "no"):
+        won = (o["side"] == "NO" and o["outcome"] == "no") or (o["side"] == "YES" and o["outcome"] == "yes")
+        gross = filled * (100 - avg) if won else -filled * avg
+        net = (gross - fee) / 100.0
+    return {"filled": round(filled, 2), "avg_px": avg, "net": net, "note": ""}
+
+
 def long_rest_shadow(orders: list[dict], until_hhmm: str = "17:28") -> list[dict]:
+    """K_HIGH orders that keep resting until 17:28 CT instead of 60 minutes after booking."""
     from datetime import datetime, timezone
     out = []
     for o in orders:
-        placed = clock.parse_dt(o.get("placed_at"))
-        if placed is None or not o.get("ticker"):
-            continue
         hh, mm = [int(x) for x in until_hhmm.split(":")]
         d = datetime.strptime(o["date"], "%Y-%m-%d").date()
         until = datetime(d.year, d.month, d.day, hh, mm, tzinfo=C.CT).astimezone(timezone.utc)
-        try:
-            series = store.depth_series(o["ticker"], o["date"], placed, until)
-        except Exception as exc:
-            log.warning("depth series: %s", exc)
-            series = []
-        if not series:
-            out.append({**_shadow_id(o), "note": "no depth history left for this market"})
+        r = _replay_one(o, until)
+        if r is None:
             continue
-        yes_limit = int(o["yes_ticket"]) if o.get("yes_ticket") is not None else None
-        if yes_limit is None:
+        if r["note"]:
+            out.append({**_shadow_id(o), "note": r["note"]})
             continue
-        remaining, filled, credit, last, cost = float(o["intended"]), 0.0, 0.0, None, 0.0
-        for snap in series:
-            size, best_yes = fills.crossing({"yes": snap["yes_book"], "no": snap["no_book"]}, o["side"], yes_limit)
-            if size != (last if last is not None else 0.0):
-                credit += size if last is None else max(0.0, size - last)
-                last = size
-            take_c = min(remaining, max(0.0, credit - filled))
-            if take_c > 0:
-                px = fills.slice_price(o["side"], yes_limit, best_yes)
-                filled += take_c
-                remaining -= take_c
-                cost += take_c * px
-        avg = (cost / filled) if filled > 0 else None
-        fee = fees.fee_cents(filled, int(round(avg))) if avg else 0
-        won = o.get("outcome") in ("yes", "no") and ((o["side"] == "NO" and o["outcome"] == "no") or (o["side"] == "YES" and o["outcome"] == "yes"))
-        net = None
-        if avg is not None and o.get("outcome") in ("yes", "no"):
-            gross = filled * (100 - avg) if won else -filled * avg
-            net = (gross - fee) / 100.0
-        out.append({**_shadow_id(o), "actual_filled": o["filled"], "actual_net": (o["net"] or 0) / 100.0 if o["net"] is not None else None,
-                    "long_filled": round(filled, 2), "long_avg_px": avg, "long_net": net, "note": ""})
+        out.append({**_shadow_id(o), "actual_filled": o["filled"],
+                    "actual_net": (o["net"] or 0) / 100.0 if o["net"] is not None else None,
+                    "long_filled": r["filled"], "long_avg_px": r["avg_px"], "long_net": r["net"], "note": ""})
+    return out
+
+
+def recompute_fills(orders: list[dict]) -> list[dict]:
+    """The SAME orders, replayed with the no-double-counting fill rule inside their normal window
+    (booking time + the cancel window). Shows what a $100 order REALLY would have filled when the
+    old paper model let the same displayed liquidity be counted on every poll."""
+    from datetime import timedelta
+    out = []
+    for o in orders:
+        placed = clock.parse_dt(o.get("placed_at"))
+        if placed is None:
+            continue
+        r = _replay_one(o, placed + timedelta(minutes=C.CANCEL_AFTER_MIN))
+        if r is None:
+            continue
+        base = {**_shadow_id(o), "paper_filled": o["filled"],
+                "paper_net": (o["net"] or 0) / 100.0 if o["net"] is not None else None}
+        if r["note"]:
+            out.append({**base, "note": r["note"]})
+        else:
+            out.append({**base, "real_filled": r["filled"], "real_avg_px": r["avg_px"], "real_net": r["net"], "note": ""})
     return out
 
 
@@ -562,10 +651,13 @@ def panel(data: dict) -> dict:
     prep = prepare(data)
     words = prep["words"]
     slice_orders = data.get("slice_orders", [])
-    sweep = size_sweep(words)
+    sweeps = {v: size_sweep(words, variant=v) for v, _ in SWEEP_VARIANTS}
+    sweep = sweeps["K_HIGH"]
+    mrows = m_vs_khigh(words)
     return {
+        "m": mrows, "m_reading": m_reading(mrows),
         "words": words,
-        "sweep": sweep, "sweep_pass": sweep_pass(sweep),
+        "sweep": sweep, "sweeps": sweeps, "sweep_pass": sweep_pass(sweep),
         "capacity": capacity_summary(words),
         "segments": segment_frequency(words, slice_orders),
         "buckets": fills_by_bucket(slice_orders),

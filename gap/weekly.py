@@ -1043,6 +1043,7 @@ def slice_panel() -> dict:
         "i": _k_panel(data, "I"),
         "score": score_panel(data),
         "lab": L,
+        "recompute": recompute_table(data),
         "weeks": weeks,
         "asof": clock.fmt(clock.now_ct()),
     }
@@ -1090,6 +1091,15 @@ def _book_k_block(data) -> list[str]:
     return lines
 
 
+def k_orders_ab(data) -> list[dict]:
+    return [o for o in data["slice_orders"] if not o["excluded"] and (_k_member(o, "A") or _k_member(o, "B"))]
+
+
+def recompute_table(data) -> list[dict]:
+    """K orders of Books A and B replayed with the no-double-counting fill rule (depth history permitting)."""
+    return lab.recompute_fills(k_orders_ab(data))
+
+
 def ab_verdict(a, b) -> str:
     """Does the edge survive at size? B's margin within ~5 pts of A's AND B's contract fill % not >10 pts lower."""
     if a["filled"] >= 1 and b["filled"] >= 1 and a["margin"] is not None and b["margin"] is not None:
@@ -1117,6 +1127,20 @@ def _ab_compare(data) -> list[str]:
                          f"{_fx(r['px'], 1):>8}{_fx(r['hit'], 0):>6}{_fx(r['margin'], 1):>8}{r['net'] / 100:>+10.2f}   "
                          + (verdict if book == "A" else ""))
     lines.append("'Survives' = B's margin within about 5 points of A's AND B's contract fill % not more than 10 points lower.")
+    lines.append("WARNING: W38's Book B fills came from the OLD paper model, which counted the same displayed liquidity on every poll. "
+                 "That is why B looks like A x 100. B is NOT evidence that $100 fills. From v1.5.6 an order can only take the size it sees. "
+                 "Also: every paper order is priced at its own limit price whatever its size, so dollars just scale; a real $100 order pays worse prices as it walks the book.")
+    lines.append("REAL SIZE evidence is the 'take at market' size sweep in section 4D (walks the actual order book).")
+    rc = recompute_table(data)
+    if rc:
+        lines += ["", "RECOMPUTED: the same K orders replayed against the stored depth history with the no-double-counting rule (booking time + cancel window)",
+                  f"{'night':<12}{'book':<5}{'word':<26}{'want ct':>8}{'paper ct':>9}{'real ct':>9}{'paper net$':>11}{'real net$':>10}"]
+        for r in rc:
+            if r.get("note"):
+                lines.append(f"{r['date']:<12}{r['book']:<5}{_trunc(r['word'], 25):<26}{r['intended']:>8.1f}{r['paper_filled']:>9.1f}   {r['note']}")
+            else:
+                lines.append(f"{r['date']:<12}{r['book']:<5}{_trunc(r['word'], 25):<26}{r['intended']:>8.1f}{r['paper_filled']:>9.1f}{r['real_filled']:>9.1f}"
+                             f"{_fx(r['paper_net'], 2):>11}{_fx(r['real_net'], 2):>10}")
     return lines
 
 
@@ -1157,6 +1181,12 @@ def _capacity_block(data) -> list[str]:
         lines.append(f"{r['scope']:<12}{r['size']:>6}{r['signals']:>8}{r['trades']:>7}{_fx(r['filled_pct'], 0):>7}{_fx(r['avg_px'], 1):>10}"
                      f"{_fx(r['fee_pc'], 1):>7}{_fx(r['be'], 1):>11}{_fx(r['hit'], 0):>6}{rng:>12}{_fx(r['margin'], 1):>8}{r['net']:>+9.2f}")
     lines.append("PRE-REGISTERED PASS: " + L["sweep_pass"]["status"])
+    for vname in ("K", "K_LOW"):
+        lines += ["", f"{vname} SIZE SWEEP (cumulative, take at market, same method)",
+                  f"{'size$':>6}{'signals':>8}{'trades':>7}{'fill%':>7}{'avg NO px':>10}{'break-even':>11}{'hit%':>6}{'margin':>8}{'net$':>9}"]
+        for r in [x for x in L["sweeps"][vname] if x["scope"] == "CUMULATIVE"]:
+            lines.append(f"{r['size']:>6}{r['signals']:>8}{r['trades']:>7}{_fx(r['filled_pct'], 0):>7}{_fx(r['avg_px'], 1):>10}"
+                         f"{_fx(r['be'], 1):>11}{_fx(r['hit'], 0):>6}{_fx(r['margin'], 1):>8}{r['net']:>+9.2f}")
     # long-rest shadow
     kh = [o for o in data["slice_orders"] if not o["excluded"] and (_k_member(o, "A", "HIGH") or _k_member(o, "B", "HIGH"))]
     lines += ["", "LONG-REST SHADOW for K_HIGH orders (report only): what if each order kept resting until 17:28 CT instead of 60 min after booking?",
@@ -1171,6 +1201,29 @@ def _capacity_block(data) -> list[str]:
             else:
                 lines.append(f"{r['date']:<12}{r['book']:<5}{_trunc(r['word'], 25):<26}{r['intended']:>8.1f}{r['actual_filled']:>10.1f}"
                              f"{r['long_filled']:>9.1f}{_fx(r['actual_net'], 2):>12}{_fx(r['long_net'], 2):>10}")
+    return lines
+
+
+def _m_block(data) -> list[str]:
+    L = data["lab"]
+    lines = [
+        f"BOOK M (pre-registered, no rules to tune): buy NO at market on EVERY word with a valid frozen YES bid >= {lab.M_MIN_YES_BID}, regardless of Grok.",
+        "Fill = walk the YES-bid book from the best bid down, pay (100 - bid), fees included. $1 per trade.",
+        "M_GROKLOW = M words where Grok is also low (Grok <= 30, market > 15 above). M_REST = M words where Grok is NOT low.",
+        "If M is at break-even and K_HIGH is above it, Grok is what makes taking at market work. If M also clears break-even, there is a bigger, deeper edge.",
+        f"{'scope':<12}{'variant':<11}{'trades':>7}{'avg NO px':>10}{'fee/ct':>7}{'break-even':>11}{'hit%':>6}{'90% range':>11}{'margin':>8}{'net$':>8}{'ROI%':>6}",
+    ]
+    for r in L["m"]:
+        rng = f"{_fx(r['lo'], 0)}-{_fx(r['hi'], 0)}" if r["lo"] is not None else "n/a"
+        lines.append(f"{r['scope']:<12}{r['variant']:<11}{r['trades']:>7}{_fx(r['avg_px'], 1):>10}{_fx(r['fee_pc'], 1):>7}{_fx(r['be'], 1):>11}"
+                     f"{_fx(r['hit'], 0):>6}{rng:>11}{_fx(r['margin'], 1):>8}{r['net']:>+8.2f}{_fx(r['roi'], 0):>6}")
+    lines += ["READING: " + L["m_reading"], "",
+              "REAL SIZE for M (book walk, cumulative): price gets worse and fill % falls as size grows",
+              f"{'size$':>6}{'signals':>8}{'trades':>7}{'fill%':>7}{'avg NO px':>10}{'break-even':>11}{'hit%':>6}{'margin':>8}{'net$':>9}"]
+    for r in L["sweeps"]["M"]:
+        if r["scope"] == "CUMULATIVE":
+            lines.append(f"{r['size']:>6}{r['signals']:>8}{r['trades']:>7}{_fx(r['filled_pct'], 0):>7}{_fx(r['avg_px'], 1):>10}{_fx(r['be'], 1):>11}"
+                         f"{_fx(r['hit'], 0):>6}{_fx(r['margin'], 1):>8}{r['net']:>+9.2f}")
     return lines
 
 
@@ -1761,7 +1814,7 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines.append(" 4 Books: gross/fees/net    9 Data-quality flags")
     lines.append(" 5 Fill-selection check    10 Rules and settings")
     lines.append(" 4B BOOK K, K_HIGH, K_LOW for A and B, A-vs-B  4C fills by Grok bucket  4D capacity, segment frequency, size sweep, long-rest shadow")
-    lines.append(" 4E STRATEGY LAB: report-only variants taken at market, grid, growth check")
+    lines.append(" 4E STRATEGY LAB: report-only variants taken at market, grid, growth check   4F BOOK M vs K_HIGH")
 
     _hdr(lines, "1. NIGHT STATUS")
     lines += _nights_status_block(data)
@@ -1781,6 +1834,8 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines += _capacity_block(data)
     _hdr(lines, "4E. STRATEGY LAB (report-only variants taken at market)")
     lines += _lab_block(data)
+    _hdr(lines, "4F. BOOK M vs K_HIGH (report-only, $1 at market, decision-time book)")
+    lines += _m_block(data)
     _hdr(lines, "5. FILL-SELECTION CHECK (do fills happen mostly when the market moves against us?)")
     lines += _fill_selection_block(data)
     _hdr(lines, "6. HOW GOOD IS GROK? (every word with a result; market comparisons use valid quotes only)")
@@ -1828,7 +1883,7 @@ def render_csv(data: dict) -> str:
     cols = ["date", "night_status", "event_ticker", "market_ticker", "word", "is_count_market",
             "grok_p", "p_block_airs", "p_said_given_airs",
             "quote_bid", "quote_ask", "quote_time_ct", "quote_valid", "quote_invalid_reason", "quote_age_s", "quote_source",
-            "mkt_mid", "blend_p", "K_in_slice", "K_HIGH_in_slice", "K_LOW_in_slice", "IK_in_slice",
+            "mkt_mid", "blend_p", "K_in_slice", "K_HIGH_in_slice", "K_LOW_in_slice", "IK_in_slice", "M_in_slice",
             "dec_bid", "dec_ask", "no_dollars_yesbid60plus", "no_dollars_yesbid65plus", "no_dollars_yesbid70plus",
             "gap", "outcome", "said_yes", "cycle_temp", "has_substitute_risk",
             "carrying_story", "substitute_risk"]
@@ -1853,6 +1908,7 @@ def render_csv(data: dict) -> str:
                int(any(_k_member(t, "A", "HIGH") for t in r["trades"])),
                int(any(_k_member(t, "A", "LOW") for t in r["trades"])),
                int(any(_k_member(t, "I") for t in r["trades"])),
+               (int(bool(lab.v_m(lw))) if lw else None),
                lw.get("bid"), lw.get("ask"), lw.get("cap60"), lw.get("cap65"), lw.get("cap70"),
                None if r["gap"] is None else round(r["gap"], 2),
                r["outcome"], r["y"], r["cycle_temp"], int(r["has_sub"]),
