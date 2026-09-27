@@ -1308,8 +1308,9 @@ def _l_block(data) -> list[str]:
         f"LIVE (real Kalshi orders, real dollars): {'ON' if C.L_LIVE_ON else 'OFF'} | "
         f"${C.L_NOTIONAL_DOLLARS:g}/word fixed | nightly cap ${C.L_NIGHTLY_CAP_DOLLARS:g} "
         f"(first {C.L_MAX_WORDS_PER_NIGHT} qualifying words, never scaled down) | "
-        f"cancel send+{C.L_CANCEL_AFTER_MIN}m (the OLD Book A window, not the 5:29 CT show529 "
-        f"cancel A/B/E/F/I use now) | circuit breaker: pause if net < -${C.L_CIRCUIT_BREAKER_WEEKLY_LOSS:g} in a week",
+        f"cancel {C.SHOW_CANCEL_CT} CT (same cancel time every paper book uses -- A/B/E/F/G/H/I -- "
+        f"one deadline for every strategy, paper and live) | circuit breaker: pause if net < "
+        f"-${C.L_CIRCUIT_BREAKER_WEEKLY_LOSS:g} in a week",
         "Rule is IDENTICAL to K (side=NO, Grok<=30, valid quote, |Grok-mid| strictly >15). No new signal -- "
         "this only tests whether K's paper edge survives contact with a real resting order.",
         "",

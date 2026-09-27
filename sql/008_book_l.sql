@@ -26,7 +26,7 @@ create table if not exists gap_l_orders (
     -- pending -> resting -> (filled | partially_filled | cancelled | expired | rejected) -> settled
   reject_reason         text,
   placed_at             timestamptz not null default now(),
-  cancel_deadline_at    timestamptz not null,          -- placed_at + L_CANCEL_AFTER_MIN
+  cancel_deadline_at    timestamptz not null,          -- 5:29 CT show529, same as every paper book
   cancel_requested_at   timestamptz,
   cancel_confirmed_at   timestamptz,
   filled_contracts      numeric not null default 0,

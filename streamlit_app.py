@@ -82,18 +82,26 @@ class MD:
         return "\n\n".join(self.parts)
 
 
+def _dollar_escape(text):
+    """Streamlit's st.markdown/caption/info/etc. treat two '$' in one call as a
+    MathJax delimiter pair and render whatever's between them as broken LaTeX.
+    Escape '$' -> '\\$' only for what's shown on screen; the copy-as-Markdown
+    text (md.p/md.h) keeps the literal '$' since that's plain text elsewhere."""
+    return str(text).replace("$", "\\$")
+
+
 def show_h(md, text):
     st.subheader(text)
     md.h(text)
 
 
 def show_p(md, text):
-    st.markdown(text)
+    st.markdown(_dollar_escape(text))
     md.p(text)
 
 
 def show_cap(md, text):
-    st.caption(text)
+    st.caption(_dollar_escape(text))
     md.p("_" + str(text) + "_")
 
 
@@ -105,7 +113,7 @@ def show_df(md, df, **kw):
 
 
 def show_note(md, kind, text):
-    getattr(st, kind)(text)
+    getattr(st, kind)(_dollar_escape(text))
     md.p(f"> **{kind.upper()}:** {text}")
 
 
@@ -541,6 +549,30 @@ with tab_k:
                     show_note(md, "warning", B_WARNING)
                     show_df(md, _k_df(_pick(pb["rows"])), column_config=CFG_K)
                 if name == "K":
+                    show_h(md, "K at $10/word, week by week — the size Book L actually trades")
+                    show_cap(md,
+                        "Same real-size book walk as above, filtered to $10/word (Book L's own size) and broken out "
+                        "by week instead of cumulative. This is the actual weekly P&L variance a circuit breaker "
+                        "threshold should be set against, not a guess.")
+                    wk_sw = [r for r in PANEL["lab"]["sweeps"]["K"] if r["size"] == 10 and r["scope"] != "CUMULATIVE"]
+                    if wk_sw:
+                        wk_sw = sorted(wk_sw, key=lambda r: r["scope"])
+                        worst = min(wk_sw, key=lambda r: r["net"])
+                        show_df(md, pd.DataFrame([{
+                            "week": r["scope"], "trades": r["trades"], "hit %": r["hit"], "net $": r["net"]} for r in wk_sw]),
+                            column_config={"hit %": st.column_config.NumberColumn(format="%.0f"),
+                                           "net $": st.column_config.NumberColumn(format="$%+.2f")})
+                        tripped = worst["net"] < -C.L_CIRCUIT_BREAKER_WEEKLY_LOSS
+                        show_note(md, "warning" if tripped else "info",
+                            f"Worst week at $10/word so far: {worst['week']} at ${worst['net']:+.2f} ({worst['trades']} trades). "
+                            f"Circuit breaker trips at -${C.L_CIRCUIT_BREAKER_WEEKLY_LOSS:g}/week -- "
+                            + (f"K's worst real week on record already exceeds that, so the breaker would have tripped."
+                               if tripped else "that threshold has never been touched by K's real history yet.")
+                            + f" Only {len(wk_sw)} week(s) of real order-book history exist so far -- too few to call "
+                              f"this threshold well-tested either way; keep watching this table as more weeks accumulate.")
+                    else:
+                        show_note(md, "info", "No weeks with K candidates and a decision-time order book yet -- "
+                                              "too little history to size a circuit breaker from real data.")
                     show_h(md, "Same slice for Book I (NO, Grok ≤ 30, valid quote)")
                     show_df(md, _k_df(_pick(PANEL["i"]["rows"])), column_config=CFG_K)
                     with st.expander(f"The {len(pa['orders'])} Book K orders (Book A)", expanded=False):
@@ -656,10 +688,10 @@ with tab_l:
               "while it was previously on.")
     show_p(md,
         f"Same rule as Book K, no new logic: side=NO, Grok≤30, valid quote, |Grok−mid| strictly >15. "
-        f"**${C.L_NOTIONAL_DOLLARS:g} fixed per word** (not a %, not scaled) · nightly cap "
-        f"**${C.L_NIGHTLY_CAP_DOLLARS:g}** (first {C.L_MAX_WORDS_PER_NIGHT} qualifying words, excess skipped, "
-        f"never size-scaled) · cancel at **send+{C.L_CANCEL_AFTER_MIN}m** (the OLD Book A window, not the "
-        f"5:29 CT show529 cancel A/B/E/F/I use now) · hold to settlement, no early exit.")
+        f"**{C.L_NOTIONAL_DOLLARS:g} dollars fixed per word** (not a %, not scaled) — nightly cap "
+        f"**{C.L_NIGHTLY_CAP_DOLLARS:g} dollars** (first {C.L_MAX_WORDS_PER_NIGHT} qualifying words, excess skipped, "
+        f"never size-scaled) — cancel at **{C.SHOW_CANCEL_CT} CT**, the same time every paper book uses — "
+        f"hold to settlement, no early exit.")
     try:
         L = live.status_report()
         L_ERR = None

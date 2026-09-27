@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.6.0"  # v1.5.10 (SCALP, early detection, timing overhaul) + Book L (LIVE real money)
+VERSION = "wnt-gap-v1.6.1"  # v1.6.0 + Book L cancels at 5:29 CT like every paper book, $ markdown fix, K weekly P&L table
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -205,11 +205,10 @@ L_MAX_WORDS_PER_NIGHT = int(_num("L_MAX_WORDS_PER_NIGHT", 5))  # first N qualify
 L_CIRCUIT_BREAKER_WEEKLY_LOSS = float(_num("L_CIRCUIT_BREAKER_WEEKLY_LOSS", 30.0))
 L_FREEZE_MIN_FILLED = int(_num("L_FREEZE_MIN_FILLED", 30))
 L_FREEZE_WEEKS = int(_num("L_FREEZE_WEEKS", 6))
-# L cancels at send+60m, like the OLD Book A (pre-v1.5.10 timing overhaul) -- NOT the
-# 5:29 CT show529 cancel that A/B/E/F/I use now, and NOT tied to CANCEL_AFTER_MIN above
-# (which paper books could still change independently). Fixed on its own so a future
-# change to paper timing can never silently change L's real-money cancel window.
-L_CANCEL_AFTER_MIN = int(_num("L_CANCEL_AFTER_MIN", 60))
+# L cancels at 5:29 CT (SHOW_CANCEL_CT below), the SAME cancel every paper book
+# (A/B/E/F/G/H/I) now uses -- one cancel time for every strategy, paper and live.
+# See gap/live.py's arm_tonight(), which computes this deadline the same way
+# gap/fills.py does for the paper books (_show_cancel_utc).
 
 DATABASE_URL = _secret("DATABASE_URL", "")
 SQLITE_PATH = _secret("SQLITE_PATH", "gap_bot.db")
@@ -239,7 +238,7 @@ def summary() -> str:
         f"NO bankroll / NO night cap / NO cluster cap\n"
         f"L (LIVE $ real): {'ON' if L_LIVE_ON else 'off'} · ${L_NOTIONAL_DOLLARS:g}/word · "
         f"cap ${L_NIGHTLY_CAP_DOLLARS:g}/night (first {L_MAX_WORDS_PER_NIGHT} words) · "
-        f"cancel send+{L_CANCEL_AFTER_MIN}m · circuit breaker -${L_CIRCUIT_BREAKER_WEEKLY_LOSS:g}/wk\n"
+        f"cancel {SHOW_CANCEL_CT} CT (same as every paper book) · circuit breaker -${L_CIRCUIT_BREAKER_WEEKLY_LOSS:g}/wk\n"
         f"prompt {prompt_version()} | harness {HARNESS} | addendum {ADDENDUM}\n"
         f"poll {POLL_START_CT} CT | json deadline {JSON_DEADLINE_CT} CT"
     )

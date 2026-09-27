@@ -2,10 +2,11 @@
 
 Mirrors Book K's exact rule (side=NO, Grok<=30, valid quote, |Grok-mid| strictly
 >15) via strategy.order_for_rule("fade15_gate30_no", ...) -- no new signal, no
-new logic. Order mechanics mirror the OLD Book A behavior: rest 8c from mid
-toward Grok, cancel at send+60min (L_CANCEL_AFTER_MIN), NOT the 5:29 show529
-cancel that A/B/E/F/I use since the v1.5.10 timing overhaul. That is a
-deliberate, spec'd difference -- see gap/config.py's L_CANCEL_AFTER_MIN comment.
+new logic. Order mechanics mirror Book A: rest 8c from mid toward Grok, cancel
+at 5:29 CT (show529) -- the SAME cancel every paper book (A/B/E/F/G/H/I) uses
+since the v1.5.10 timing overhaul. An earlier draft of this spec gave L its
+own send+60min window; that's been dropped on your instruction to keep every
+strategy, paper and live, on one cancel time.
 
 Real order placement/cancellation is gap/kalshi.py's create_no_order /
 cancel_order / batch_cancel / get_fills -- ported from wnt-nofade-bot's
@@ -45,6 +46,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import clock, config as C, notify, store, strategy
 from .fees import fee_cents, hold_pnl_cents
+from .fills import _show_cancel_utc  # same 5:29 CT deadline every paper book now uses
 from .kalshi import KalshiClient, KalshiError, market_result
 from .lab import verdict, wilson
 
@@ -191,7 +193,7 @@ def arm_tonight(run: dict) -> dict:
     client = _client()
     placed, rejected = [], []
     placed_at = _now()
-    deadline = placed_at + timedelta(minutes=C.L_CANCEL_AFTER_MIN)
+    deadline = _show_cancel_utc(date_str) or (placed_at + timedelta(minutes=60))
     for sig in take:
         f = sig["forecast"]
         d = sig["decision"]
@@ -262,7 +264,7 @@ def arm_tonight(run: dict) -> dict:
             lines.append(f"  rested NO {w} · ${C.L_NOTIONAL_DOLLARS:g}")
         for w in rejected:
             lines.append(f"  REJECTED {w}")
-        lines.append(f"cancel at send+{C.L_CANCEL_AFTER_MIN}m if unfilled · hold to settlement")
+        lines.append("cancel at 5:29 CT if unfilled · hold to settlement")
         notify.send("\n".join(lines))
     return {"ok": True, "reason": "armed", "placed": placed, "rejected": rejected}
 
@@ -362,7 +364,7 @@ def cancel_if_due_tick() -> None:
         store.l_update_order(order["id"], **fields)
         store.log_activity(
             "l_cancel",
-            f"{order['event_date']} {order['market_ticker']}: cancel at send+{C.L_CANCEL_AFTER_MIN}m "
+            f"{order['event_date']} {order['market_ticker']}: cancel at 5:29 CT "
             f"{'confirmed' if ok else 'FAILED, will retry'}",
         )
 
@@ -498,5 +500,5 @@ def status_report(start_date: str | None = None, end_date: str | None = None) ->
         "notional_dollars": C.L_NOTIONAL_DOLLARS,
         "nightly_cap_dollars": C.L_NIGHTLY_CAP_DOLLARS,
         "max_words_per_night": C.L_MAX_WORDS_PER_NIGHT,
-        "cancel_after_min": C.L_CANCEL_AFTER_MIN,
+        "cancel_time_ct": C.SHOW_CANCEL_CT,
     }
