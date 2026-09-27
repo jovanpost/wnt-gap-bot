@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import timedelta
 
 from . import clock, config as C, fees, fills, quotes as Q, store
 
@@ -496,6 +497,7 @@ def _replay_one(o: dict, until) -> dict | None:
         return {"note": "no depth history left for this market"}
     yes_limit = int(o["yes_ticket"])
     remaining, filled, credit, last, cost = float(o["intended"]), 0.0, 0.0, None, 0.0
+    first_fill_ts = None
     for snap in series:
         size, best_yes = fills.crossing({"yes": snap["yes_book"], "no": snap["no_book"]}, o["side"], yes_limit)
         if size != (last if last is not None else 0.0):
@@ -503,6 +505,8 @@ def _replay_one(o: dict, until) -> dict | None:
             last = size
         take_c = min(remaining, max(0.0, credit - filled))
         if take_c > 0:
+            if first_fill_ts is None:
+                first_fill_ts = snap.get("ts")
             px = fills.slice_price(o["side"], yes_limit, best_yes)
             filled += take_c
             remaining -= take_c
@@ -514,7 +518,8 @@ def _replay_one(o: dict, until) -> dict | None:
         won = (o["side"] == "NO" and o["outcome"] == "no") or (o["side"] == "YES" and o["outcome"] == "yes")
         gross = filled * (100 - avg) if won else -filled * avg
         net = (gross - fee) / 100.0
-    return {"filled": round(filled, 2), "avg_px": avg, "net": net, "note": "", "credit": credit, "last": (last or 0.0)}
+    return {"filled": round(filled, 2), "avg_px": avg, "net": net, "note": "", "credit": credit, "last": (last or 0.0),
+            "first_fill_ts": first_fill_ts}
 
 
 def long_rest_shadow(orders: list[dict], until_hhmm: str = "17:28") -> list[dict]:
@@ -535,6 +540,89 @@ def long_rest_shadow(orders: list[dict], until_hhmm: str = "17:28") -> list[dict
                     "actual_net": (o["net"] or 0) / 100.0 if o["net"] is not None else None,
                     "long_filled": r["filled"], "long_avg_px": r["avg_px"], "long_net": r["net"], "note": ""})
     return out
+
+
+TIMING_BUCKETS = ((0, 15, "0-15min"), (15, 60, "15-60min"), (60, 180, "1-3hr"),
+                   (180, None, "3hr-to-5:15pm"), (None, None, "5:15-5:29pm"))
+FULL_WINDOW_UNTIL = {"show529": lambda date_str: _hhmm(date_str, "17:29"),
+                     "send60": lambda date_str, placed=None: placed + timedelta(minutes=C.CANCEL_AFTER_MIN)}
+
+
+def _hhmm(date_str, hhmm):
+    from datetime import datetime, timezone
+    hh, mm = (int(x) for x in hhmm.split(":"))
+    y, m, d = (int(x) for x in date_str.split("-"))
+    return datetime(y, m, d, hh, mm, tzinfo=C.CT).astimezone(timezone.utc)
+
+
+def decision_to_fill_minutes(o: dict, decision_at) -> float | None:
+    """Real minutes from the decision time to the FIRST fill, for one settled/filled order.
+    Prefers the order's own recorded first_fill_at (live data, going forward); falls back to
+    replaying the stored depth history for orders that predate that column."""
+    dec = clock.parse_dt(decision_at)
+    if dec is None:
+        return None
+    ffa = clock.parse_dt(o.get("first_fill_at"))
+    if ffa is not None:
+        return (ffa - dec).total_seconds() / 60.0
+    placed = clock.parse_dt(o.get("placed_at"))
+    if placed is None or not o.get("ticker") or o.get("yes_ticket") is None or not (o.get("filled") or 0) > 0:
+        return None
+    spec = {s["id"]: s for s in C.VARIANTS}.get(o.get("variant") or "")
+    date_str = o["date"]
+    if spec and spec.get("cancel") == "show529":
+        until = _hhmm(date_str, "17:29")
+    else:
+        until = placed + timedelta(minutes=C.CANCEL_AFTER_MIN)
+    r = _replay_one(o, until)
+    if not r or r.get("note") or not r.get("first_fill_ts"):
+        return None
+    return (r["first_fill_ts"] - dec).total_seconds() / 60.0
+
+
+def _bucket_label(mins: float) -> str:
+    if mins < 15:
+        return "0-15min"
+    if mins < 60:
+        return "15-60min"
+    if mins < 180:
+        return "1-3hr"
+    if mins < 335:      # 3hr up to ~5:15pm for a typical ~1:30pm decision time
+        return "3hr-to-5:15pm"
+    return "5:15-5:29pm"
+
+
+def fill_timing_report(orders: list[dict], run_info: dict) -> dict:
+    """For every filled order (any book): minutes from decision to first fill, bucketed.
+    Flags adverse selection if hit rate clearly drops in the later buckets."""
+    rows = []
+    for o in orders:
+        if o.get("excluded") or not (o.get("filled") or 0) > 0 or o.get("state") not in ("won", "lost"):
+            continue
+        info = run_info.get(o.get("run_id"))
+        if not info:
+            continue
+        mins = decision_to_fill_minutes(
+            {"date": o["date"], "ticker": o["ticker"], "placed_at": o.get("placed_at"), "yes_ticket": o.get("yes_ticket"),
+             "side": o["side"], "intended": o["intended"], "variant": o["variant"], "first_fill_at": o.get("first_fill_at")},
+            info.get("decision_at"))
+        if mins is None or mins < 0:
+            continue
+        rows.append({"bucket": _bucket_label(mins), "won": o["state"] == "won", "px": o["our_px"], "net": (o["net"] or 0) / 100.0})
+    order_labels = [b[2] for b in TIMING_BUCKETS]
+    out = []
+    for label in order_labels:
+        bs = [r for r in rows if r["bucket"] == label]
+        if not bs:
+            out.append({"bucket": label, "n": 0, "hit": None, "avg_px": None, "net": 0.0})
+            continue
+        wins = sum(1 for r in bs if r["won"])
+        out.append({"bucket": label, "n": len(bs), "hit": 100.0 * wins / len(bs),
+                    "avg_px": sum(r["px"] for r in bs) / len(bs), "net": sum(r["net"] for r in bs)})
+    have_hits = [b["hit"] for b in out if b["n"] >= 3]
+    flag = len(have_hits) >= 2 and have_hits[-1] < have_hits[0] - 15
+    return {"buckets": out, "n_with_timing": len(rows), "n_total_filled": sum(1 for o in orders if (o.get("filled") or 0) > 0 and not o.get("excluded")),
+            "adverse_selection_flag": flag}
 
 
 def recompute_fills(orders: list[dict]) -> list[dict]:
@@ -655,8 +743,10 @@ def panel(data: dict) -> dict:
     sweeps = {v: size_sweep(words, variant=v) for v, _ in SWEEP_VARIANTS}
     sweep = sweeps["K_HIGH"]
     mrows = m_vs_khigh(words)
+    timing = fill_timing_report(slice_orders, data.get("run_info", {}))
     return {
         "m": mrows, "m_reading": m_reading(mrows),
+        "timing": timing,
         "words": words,
         "sweep": sweep, "sweeps": sweeps, "sweep_pass": sweep_pass(sweep),
         "capacity": capacity_summary(words),
@@ -665,3 +755,103 @@ def panel(data: dict) -> dict:
         "coverage": {"words": len(words), "with_book": sum(1 for w in words if w["has_book"]),
                      "valid": sum(1 for w in words if w["valid"] and w["has_book"])},
     }
+
+
+# ---------------------------------------------------------------------------
+# SCALP (v1.5.10 A): report on the real gap_scalp_batches history.
+# ---------------------------------------------------------------------------
+SCALP_MIN_FILLED = 30      # "filled" here = completed round trips (scalp_hit or fallback_sold)
+SCALP_PASS_MARGIN = 5.0
+
+
+def scalp_stats(batches: list[dict]) -> dict:
+    done = [b for b in batches if b["status"] in ("scalp_hit", "fallback_sold")]
+    hits = [b for b in done if b["status"] == "scalp_hit"]
+    spent = sum(int(b["buy_cost_cents"] or 0) + int(b["buy_fee_cents"] or 0) for b in done)
+    net = sum(int(b["net_cents"] or 0) for b in done)
+    px_buy = (sum(b["buy_price_cents"] for b in done) / len(done)) if done else None
+    px_sell = (sum(b["sell_price_cents"] for b in hits) / len(hits)) if hits else None
+    be = (px_buy + (sum(int(b["buy_fee_cents"] or 0) for b in done) / sum(float(b["buy_contracts"]) for b in done) if done else 0)) if px_buy else None
+    hit_rate = (100.0 * len(hits) / len(done)) if done else None
+    words = {(b["market_ticker"]) for b in batches}
+    words_full = {b["market_ticker"] for b in batches
+                  if sum(float(x["buy_cost_cents"]) for x in batches if x["market_ticker"] == b["market_ticker"]) / 100.0 >= C.SCALP_BUDGET_DOLLARS - 0.5}
+    return {
+        "words": len(words), "words_fully_filled_pct": (100.0 * len(words_full) / len(words)) if words else None,
+        "batches": len(batches), "done": len(done), "resting": sum(1 for b in batches if b["status"] == "resting_sell"),
+        "scalp_hit": len(hits), "fallback_sold": len(done) - len(hits), "hit_rate": hit_rate,
+        "avg_buy_px": px_buy, "avg_sell_px": px_sell, "break_even_px": be,
+        "margin": (px_sell - be) if (px_sell is not None and be is not None) else None,
+        "spent": spent / 100.0, "net": net / 100.0, "roi": (100.0 * net / spent) if spent else None,
+    }
+
+
+def scalp_status(cum: dict) -> str:
+    if cum["done"] < SCALP_MIN_FILLED:
+        tag = f"TOO EARLY (fewer than {SCALP_MIN_FILLED} completed round trips: {cum['done']})"
+    elif cum["margin"] is None:
+        tag = "UNCLEAR"
+    elif cum["margin"] >= SCALP_PASS_MARGIN:
+        tag = f"PASSING (avg sell {cum['avg_sell_px']:.1f}c vs break-even {cum['break_even_px']:.1f}c, margin {cum['margin']:+.1f})"
+    elif cum["margin"] < 0:
+        tag = f"FAILING (margin {cum['margin']:+.1f})"
+    else:
+        tag = f"UNCLEAR (margin {cum['margin']:+.1f}, under +{SCALP_PASS_MARGIN:.0f})"
+    return tag
+
+
+def _iso_week(d: str) -> str:
+    from datetime import date as _date
+    y, m, dd = (int(x) for x in d.split("-"))
+    iy, iw, _ = _date(y, m, dd).isocalendar()
+    return f"{iy}-W{iw:02d}"
+
+
+def scalp_by_week(batches: list[dict]) -> list[dict]:
+    weeks = sorted({_iso_week(b["event_date"] if isinstance(b["event_date"], str) else str(b["event_date"])[:10]) for b in batches})
+    rows = []
+    for w in weeks:
+        wb = [b for b in batches if _iso_week(b["event_date"] if isinstance(b["event_date"], str) else str(b["event_date"])[:10]) == w]
+        rows.append({"week": w, **scalp_stats(wb)})
+    rows.append({"week": "CUMULATIVE", **scalp_stats(batches)})
+    return rows
+
+
+def scalp_budget_sweep(batches: list[dict], sizes=SIZES) -> list[dict]:
+    """What each word's REAL batch history would have looked like at a smaller/larger per-word
+    budget cap. Whole batches only (a batch is one real buy+sell round trip, not divisible)."""
+    by_word: dict = {}
+    for b in batches:
+        by_word.setdefault(b["market_ticker"], []).append(b)
+    rows = []
+    for size in sizes:
+        cap = size * 100.0
+        capped: list[dict] = []
+        for word_batches in by_word.values():
+            spent = 0.0
+            for b in sorted(word_batches, key=lambda x: x["buy_at"]):
+                cost = float(b["buy_cost_cents"]) + float(b["buy_fee_cents"])
+                if spent + cost > cap:
+                    break
+                spent += cost
+                capped.append(b)
+        rows.append({"size": size, **scalp_stats(capped)})
+    return rows
+
+
+def scalp_word_fill(batches: list[dict]) -> list[dict]:
+    """Per word: how much of the $100 target actually filled -- the liquidity signal."""
+    by_word: dict = {}
+    for b in batches:
+        by_word.setdefault((b["event_date"] if isinstance(b["event_date"], str) else str(b["event_date"])[:10],
+                            b["market_ticker"], b["word"]), []).append(b)
+    out = []
+    for (d, t, w), bs in sorted(by_word.items()):
+        spent = sum(float(x["buy_cost_cents"]) + float(x["buy_fee_cents"]) for x in bs) / 100.0
+        out.append({"date": d, "word": w, "batches": len(bs), "spent": spent,
+                    "fill_pct": 100.0 * spent / C.SCALP_BUDGET_DOLLARS,
+                    "hit": sum(1 for x in bs if x["status"] == "scalp_hit"),
+                    "fallback": sum(1 for x in bs if x["status"] == "fallback_sold"),
+                    "resting": sum(1 for x in bs if x["status"] == "resting_sell"),
+                    "net": sum(float(x["net_cents"] or 0) for x in bs) / 100.0})
+    return out

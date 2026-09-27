@@ -8,7 +8,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from gap import backtest, board, clock, config as C, lab, notify, pipeline, store, weekly
+from gap import backtest, board, clock, config as C, lab, live, notify, pipeline, store, weekly
 
 logging.basicConfig(
     level=logging.INFO,
@@ -210,8 +210,8 @@ with st.sidebar:
         st.rerun()
     st.caption("Research tabs read the database only (no Kalshi calls) and refresh every 3 minutes.")
 
-tab_live, tab_books, tab_four, tab_k, tab_lab, tab_curve = st.tabs(
-    ["Tonight", "Books · P&L", "All nights · books", "Book K + blend", "Strategy lab", "Cancel-window curve"]
+tab_live, tab_books, tab_four, tab_k, tab_l, tab_lab, tab_scalp, tab_timing, tab_curve = st.tabs(
+    ["Tonight", "Books · P&L", "All nights · books", "Book K + blend", "L (Live)", "Strategy lab", "SCALP", "Fill timing", "Cancel-window curve"]
 )
 
 # ---------------------------------------------------------------------------
@@ -646,6 +646,106 @@ with tab_k:
     copy_box(slot_k, md, "md_k", f"gap-book-k-{SEL}.md")
 
 # ---------------------------------------------------------------------------
+with tab_l:
+    slot_l = st.container()
+    md = MD("L (Live) — REAL MONEY")
+    show_note(md, "warning" if C.L_LIVE_ON else "info",
+              "🔴 REAL MONEY — this book places actual Kalshi orders with actual dollars, not a paper simulation."
+              if C.L_LIVE_ON else
+              "L_LIVE_ON is off. No real orders are placed. Numbers below (if any) are from real orders placed "
+              "while it was previously on.")
+    show_p(md,
+        f"Same rule as Book K, no new logic: side=NO, Grok≤30, valid quote, |Grok−mid| strictly >15. "
+        f"**${C.L_NOTIONAL_DOLLARS:g} fixed per word** (not a %, not scaled) · nightly cap "
+        f"**${C.L_NIGHTLY_CAP_DOLLARS:g}** (first {C.L_MAX_WORDS_PER_NIGHT} qualifying words, excess skipped, "
+        f"never size-scaled) · cancel at **send+{C.L_CANCEL_AFTER_MIN}m** (the OLD Book A window, not the "
+        f"5:29 CT show529 cancel A/B/E/F/I use now) · hold to settlement, no early exit.")
+    try:
+        L = live.status_report()
+        L_ERR = None
+    except Exception as exc:
+        L, L_ERR = None, str(exc)
+    if L is None:
+        show_note(md, "error", f"Book L could not load: {L_ERR}")
+    else:
+        cb = L["circuit_breaker"]
+        if cb["tripped"]:
+            show_note(md, "error",
+                f"🛑 CIRCUIT BREAKER TRIPPED for {cb['iso_week']}: net ${cb['net_cents']/100.0:+.2f} this week "
+                f"(limit -${C.L_CIRCUIT_BREAKER_WEEKLY_LOSS:g}). No new L orders until this is cleared manually. "
+                f"Nothing auto-widens or auto-adjusts the rule or size.")
+        fr = L["freeze"]
+        show_cap(md, f"Freeze: {fr['filled_trades']}/{fr['min_filled']} filled trades, "
+                    f"{fr['weeks_running'] if fr['weeks_running'] is not None else 0}/{fr['freeze_weeks']} weeks running. "
+                    f"{'Freeze window is OVER — a real read is possible.' if fr['frozen_window_over'] else 'Still inside the freeze window — no rule/size changes yet.'}")
+        show_note(md, "success" if L["verdict"].startswith("CLEAR") else ("info" if L["n_settled"] < 10 else "warning"),
+                  "STATUS: " + L["verdict"])
+        lo, hi = L["range_90"]
+        show_metrics(md, [
+            ("Settled trades", L["n_settled"], None),
+            ("Hit rate", "n/a" if L["hit_pct"] is None else f"{L['hit_pct']:.0f}%",
+             None if lo is None else f"90% range {lo:.0f}–{hi:.0f}"),
+            ("Break-even", "n/a" if L["break_even_pct"] is None else f"{L['break_even_pct']:.1f}%", None),
+            ("Margin (pts)", "n/a" if L["margin_pts"] is None else f"{L['margin_pts']:+.1f}", None),
+            ("Net $ (real)", f"${L['net_dollars']:+.2f}", None),
+        ])
+
+        show_h(md, "Tonight")
+        today = L["today"]
+        if not today:
+            show_note(md, "info", "No Book L orders tonight (either not qualifying, L_LIVE_ON is off, or circuit breaker active).")
+        else:
+            show_df(md, pd.DataFrame([{
+                "word": o["word"], "status": o["status"], "want": float(o["contracts"]),
+                "filled": float(o["filled_contracts"] or 0), "entry ¢": o["our_price_cents"],
+                "cost $": (o["cost_cents"] or 0) / 100.0, "result": o.get("result") or "pending",
+                "net $": None if o.get("realized_pnl_cents") is None else o["realized_pnl_cents"] / 100.0,
+                "gap": o["gap_points"],
+            } for o in today]))
+
+        show_h(md, "K (paper) vs L (live) — same rule, side by side")
+        show_cap(md, "The single most useful comparison this book can produce right now: does K's paper hit rate "
+                    "hold up when the fills are real? K rows come from the Book K + blend tab's per-week table; "
+                    "only weeks with a plain YYYY-Wnn label match up (a 'CUMULATIVE'/'OLD TIMING' row has no single week).")
+        import re as _re
+        k_rows = (PANEL.get("k", {}).get("rows") or []) if PANEL else []
+        by_week_l = {r["iso_week"]: r for r in store.l_weekly_all()}
+        cmp_rows = []
+        weeks = set(by_week_l.keys())
+        k_by_week = {}
+        for r in k_rows:
+            m = _re.search(r"\d{4}-W\d{2}", str(r.get("label") or ""))
+            if m:
+                k_by_week[m.group(0)] = r
+                weeks.add(m.group(0))
+        for wk in sorted(weeks):
+            kr = k_by_week.get(wk)
+            lr = by_week_l.get(wk)
+            cmp_rows.append({
+                "week": wk,
+                "K paper hit %": kr.get("hit") if kr else None,
+                "K paper net $": (kr.get("net") / 100.0) if kr and kr.get("net") is not None else None,
+                "L live trades": lr["trades"] if lr else 0,
+                "L live net $": (lr["net_cents"] / 100.0) if lr else 0.0,
+                "L paused": bool(lr and lr.get("paused")),
+            })
+        if cmp_rows:
+            show_df(md, pd.DataFrame(cmp_rows))
+        else:
+            show_note(md, "info", "No weeks to compare yet.")
+
+        show_h(md, "All Book L orders (real)")
+        with st.expander(f"All {len(L['orders'])} Book L orders", expanded=False):
+            show_df(md, pd.DataFrame([{
+                "date": str(o["event_date"])[:10], "word": o["word"], "status": o["status"],
+                "kalshi order": o.get("kalshi_order_id") or "", "want": float(o["contracts"]),
+                "filled": float(o["filled_contracts"] or 0), "entry ¢": o["our_price_cents"],
+                "avg fill ¢": o.get("avg_fill_price_cents"), "result": o.get("result") or "",
+                "net $": None if o.get("realized_pnl_cents") is None else o["realized_pnl_cents"] / 100.0,
+            } for o in L["orders"]]))
+    copy_box(slot_l, md, "md_l", f"gap-book-l-{SEL}.md")
+
+# ---------------------------------------------------------------------------
 with tab_lab:
     slot_lab = st.container()
     md = MD("Strategy lab" + ("" if SEL == "All weeks" else f" · {SEL}"))
@@ -799,6 +899,103 @@ with tab_lab:
             "- The two baselines (GROK_ONLY, ALL_NO) are the yardsticks: a variant that does not beat them is not adding anything."
         )
     copy_box(slot_lab, md, "md_lab", f"gap-strategy-lab-{SEL}.md")
+
+# ---------------------------------------------------------------------------
+with tab_scalp:
+    slot_scalp = st.container()
+    md = MD("SCALP")
+    show_p(md,
+        f"Not a hold book: buys YES in batches any time the ask is **≤ {C.SCALP_BUY_MAX_CENTS}c**, from the decision time until "
+        f"**{C.SCALP_BUY_CUTOFF_HHMM} CT**, up to **${C.SCALP_BUDGET_DOLLARS:.0f} per word** (a target, not a guarantee — thin "
+        f"books partially fill and that's expected). Every batch rests its own sell at **{C.SCALP_SELL_CENTS}c** the moment it "
+        f"fills. Anything still unsold at **{C.SCALP_FALLBACK_HHMM} CT** sells at market. Qualify: Grok **≥ {C.SCALP_QUALIFY_PROB}%**.")
+    show_note(md, "info",
+        "Backed by a trade-by-trade backtest (Aug 17–Sep 23, 29 qualifying words, 14 nights): net ROI 16.7%–26.0% across every "
+        "sell target tried 75–95c, best cluster at 85/90c. **FROZEN** — do not tune before 30 completed round trips or 6 weeks.")
+    if PANEL is None:
+        show_note(md, "error", f"SCALP could not load: {PANEL_ERR}")
+    else:
+        batches = PANEL["scalp_batches"]
+        if not batches:
+            show_note(md, "info", "No SCALP batches yet.")
+        else:
+            cum = PANEL["scalp_cum"]
+            status = PANEL["scalp_status"]
+            show_note(md, "success" if status.startswith("PASSING") else ("error" if status.startswith("FAILING") else "info"),
+                      "STATUS: " + status)
+            show_metrics(md, [
+                ("Completed round trips", f"{cum['done']} / {lab.SCALP_MIN_FILLED}", None),
+                ("Hit rate (sold at target)", "n/a" if cum["hit_rate"] is None else f"{cum['hit_rate']:.0f}%",
+                 None if cum["break_even_px"] is None else f"break-even {cum['break_even_px']:.1f}c"),
+                ("Margin (points)", "n/a" if cum["margin"] is None else f"{cum['margin']:+.1f}", None),
+                ("Net after fees", f"${cum['net']:+.2f}", None),
+                ("Per-word fill %", "n/a" if cum["words_fully_filled_pct"] is None else f"{cum['words_fully_filled_pct']:.0f}%",
+                 "backtest ref. 62-70%"),
+            ])
+            show_h(md, "By week")
+            wk_rows = PANEL["scalp_by_week"] if SEL == "All weeks" else [r for r in PANEL["scalp_by_week"] if r["week"] in (SEL, "CUMULATIVE")]
+            show_df(md, pd.DataFrame([{
+                "week": r["week"], "words": r["words"], "batches": r["batches"], "done": r["done"], "resting": r["resting"],
+                "scalp_hit": r["scalp_hit"], "fallback": r["fallback_sold"], "hit %": r["hit_rate"],
+                "avg buy ¢": r["avg_buy_px"], "avg sell ¢": r["avg_sell_px"], "break-even ¢": r["break_even_px"],
+                "margin": r["margin"], "net $": r["net"], "ROI %": r["roi"]} for r in wk_rows]),
+                column_config={"hit %": st.column_config.NumberColumn(format="%.0f"), "avg buy ¢": st.column_config.NumberColumn(format="%.1f"),
+                              "avg sell ¢": st.column_config.NumberColumn(format="%.1f"), "break-even ¢": st.column_config.NumberColumn(format="%.1f"),
+                              "margin": st.column_config.NumberColumn(format="%+.1f"), "net $": st.column_config.NumberColumn(format="$%+.2f"),
+                              "ROI %": st.column_config.NumberColumn(format="%+.0f")})
+
+            show_h(md, "Budget-cap sweep (report only — real executed batches, whole batches only)")
+            show_cap(md, "What a smaller or larger per-word cap would have kept from the actual batch history. "
+                        "Unlike K_HIGH's sweep, this uses real executed prices, not a single decision-time snapshot.")
+            show_df(md, pd.DataFrame([{"cap $": r["size"], "words": r["words"], "batches": r["batches"], "hit %": r["hit_rate"],
+                                       "avg buy ¢": r["avg_buy_px"], "avg sell ¢": r["avg_sell_px"], "margin": r["margin"],
+                                       "net $": r["net"], "ROI %": r["roi"]} for r in PANEL["scalp_sweep"]]),
+                     column_config={"hit %": st.column_config.NumberColumn(format="%.0f"), "avg buy ¢": st.column_config.NumberColumn(format="%.1f"),
+                                   "avg sell ¢": st.column_config.NumberColumn(format="%.1f"), "margin": st.column_config.NumberColumn(format="%+.1f"),
+                                   "net $": st.column_config.NumberColumn(format="$%+.2f"), "ROI %": st.column_config.NumberColumn(format="%+.0f")})
+
+            show_h(md, "Per-word fill % (the liquidity signal)")
+            wf = PANEL["scalp_word_fill"] if SEL == "All weeks" else [r for r in PANEL["scalp_word_fill"] if weekly._week_id(r["date"]) == SEL]
+            show_df(md, pd.DataFrame([{"date": r["date"], "word": r["word"], "batches": r["batches"], "spent $": r["spent"],
+                                       "fill %": r["fill_pct"], "scalp_hit": r["hit"], "fallback": r["fallback"], "resting": r["resting"],
+                                       "net $": r["net"]} for r in wf]),
+                     column_config={"spent $": st.column_config.NumberColumn(format="$%.2f"), "fill %": st.column_config.NumberColumn(format="%.0f"),
+                                   "net $": st.column_config.NumberColumn(format="$%+.2f")})
+
+            with st.expander(f"All {len(batches)} SCALP batches (per-trade detail)", expanded=False):
+                bview = batches if SEL == "All weeks" else [b for b in batches if weekly._week_id(str(b["event_date"])[:10]) == SEL]
+                show_df(md, pd.DataFrame([{
+                    "date": str(b["event_date"])[:10], "word": b["word"], "grok": b["grok_probability"],
+                    "buy time": clock.fmt(clock.parse_dt(b["buy_at"]))[-8:] if b.get("buy_at") else "",
+                    "buy ¢": b["buy_price_cents"], "contracts": float(b["buy_contracts"]),
+                    "sell time": clock.fmt(clock.parse_dt(b["sell_at"]))[-8:] if b.get("sell_at") else "",
+                    "sell ¢": b["sell_price_cents"], "status": b["status"], "net $": (b["net_cents"] or 0) / 100.0,
+                } for b in bview]))
+    copy_box(slot_scalp, md, "md_scalp", f"gap-scalp-{SEL}.md")
+
+# ---------------------------------------------------------------------------
+with tab_timing:
+    slot_timing = st.container()
+    md = MD("Fill timing (adverse-selection check)")
+    show_p(md, "Permanent weekly check: for every **filled, settled** order (any book), minutes from the decision time to the "
+               "first fill. If the hit rate clearly falls in the later buckets, fills are arriving late because news moved "
+               "against the forecast, not because the book was just slow.")
+    if PANEL is None:
+        show_note(md, "error", f"Fill timing could not load: {PANEL_ERR}")
+    else:
+        t = PANEL["lab"]["timing"]
+        show_cap(md, f"{t['n_with_timing']} of {t['n_total_filled']} filled orders have a usable timing measurement "
+                    "(first_fill_at is recorded live going forward; older orders are recovered from stored depth history where it still exists).")
+        if t["adverse_selection_flag"]:
+            show_note(md, "warning", "Hit rate drops by more than 15 points from the earliest to the latest bucket with 3+ orders — "
+                                     "a signature of adverse selection.")
+        else:
+            show_note(md, "info", "No adverse-selection flag right now (hit rate does not clearly fall in later buckets, or too few orders per bucket).")
+        show_df(md, pd.DataFrame([{"bucket": b["bucket"], "n": b["n"], "hit %": b["hit"], "avg px ¢": b["avg_px"], "net $": b["net"]}
+                                  for b in t["buckets"]]),
+                column_config={"hit %": st.column_config.NumberColumn(format="%.0f"), "avg px ¢": st.column_config.NumberColumn(format="%.1f"),
+                              "net $": st.column_config.NumberColumn(format="$%+.2f")})
+    copy_box(slot_timing, md, "md_timing", f"gap-fill-timing-{SEL}.md")
 
 with tab_curve:
     slot_curve = st.container()

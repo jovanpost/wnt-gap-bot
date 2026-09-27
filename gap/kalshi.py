@@ -1,4 +1,13 @@
-"""Kalshi REST client — read path only for Phase 1 (events, markets, quotes)."""
+"""Kalshi REST client.
+
+Read path (events, markets, quotes) has been here since Phase 1. The order-
+placement path below (create_no_order / cancel_order / batch_cancel /
+get_balance / get_fills / get_resting_orders / get_positions) is new for
+Book L and is ported near-verbatim from wnt-nofade-bot's wnt/kalshi.py --
+same signing, same endpoints, same v1/v2 order-API branching -- per the
+explicit instruction to reuse that bot's proven live-order plumbing rather
+than invent a new one. Only Book L calls these; every paper book (A/B/E/F/G/
+H/I/K/M/SCALP) still only ever calls the read methods."""
 from __future__ import annotations
 
 import base64
@@ -273,6 +282,128 @@ class KalshiClient:
         if min_ts:
             params["min_ts"] = int(min_ts)
         return self.paginate("/markets/trades", "trades", params, auth=False, max_pages=5)
+
+    # ------------------------------------------------------------------
+    # Real-money order path (Book L only). Ported from wnt-nofade-bot/wnt/kalshi.py.
+    # ------------------------------------------------------------------
+
+    def get_balance(self) -> dict:
+        return self.request("GET", "/portfolio/balance")
+
+    def get_resting_orders(self, series_prefix: str | None = None) -> list[dict]:
+        orders = self.paginate("/portfolio/orders", "orders", {"status": "resting", "limit": 200})
+        if series_prefix:
+            orders = [o for o in orders if str(o.get("ticker", "")).startswith(series_prefix)]
+        return orders
+
+    def get_fills(self, ticker: str | None = None, limit: int = 200) -> list[dict]:
+        params: dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        return self.paginate("/portfolio/fills", "fills", params)
+
+    def get_positions(self) -> list[dict]:
+        return self.paginate("/portfolio/positions", "market_positions", {"limit": 200})
+
+    def create_no_order(
+        self,
+        ticker: str,
+        no_price_cents: int,
+        count: float,
+        client_order_id: str,
+        post_only: bool = True,
+        expiration_epoch: int | None = None,
+    ) -> dict:
+        """Buy NO at no_price_cents (== sell YES at 100-no_price_cents). Same
+        v1/v2 branching as nofade's client, selected by C.ORDER_API."""
+        if C.ORDER_API == "v1":
+            body = {
+                "ticker": ticker,
+                "client_order_id": client_order_id,
+                "action": "buy",
+                "side": "no",
+                "count": int(count),
+                "type": "limit",
+                "no_price": int(no_price_cents),
+                "post_only": bool(post_only),
+            }
+            if expiration_epoch:
+                body["expiration_ts"] = int(expiration_epoch)
+            resp = self.request("POST", "/portfolio/orders", body=body)
+            order = resp.get("order") or {}
+            return {
+                "order_id": order.get("order_id"),
+                "client_order_id": order.get("client_order_id") or client_order_id,
+                "fill_count": _to_count(order.get("taker_fill_count") or 0),
+                "remaining_count": _to_count(order.get("remaining_count") or count),
+                "avg_fill_price_cents": _to_cents(order.get("taker_fill_cost")),
+                "raw": resp,
+            }
+
+        yes_price = 100 - int(no_price_cents)
+        body = {
+            "ticker": ticker,
+            "client_order_id": client_order_id,
+            "side": "ask",
+            "count": f"{float(count):.2f}",
+            "price": f"{yes_price / 100:.4f}",
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": bool(post_only),
+            "cancel_order_on_pause": True,
+            "reduce_only": False,
+        }
+        if expiration_epoch:
+            body["expiration_time"] = int(expiration_epoch)
+        resp = self.request("POST", "/portfolio/events/orders", body=body)
+        return {
+            "order_id": resp.get("order_id"),
+            "client_order_id": resp.get("client_order_id") or client_order_id,
+            "fill_count": _to_count(resp.get("fill_count")),
+            "remaining_count": _to_count(resp.get("remaining_count")),
+            "avg_fill_price_cents": _to_cents(resp.get("average_fill_price")),
+            "raw": resp,
+        }
+
+    def cancel_order(self, order_id: str) -> bool:
+        for endpoint in (f"/portfolio/events/orders/{order_id}", f"/portfolio/orders/{order_id}"):
+            try:
+                self.request("DELETE", endpoint, retries=3)
+                return True
+            except KalshiError as exc:
+                if exc.status == 404:
+                    return True
+                log.warning("cancel via %s failed: %s", endpoint, exc)
+        return False
+
+    def batch_cancel(self, order_ids: list[str]) -> tuple[int, list[str]]:
+        if not order_ids:
+            return 0, []
+        try:
+            resp = self.request(
+                "DELETE", "/portfolio/events/orders/batched",
+                body={"orders": [{"order_id": oid} for oid in order_ids]},
+                retries=3,
+            )
+            failed = []
+            ok = 0
+            for entry in resp.get("orders", []):
+                if entry.get("error"):
+                    failed.append(entry.get("order_id"))
+                else:
+                    ok += 1
+            if ok or not failed:
+                return ok, [f for f in failed if f]
+        except KalshiError as exc:
+            log.warning("batch cancel failed (%s), falling back to singles", exc)
+        ok, failed = 0, []
+        for oid in order_ids:
+            if self.cancel_order(oid):
+                ok += 1
+            else:
+                failed.append(oid)
+            time.sleep(0.05)
+        return ok, failed
 
 
 def _parse_ts(raw) -> datetime | None:

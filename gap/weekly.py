@@ -34,7 +34,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
-from . import clock, config as C, lab, notify, pricing, quotes as Q, results, settle, store, strategy
+from . import clock, config as C, lab, live, notify, pricing, quotes as Q, results, settle, store, strategy
 
 log = logging.getLogger("gap.weekly")
 
@@ -63,6 +63,10 @@ K_MAX_GROK = 30
 K_MIN_GAP = 15          # fixed at 15 on purpose: does not follow GAP_THRESHOLD if that ever changes
 K_MIN_FILLED = 30
 K_SPLIT_MID = lab.SPLIT_MID   # 55: K_HIGH = booked mid >= 55, K_LOW = mid < 55 (frozen 6 weeks / 30 filled K_HIGH)
+TIMING_FIX_DATE = "2026-09-24"   # first night under the timing overhaul: 0->5min decision lag, ALL books rest to 5:29 CT.
+                                  # Orders before this date traded under the OLD timing (60m lag, A/B/E/F/I cancelled after
+                                  # 60 minutes) -- they are kept for reference but are not the same experiment as what
+                                  # follows, so K/K_HIGH/K_LOW/M report a second, separately-labeled cohort for the new timing.
 K_WINDOW_WEEKS = 6
 K_PASS_MARGIN = 5.0     # points
 
@@ -470,6 +474,8 @@ def collect(start: str, end: str, light: bool = False) -> dict:
             orow = _order_row(o, s, d, row_by_ticker, status)
             orow["week"] = wk
             orow["prompt"] = plabel
+            orow["run_id"] = run["id"]
+            orow["first_fill_at"] = o.get("first_fill_at")
             orows.append(orow)
             if orow["ticker"] in row_by_ticker:
                 row_by_ticker[orow["ticker"]]["trades"].append(orow)
@@ -988,9 +994,13 @@ def _k_panel(data, book, sub=None) -> dict:
     for wk in weeks:
         wm = [o for o in members if o["week"] == wk]
         plabels = sorted({o["prompt"] for o in allo if o["week"] == wk})
-        rows.append({"label": wk, "prompt": " / ".join(plabels), **_k_stats(wm)})
+        label = wk if wk >= TIMING_FIX_DATE[:7] else f"{wk} (OLD TIMING)"
+        rows.append({"label": label, "prompt": " / ".join(plabels), **_k_stats(wm)})
     cum = _k_stats(members)
-    rows.append({"label": "CUMULATIVE", "prompt": "all weeks", **cum})
+    rows.append({"label": "CUMULATIVE (all, old+new timing)", "prompt": "all weeks", **cum})
+    new_timing = [o for o in members if o["date"] >= TIMING_FIX_DATE]
+    cum_new = _k_stats(new_timing)
+    rows.append({"label": "CUMULATIVE (new timing only)", "prompt": f"from {TIMING_FIX_DATE}", **cum_new})
     first = min((o["date"] for o in allo), default=None)
     if first:
         d0 = datetime.strptime(first, "%Y-%m-%d").date()
@@ -1005,8 +1015,9 @@ def _k_panel(data, book, sub=None) -> dict:
         "state": o["state"], "net_dollars": None if o["net"] is None else round(o["net"] / 100.0, 2),
         "is_count": o["is_count"],
     } for o in sorted(members, key=lambda x: (x["date"], x["word"]))]
-    return {"rows": rows, "cum": cum, "weeks_in": weeks_in, "status": _k_status(cum, weeks_in), "orders": detail,
-            "last_date": max((o["date"] for o in members), default=None)}
+    return {"rows": rows, "cum": cum, "cum_new_timing": cum_new, "weeks_in": weeks_in,
+            "status": _k_status(cum_new, weeks_in) + "  (counts NEW-TIMING trades only; old-timing rows above are reference)",
+            "orders": detail, "last_date": max((o["date"] for o in members), default=None)}
 
 
 def score_panel(data) -> dict:
@@ -1038,6 +1049,7 @@ def slice_panel() -> dict:
     data = collect("2000-01-01", end, light=True)
     L = lab.panel(data)
     data["lab"] = L
+    batches = store.scalp_batches_between("2000-01-01", end)
     weeks = sorted({o["week"] for o in data["slice_orders"]} | {w["week"] for w in L["words"]})
     return {
         "k": _k_panel(data, "A"), "k_high": _k_panel(data, "A", "HIGH"), "k_low": _k_panel(data, "A", "LOW"),
@@ -1046,6 +1058,9 @@ def slice_panel() -> dict:
         "score": score_panel(data),
         "lab": L,
         "recompute": recompute_table(data),
+        "scalp_batches": batches, "scalp_by_week": lab.scalp_by_week(batches), "scalp_cum": lab.scalp_stats(batches),
+        "scalp_status": lab.scalp_status(lab.scalp_stats(batches)), "scalp_sweep": lab.scalp_budget_sweep(batches),
+        "scalp_word_fill": lab.scalp_word_fill(batches),
         "weeks": weeks,
         "asof": clock.fmt(clock.now_ct()),
     }
@@ -1211,6 +1226,140 @@ def _capacity_block(data) -> list[str]:
             else:
                 lines.append(f"{r['date']:<12}{r['book']:<5}{_trunc(r['word'], 25):<26}{r['intended']:>8.1f}{r['actual_filled']:>10.1f}"
                              f"{r['long_filled']:>9.1f}{_fx(r['actual_net'], 2):>12}{_fx(r['long_net'], 2):>10}")
+    return lines
+
+
+def _timing_block(data) -> list[str]:
+    t = data["lab"]["timing"]
+    lines = [
+        "Permanent weekly check: for every FILLED, SETTLED order (any book), minutes from the decision time to the first fill.",
+        f"orders with a usable timing measurement: {t['n_with_timing']} of {t['n_total_filled']} filled orders "
+        "(first_fill_at is recorded live going forward; older orders are recovered by replaying the stored depth history where it still exists).",
+        f"{'bucket':<16}{'n':>5}{'hit%':>6}{'avg px':>8}{'net$':>9}",
+    ]
+    for b in t["buckets"]:
+        lines.append(f"{b['bucket']:<16}{b['n']:>5}{_fx(b['hit'], 0):>6}{_fx(b['avg_px'], 1):>8}{b['net']:>+9.2f}")
+    if t["adverse_selection_flag"]:
+        lines.append("FLAG: hit rate drops by more than 15 points from the earliest to the latest bucket with 3+ orders -- "
+                     "a signature of adverse selection (fills that only came late because news moved against the forecast).")
+    else:
+        lines.append("No adverse-selection flag this week (hit rate does not clearly fall in the later buckets, or too few orders per bucket to tell).")
+    return lines
+
+
+def _scalp_block(data) -> list[str]:
+    batches = data["scalp_batches"]
+    lines = [
+        f"Not a hold book: SCALP buys YES in batches (any poll with the ask <= {C.SCALP_BUY_MAX_CENTS}c, from the decision time "
+        f"until {C.SCALP_BUY_CUTOFF_HHMM} CT, up to ${C.SCALP_BUDGET_DOLLARS:.0f} per word) and sells each batch the moment it "
+        f"fills, resting at {C.SCALP_SELL_CENTS}c. Anything unsold by {C.SCALP_FALLBACK_HHMM} CT sells at market. "
+        f"Qualify: Grok >= {C.SCALP_QUALIFY_PROB}%. FROZEN -- do not tune before 30 completed round trips or 6 weeks.",
+        f"backtest reference (Aug17-Sep23, 29 words, 14 nights): net ROI 16.7%-26.0% across every sell target tried 75-95c; "
+        f"{C.SCALP_SELL_CENTS}c chosen for its fill speed and hit rate; budget capped at $100/word on purpose -- a $1000/word "
+        "test only reached 17% of words and barely grew total profit (see the budget-cap sweep below).",
+        "",
+    ]
+    if not batches:
+        lines.append("no SCALP batches yet")
+        return lines
+    for r in lab.scalp_by_week(batches):
+        lines.append(f"{r['week']}: words {r['words']} | batches {r['batches']} (done {r['done']}, resting {r['resting']}) | "
+                     f"scalp_hit {r['scalp_hit']} / fallback {r['fallback_sold']} | hit% {_fx(r['hit_rate'], 0)} | "
+                     f"avg buy {_fx(r['avg_buy_px'], 1)}c avg sell {_fx(r['avg_sell_px'], 1)}c break-even {_fx(r['break_even_px'], 1)}c "
+                     f"margin {_fx(r['margin'], 1)} | net ${r['net']:+.2f} ROI {_fx(r['roi'], 0)}%")
+    cum = lab.scalp_stats(batches)
+    lines.append("")
+    lines.append("STATUS: " + lab.scalp_status(cum))
+    lines.append("")
+    lines.append(f"per-word fill%: {_fx(cum['words_fully_filled_pct'], 0)}% of words reached the full ${C.SCALP_BUDGET_DOLLARS:.0f} target "
+                 f"(backtest reference: 62-70%). Track this every week, not just net $ -- a low fill% means the edge is real but the book is thin.")
+    lines.append("")
+    lines.append("BUDGET-CAP SWEEP (report only, real executed batches, whole batches only -- what a smaller/larger per-word cap would have kept):")
+    lines.append(f"{'cap$':>6}{'words':>7}{'batches':>8}{'hit%':>6}{'avg buy':>8}{'avg sell':>9}{'margin':>8}{'net$':>9}{'ROI%':>6}")
+    for r in lab.scalp_budget_sweep(batches):
+        lines.append(f"{r['size']:>6}{r['words']:>7}{r['batches']:>8}{_fx(r['hit_rate'], 0):>6}{_fx(r['avg_buy_px'], 1):>8}"
+                     f"{_fx(r['avg_sell_px'], 1):>9}{_fx(r['margin'], 1):>8}{r['net']:>+9.2f}{_fx(r['roi'], 0):>6}")
+    lines.append("")
+    lines.append("PER-WORD FILL% (this week's words):")
+    lines.append(f"{'date':<12}{'word':<26}{'batches':>8}{'spent$':>8}{'fill%':>7}{'hit':>5}{'fallback':>9}{'resting':>8}{'net$':>9}")
+    for r in lab.scalp_word_fill([b for b in batches if str(b['event_date'])[:10] >= data['start']]):
+        lines.append(f"{r['date']:<12}{_trunc(r['word'], 25):<26}{r['batches']:>8}{r['spent']:>8.2f}{r['fill_pct']:>7.0f}"
+                     f"{r['hit']:>5}{r['fallback']:>9}{r['resting']:>8}{r['net']:>+9.2f}")
+    lines.append("")
+    lines.append("PER-TRADE DETAIL (this week):")
+    lines.append(f"{'date':<12}{'word':<24}{'grok':>5}{'buy time':>10}{'buy px':>7}{'sell time':>10}{'sell px':>8}{'hit?':>5}{'fee':>6}{'net$':>8}")
+    for b in sorted([x for x in batches if str(x["event_date"])[:10] >= data["start"]], key=lambda x: (x["event_date"], x["word"], x["buy_at"])):
+        bt = clock.parse_dt(b["buy_at"]); st_ = clock.parse_dt(b["sell_at"])
+        lines.append(f"{str(b['event_date'])[:10]:<12}{_trunc(b['word'], 23):<24}{b['grok_probability'] or '':>5}"
+                     f"{(clock.fmt(bt)[-8:] if bt else ''):>10}{b['buy_price_cents']:>7}"
+                     f"{(clock.fmt(st_)[-8:] if st_ else ''):>10}{b['sell_price_cents'] or '':>8}"
+                     f"{'Y' if b['status'] == 'scalp_hit' else ('N' if b['status'] == 'fallback_sold' else '-'):>5}"
+                     f"{(b['buy_fee_cents'] or 0) + (b['sell_fee_cents'] or 0):>6}{(b['net_cents'] or 0) / 100:>+8.2f}")
+    return lines
+
+
+def _l_block(data) -> list[str]:
+    """Book L: LIVE real money, same rule as K. Side-by-side vs K's paper fills is
+    'the single most useful comparison this book can produce right now' per the
+    go-live spec -- does K's paper hit rate hold up when the fills are real?
+    Also tracks L's own fill-selection stats (section 5 does this for every other
+    book; L gets its own version here since its data lives outside gap_orders)."""
+    lines = [
+        f"LIVE (real Kalshi orders, real dollars): {'ON' if C.L_LIVE_ON else 'OFF'} | "
+        f"${C.L_NOTIONAL_DOLLARS:g}/word fixed | nightly cap ${C.L_NIGHTLY_CAP_DOLLARS:g} "
+        f"(first {C.L_MAX_WORDS_PER_NIGHT} qualifying words, never scaled down) | "
+        f"cancel send+{C.L_CANCEL_AFTER_MIN}m (the OLD Book A window, not the 5:29 CT show529 "
+        f"cancel A/B/E/F/I use now) | circuit breaker: pause if net < -${C.L_CIRCUIT_BREAKER_WEEKLY_LOSS:g} in a week",
+        "Rule is IDENTICAL to K (side=NO, Grok<=30, valid quote, |Grok-mid| strictly >15). No new signal -- "
+        "this only tests whether K's paper edge survives contact with a real resting order.",
+        "",
+    ]
+    rep = live.status_report()
+    cb = rep["circuit_breaker"]
+    if cb["tripped"]:
+        lines.append(f"CIRCUIT BREAKER TRIPPED for {cb['iso_week']}: net ${cb['net_cents']/100.0:+.2f} this week. "
+                     "No new L orders until cleared manually. Nothing here auto-adjusts the rule or size.")
+    fr = rep["freeze"]
+    lines.append(f"freeze: {fr['filled_trades']}/{fr['min_filled']} filled trades, "
+                 f"{fr['weeks_running'] if fr['weeks_running'] is not None else 0}/{fr['freeze_weeks']} weeks running -- "
+                 f"{'freeze window OVER' if fr['frozen_window_over'] else 'still inside freeze, no changes'}")
+    lines.append("STATUS: " + rep["verdict"])
+    lines.append(f"cumulative: {rep['n_settled']} settled | hit {_fx(rep['hit_pct'], 0)}% | "
+                 f"break-even {_fx(rep['break_even_pct'], 1)}% | margin {_fx(rep['margin_pts'], 1)} | "
+                 f"net ${rep['net_dollars']:+.2f}")
+    lines.append("")
+
+    week_orders = store.l_orders_between(data["start"], data["end"])
+    if not week_orders:
+        lines.append("no Book L orders this week")
+        return lines
+
+    lines.append("K (paper, Book A slice) vs L (live) -- same rule, same week:")
+    lines.append(f"{'metric':<22}{'K paper':>12}{'L live':>12}")
+    l_hit = None
+    l_settled_week = [o for o in week_orders if o.get("status") == "settled" and o.get("result") in ("yes", "no")]
+    if l_settled_week:
+        wins = sum(1 for o in l_settled_week if o["side"] == "NO" and o["result"] == "no")
+        l_hit = 100.0 * wins / len(l_settled_week)
+    l_net = sum((o.get("realized_pnl_cents") or 0) for o in week_orders) / 100.0
+    lines.append(f"{'trades':<22}{'n/a':>12}{len(l_settled_week):>12}")
+    lines.append(f"{'hit %':<22}{'n/a':>12}{_fx(l_hit, 0):>12}")
+    lines.append(f"{'net $':<22}{'n/a':>12}{l_net:>+12.2f}")
+    lines.append("(K's own per-week paper numbers are in section 4B above -- match by week id to compare directly.)")
+    lines.append("")
+
+    lines.append("FILL-SELECTION CHECK for L (same idea as section 5, computed on real fills):")
+    lines.append(f"{'word':<24}{'status':<14}{'entry c':>8}{'filled':>8}{'result':>7}{'net$':>8}")
+    for o in week_orders:
+        lines.append(f"{_trunc(o['word'], 23):<24}{o['status']:<14}{o['our_price_cents']:>8}"
+                     f"{float(o.get('filled_contracts') or 0):>8.2f}{(o.get('result') or ''):>7}"
+                     f"{'' if o.get('realized_pnl_cents') is None else o['realized_pnl_cents']/100.0:>+8.2f}")
+    n_words = len(week_orders)
+    n_filled = sum(1 for o in week_orders if float(o.get("filled_contracts") or 0) > 0)
+    lines.append("")
+    lines.append(f"fill rate this week: {n_filled}/{n_words} words got any real fill "
+                 f"({100.0 * n_filled / n_words:.0f}%) -- this is the first live test of whether K's paper "
+                 f"fills were representative or optimistic.")
     return lines
 
 
@@ -1832,6 +1981,8 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines.append(" 5 Fill-selection check    10 Rules and settings")
     lines.append(" 4B BOOK K, K_HIGH, K_LOW for A and B, A-vs-B  4C fills by Grok bucket  4D capacity, segment frequency, size sweep, long-rest shadow")
     lines.append(" 4E STRATEGY LAB: report-only variants taken at market, grid, growth check   4F BOOK M vs K_HIGH")
+    lines.append(" 4G FILL TIMING (adverse selection)   4H SCALP: buy<=70c / sell 85c / fallback at 5:29")
+    lines.append(" 4I BOOK L (LIVE, real money): same rule as K, side by side")
 
     _hdr(lines, "1. NIGHT STATUS")
     lines += _nights_status_block(data)
@@ -1853,6 +2004,12 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines += _lab_block(data)
     _hdr(lines, "4F. BOOK M vs K_HIGH (report-only, $1 at market, decision-time book)")
     lines += _m_block(data)
+    _hdr(lines, "4G. FILL TIMING: decision-to-fill minutes, all books (adverse-selection check, permanent)")
+    lines += _timing_block(data)
+    _hdr(lines, "4H. SCALP: buy YES cheap, flip for a quick profit (pre-registered, backed by backtest)")
+    lines += _scalp_block(data)
+    _hdr(lines, "4I. BOOK L (LIVE, real money): same rule as K, side by side")
+    lines += _l_block(data)
     _hdr(lines, "5. FILL-SELECTION CHECK (do fills happen mostly when the market moves against us?)")
     lines += _fill_selection_block(data)
     _hdr(lines, "6. HOW GOOD IS GROK? (every word with a result; market comparisons use valid quotes only)")
@@ -1888,6 +2045,8 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
         " e) Are p_block_airs and p_said_given_airs useful, or is only the final probability informative?",
         " f) Section 5: do fills select against us? Is G/H worth keeping?",
         " g) What ONE change to the prompt or the rules is worth testing next, and what would prove it wrong?",
+        " h2) Section 4G: is there an adverse-selection flag on the fill-timing table? What does that mean for resting to 5:29 CT?",
+        " i2) Section 4H: is SCALP's status PASSING/FAILING/TOO EARLY? Does the budget-cap sweep say $100/word is still the right size?",
         " h) Section 4B: what is Book K's status line, and is the margin above break-even? Do NOT change the K rule; only report.",
         " i) Section 3: does the BLEND (Grok + market)/2 beat the market and Grok? Where?",
         "One week is a small sample. Say how confident each conclusion is. Do not retune from one week.",
@@ -1949,6 +2108,7 @@ def build_week_bundle(start: str | None = None, end: str | None = None) -> dict:
         week_id = _week_id(start)
     data = collect(start, end)
     data["lab"] = lab.panel(data)
+    data["scalp_batches"] = store.scalp_batches_between("2000-01-01", end)
     audit = _audit(data)
     rows = _all_rows(data)
     orders = _all_orders(data)

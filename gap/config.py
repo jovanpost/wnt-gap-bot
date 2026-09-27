@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.5.10"
+VERSION = "wnt-gap-v1.6.0"  # v1.5.10 (SCALP, early detection, timing overhaul) + Book L (LIVE real money)
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -109,16 +109,16 @@ LIMIT_OFFSET_CENTS = int(_num("LIMIT_OFFSET_CENTS", 8))
 # settlement needs exactly one trustworthy signal -- Kalshi's final result --
 # and nothing else. That is the only exit rule left in this repo.
 ALL_VARIANTS = (
-    {"id": "A", "notional": 1.0, "exit": "hold", "rule": "fade15", "cancel": "send60", "label": "A · $1 hold fade"},
-    {"id": "B", "notional": 100.0, "exit": "hold", "rule": "fade15", "cancel": "send60", "label": "B · $100 hold fade"},
-    {"id": "E", "notional": 1.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "send60", "label": "E · $1 hold fade+Grok>50"},
-    {"id": "F", "notional": 100.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "send60", "label": "F · $100 hold fade+Grok>50"},
+    {"id": "A", "notional": 1.0, "exit": "hold", "rule": "fade15", "cancel": "show529", "label": "A · $1 hold fade"},
+    {"id": "B", "notional": 100.0, "exit": "hold", "rule": "fade15", "cancel": "show529", "label": "B · $100 hold fade"},
+    {"id": "E", "notional": 1.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "show529", "label": "E · $1 hold fade+Grok>50"},
+    {"id": "F", "notional": 100.0, "exit": "hold", "rule": "fade15_gate50", "cancel": "show529", "label": "F · $100 hold fade+Grok>50"},
     {"id": "G", "notional": 1.0, "exit": "hold", "rule": "grok10", "cancel": "show529", "label": "G · $1 hold Grok−10"},
     {"id": "H", "notional": 100.0, "exit": "hold", "rule": "grok10", "cancel": "show529", "label": "H · $100 hold Grok−10"},
     # v1.5.1 NEW book (does not replace anything): edge measured against the price you
     # would really pay (the ask to buy YES, the bid to buy NO), not the mid. See
     # strategy.decide_exec. Threshold: EDGE_EXEC_THRESHOLD below.
-    {"id": "I", "notional": 1.0, "exit": "hold", "rule": "edge_exec", "cancel": "send60", "label": "I · $1 hold edge vs ask/bid"},
+    {"id": "I", "notional": 1.0, "exit": "hold", "rule": "edge_exec", "cancel": "show529", "label": "I · $1 hold edge vs ask/bid"},
 )
 # To retire books without touching code, set the Streamlit secret DISABLED_BOOKS, e.g. "G,H".
 # Old rows stay in the database; the books just stop being booked and shown.
@@ -131,6 +131,16 @@ QUOTE_MAX_AGE_S = int(_num("QUOTE_MAX_AGE_S", 600))
 # v1.5.9: wide spreads are TRADED. 0 = no spread rule. (It was 25 in v1.5.1-v1.5.8.) Only broken quotes
 # (bid<=1, ask<=1, bid>=99, bid>ask, a missing side) are skipped. Set the secret QUOTE_MAX_SPREAD to bring a limit back.
 QUOTE_MAX_SPREAD = int(_num("QUOTE_MAX_SPREAD", 0))
+
+# v1.5.10 A: SCALP book (pre-registered, backed by the Aug17-Sep23 backtest). FROZEN --
+# do not tune any of these before 30 filled trades or 6 weeks, whichever comes first.
+SCALP_ON = _flag("SCALP_ON", True)
+SCALP_QUALIFY_PROB = int(_num("SCALP_QUALIFY_PROB", 70))     # Grok >= this to qualify a word
+SCALP_BUY_MAX_CENTS = int(_num("SCALP_BUY_MAX_CENTS", 70))   # buy YES any time the ask is <= this
+SCALP_SELL_CENTS = int(_num("SCALP_SELL_CENTS", 85))         # every batch rests a sell at this price
+SCALP_BUDGET_DOLLARS = float(_num("SCALP_BUDGET_DOLLARS", 100.0))  # target per word, not a guarantee
+SCALP_BUY_CUTOFF_HHMM = _secret("SCALP_BUY_CUTOFF_HHMM", "17:25")   # CT, stop starting new buys
+SCALP_FALLBACK_HHMM = _secret("SCALP_FALLBACK_HHMM", "17:29")       # CT, sell anything unsold at market
 # WORD HISTORY block sent to Grok: how many past nights (0 = off).
 WORD_HISTORY_NIGHTS = int(_num("WORD_HISTORY_NIGHTS", 10))
 # Paper fills are checked every poll tick (not only when someone opens the app).
@@ -138,7 +148,12 @@ BACKGROUND_FILLS = _flag("BACKGROUND_FILLS", True)
 SHOW_CANCEL_CT = _secret("SHOW_CANCEL_CT", "17:29")
 GROK10_OFFSET = int(_num("GROK10_OFFSET", 10))
 # Addendum clocks
-DECISION_LAG_MIN = int(_num("DECISION_LAG_MIN", 60))
+# v1.5.10 B: was 60. A 5-minute buffer, not zero -- if the word list gets corrected right
+# after first-seen (it has happened: e.g. Sep 16 was "upgraded" ~3h10m after first-seen, a
+# late correction the buffer would not have caught anyway), the existing "upgraded" path
+# already pushes decision_at later and re-freezes quotes, so a short buffer here is just
+# insurance against a same-minute typo, not the only protection.
+DECISION_LAG_MIN = int(_num("DECISION_LAG_MIN", 5))
 CANCEL_AFTER_MIN = int(_num("CANCEL_AFTER_MIN", 60))
 MARKET_OPEN_CT = _secret("MARKET_OPEN_CT", "12:30")  # modal WNT open; API open_time wins
 STREAMLIT_APP_URL = _secret("STREAMLIT_APP_URL", "https://wnt-gap-bot.streamlit.app")
@@ -161,7 +176,40 @@ BASE_URL = DEMO_BASE if USE_DEMO else PROD_BASE
 KALSHI_KEY_ID = _secret("KALSHI_KEY_ID", "")
 KALSHI_PRIVATE_KEY_PATH = _secret("KALSHI_PRIVATE_KEY_PATH", "")
 KALSHI_PRIVATE_KEY_PEM = _secret("KALSHI_PRIVATE_KEY_PEM", "")
+# Same shape as wnt-nofade-bot's order path (gap/kalshi.py's create_no_order/cancel_order
+# were ported from there). Use the SAME real key -- this is not a second Kalshi account,
+# it is the same live-trading credential nofade already uses, added to gap-bot's own
+# Streamlit secrets so gap-bot can place its own (much smaller) real orders.
+ORDER_API = _secret("ORDER_API", "v2")
+POST_ONLY = _flag("POST_ONLY", True)
+USE_SERVER_SIDE_EXPIRY = _flag("USE_SERVER_SIDE_EXPIRY", True)
 USER_AGENT = f"wnt-gap-bot/{VERSION}"
+
+# ---------------------------------------------------------------------------
+# Book L: LIVE real-money trading. Mirrors Book K's exact rule (side=NO,
+# Grok<=30, valid quote, |Grok-mid| strictly >15) -- see strategy.order_for_rule's
+# "fade15_gate30_no" branch. No new signal, no new logic; only the money is real.
+#
+# L_LIVE_ON is a hard kill switch, default OFF. Nothing in gap/live.py places a
+# real order unless this is explicitly set to true in Streamlit secrets, in
+# addition to KALSHI_KEY_ID / KALSHI_PRIVATE_KEY_PEM being the real production key.
+#
+# FROZEN like K: do not tune L_NOTIONAL_DOLLARS, the rule, or the cancel window
+# before L_FREEZE_MIN_FILLED filled trades or L_FREEZE_WEEKS weeks, whichever
+# comes first -- an early live read is only honest if nothing moves under it.
+# ---------------------------------------------------------------------------
+L_LIVE_ON = _flag("L_LIVE_ON", False)
+L_NOTIONAL_DOLLARS = float(_num("L_NOTIONAL_DOLLARS", 10.0))  # $ per word. Fixed, not a %, not scaled.
+L_NIGHTLY_CAP_DOLLARS = float(_num("L_NIGHTLY_CAP_DOLLARS", 50.0))
+L_MAX_WORDS_PER_NIGHT = int(_num("L_MAX_WORDS_PER_NIGHT", 5))  # first N qualifying words; never scaled down
+L_CIRCUIT_BREAKER_WEEKLY_LOSS = float(_num("L_CIRCUIT_BREAKER_WEEKLY_LOSS", 30.0))
+L_FREEZE_MIN_FILLED = int(_num("L_FREEZE_MIN_FILLED", 30))
+L_FREEZE_WEEKS = int(_num("L_FREEZE_WEEKS", 6))
+# L cancels at send+60m, like the OLD Book A (pre-v1.5.10 timing overhaul) -- NOT the
+# 5:29 CT show529 cancel that A/B/E/F/I use now, and NOT tied to CANCEL_AFTER_MIN above
+# (which paper books could still change independently). Fixed on its own so a future
+# change to paper timing can never silently change L's real-money cancel window.
+L_CANCEL_AFTER_MIN = int(_num("L_CANCEL_AFTER_MIN", 60))
 
 DATABASE_URL = _secret("DATABASE_URL", "")
 SQLITE_PATH = _secret("SQLITE_PATH", "gap_bot.db")
@@ -189,6 +237,9 @@ def summary() -> str:
         f"broken quote (bid<=1, ask<=1, bid>=99, bid>ask{f', spread>{QUOTE_MAX_SPREAD}' if QUOTE_MAX_SPREAD else ''}) = no trade · wide spreads "
         f"{'skipped' if QUOTE_MAX_SPREAD else 'are traded'}\n"
         f"NO bankroll / NO night cap / NO cluster cap\n"
+        f"L (LIVE $ real): {'ON' if L_LIVE_ON else 'off'} · ${L_NOTIONAL_DOLLARS:g}/word · "
+        f"cap ${L_NIGHTLY_CAP_DOLLARS:g}/night (first {L_MAX_WORDS_PER_NIGHT} words) · "
+        f"cancel send+{L_CANCEL_AFTER_MIN}m · circuit breaker -${L_CIRCUIT_BREAKER_WEEKLY_LOSS:g}/wk\n"
         f"prompt {prompt_version()} | harness {HARNESS} | addendum {ADDENDUM}\n"
         f"poll {POLL_START_CT} CT | json deadline {JSON_DEADLINE_CT} CT"
     )

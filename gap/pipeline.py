@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import clock, config as C, fills, notify, parser, prompt, quotes, settle, store, strategy
+from . import clock, config as C, fills, live, notify, parser, prompt, quotes, scalp, settle, store, strategy
 from .kalshi import (
     KalshiClient,
     uniquify_words,
@@ -128,6 +128,47 @@ def maybe_upgrade_event(client: KalshiClient | None = None) -> dict:
     )
     return {"ok": True, "reason": "upgraded", "send_at": clock.fmt(send_at), "ticker": new_ticker}
 
+_DEAD_MARKET_STATUSES = {"settled", "closed", "finalized"}
+
+
+def _markets_usable(markets: list[dict]) -> bool:
+    return any(
+        (m.get("status") or "").lower() not in _DEAD_MARKET_STATUSES and (m.get("ticker") or m.get("market_ticker"))
+        for m in markets
+    )
+
+
+def find_event_early(client: KalshiClient, date_str: str) -> tuple[dict | None, str]:
+    """Find today's event as early as possible. Kalshi often LISTS the markets 5-20 minutes
+    before the event actually opens for trading -- this probes for that listing directly
+    instead of waiting for get_events(status="open"), the same trick the live wnt-nofade-bot
+    uses (wnt/strategy.py:_fast_arm) to arm itself before the market opens.
+    Returns (event_or_None, how_found) for logging."""
+    ticker = clock.event_ticker_for_date(date_str)
+    try:
+        markets = client.get_markets(ticker)
+    except Exception as exc:
+        log.debug("early probe %s: %s", ticker, exc)
+        markets = []
+    if _markets_usable(markets):
+        return {"event_ticker": ticker}, "early_probe"
+
+    try:
+        for ev in client.get_events(C.SERIES, status="unopened"):
+            t = ev.get("event_ticker") or ""
+            if clock.event_date_from_ticker(t) == date_str:
+                return ev, "unopened_listing"
+    except Exception as exc:
+        log.debug("unopened scan: %s", exc)
+
+    try:
+        events = client.get_events(C.SERIES, status="open")
+    except Exception as exc:
+        log.debug("open scan: %s", exc)
+        events = []
+    return pick_tonight_event(events, date_str), "open_event"
+
+
 def detect_event(client: KalshiClient | None = None) -> dict:
     """Record first sighting. Do not Telegram yet."""
     date_str = clock.today_ct()
@@ -136,10 +177,9 @@ def detect_event(client: KalshiClient | None = None) -> dict:
         return {"ok": True, "reason": "already_detected", "run": existing}
 
     client = client or KalshiClient()
-    events = client.get_events(C.SERIES, status="open")
-    event = pick_tonight_event(events, date_str)
+    event, how = find_event_early(client, date_str)
     if not event:
-        store.log_activity("no_event", f"no open {C.SERIES} event for {date_str}")
+        store.log_activity("no_event", f"no {C.SERIES} event for {date_str} (checked early probe, unopened listing, open events)")
         return {"ok": False, "reason": "no_event"}
 
     markets = snapshot_markets(client, event)
@@ -172,9 +212,15 @@ def detect_event(client: KalshiClient | None = None) -> dict:
     store.insert_markets(run["id"], date_str, event["event_ticker"], words)
     store.log_activity(
         "detected",
-        f"{event['event_ticker']} n={len(words)} send_at={clock.fmt(send_at)}",
+        f"{event['event_ticker']} n={len(words)} send_at={clock.fmt(send_at)} how={how}",
     )
-    return {"ok": True, "reason": "detected", "run": store.get_run_for_date(date_str), "n": len(words)}
+    if how == "early_probe":
+        notify.send(
+            f"👀 Found tonight's event early (listed, not yet open for trading): "
+            f"{event['event_ticker']}, {len(words)} words.",
+            quiet=True,
+        )
+    return {"ok": True, "reason": "detected", "run": store.get_run_for_date(date_str), "n": len(words), "how": how}
 
 
 def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> dict:
@@ -552,6 +598,14 @@ def poll_once() -> dict:
         fills_tick()
     except Exception:
         log.exception("fills_tick")
+    try:
+        scalp.tick()
+    except Exception:
+        log.exception("scalp_tick")
+    try:
+        live.tick()  # Book L: real money, own table, own lifecycle -- see gap/live.py
+    except Exception:
+        log.exception("live_tick")
     if not clock.in_poll_window() and store.get_run_for_date(clock.today_ct()):
         expire_if_needed()
         return {"ok": True, "reason": "outside_window"}

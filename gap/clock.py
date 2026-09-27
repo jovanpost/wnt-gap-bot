@@ -128,6 +128,24 @@ def fmt(when: datetime | None) -> str:
     return when.astimezone(C.CT).strftime("%-I:%M:%S %p CT")
 
 
+def event_ticker_for_date(date_str: str, series: str | None = None) -> str:
+    """'2026-09-18' -> 'KXWORLDNEWSMENTION-26SEP18'. Stolen from wnt-nofade-bot's clock.py:
+    the deterministic ticker Kalshi will use once it lists tonight's event, which lets a
+    poller probe for it directly instead of waiting for get_events(status="open")."""
+    from . import config as C
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    return f"{series or C.SERIES}-{d.strftime('%y%b%d').upper()}"
+
+
+def event_date_from_ticker(event_ticker: str) -> str | None:
+    """'KXWORLDNEWSMENTION-26SEP18' -> '2026-09-18'. Inverse of event_ticker_for_date."""
+    try:
+        stamp = event_ticker.split("-")[1]
+        return datetime.strptime("20" + stamp, "%Y%b%d").strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
 def event_date_tokens(date_str: str) -> list[str]:
     d = datetime.strptime(date_str, "%Y-%m-%d")
     return [

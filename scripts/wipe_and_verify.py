@@ -25,13 +25,14 @@ try:
 except ImportError:
     sys.exit("pip install sqlalchemy psycopg2-binary")
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from _secrets import need_database_url  # noqa: E402
+
 DEFAULT_BAD_DAYS = ["2026-09-15", "2026-09-16"]
 
 
 def engine():
-    url = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL")
-    if not url:
-        sys.exit("Set DATABASE_URL first.")
+    url = os.environ.get("SUPABASE_DB_URL") or need_database_url()
     return create_engine(url)
 
 

@@ -134,9 +134,13 @@ def apply_slice(order: dict, book: dict, now: datetime | None = None) -> dict[st
         if took <= 0:
             took = 0.0
     if took > 0:
+        first_fill = already <= 1e-9   # this is the increment that takes it from 0 to positive
         already = already + took
         remaining = max(0.0, intended - already)
-        store.update_order(order["id"], filled_contracts=round(already, 4))
+        fields = {"filled_contracts": round(already, 4)}
+        if first_fill:
+            fields["first_fill_at"] = now
+        store.update_order(order["id"], **fields)
         store.set_state(POLL_KEY.format(oid=order["id"]), now.isoformat())
         order["filled_contracts"] = already
         store.log_activity(

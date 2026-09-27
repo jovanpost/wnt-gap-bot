@@ -17,6 +17,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from _secrets import need_database_url  # noqa: E402
+need_database_url()  # hidden prompt -- must run before `gap` is imported
+
 from gap import rebook, store  # noqa: E402
 
 

@@ -31,6 +31,8 @@ SCHEMA_FILE = Path(__file__).resolve().parent.parent / "sql" / "001_gap_schema.s
 MIGRATION_FILES = [
     Path(__file__).resolve().parent.parent / "sql" / "005_v151.sql",
     Path(__file__).resolve().parent.parent / "sql" / "006_lab.sql",
+    Path(__file__).resolve().parent.parent / "sql" / "007_v1510.sql",
+    Path(__file__).resolve().parent.parent / "sql" / "008_book_l.sql",
 ]
 
 
@@ -822,3 +824,219 @@ def update_frozen_quote(run_id: int, ticker: str, valid: bool, reason: str | Non
 def set_order_placed_at(order_id: int, ts) -> None:
     with engine().begin() as conn:
         conn.execute(text("update gap_orders set placed_at = :t where id = :id"), {"t": ts, "id": order_id})
+
+
+# ---------------------------------------------------------------------------
+# v1.5.10 A: SCALP batches
+# ---------------------------------------------------------------------------
+def insert_scalp_batch(row: dict) -> dict:
+    with engine().begin() as conn:
+        r = conn.execute(
+            text("""
+                insert into gap_scalp_batches
+                    (run_id, event_date, market_ticker, word, grok_probability,
+                     buy_at, buy_price_cents, buy_contracts, buy_cost_cents, buy_fee_cents, status)
+                values (:run_id, :event_date, :market_ticker, :word, :grok_probability,
+                        :buy_at, :buy_price_cents, :buy_contracts, :buy_cost_cents, :buy_fee_cents, 'resting_sell')
+                returning *
+            """),
+            row,
+        ).mappings().first()
+    return dict(r)
+
+
+def update_scalp_batch(batch_id: int, **fields) -> None:
+    if not fields:
+        return
+    sets = ", ".join(f"{k} = :{k}" for k in fields)
+    with engine().begin() as conn:
+        conn.execute(text(f"update gap_scalp_batches set {sets} where id = :id"), {**fields, "id": batch_id})
+
+
+def scalp_batches_for_run(run_id: int) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_scalp_batches where run_id = :r order by buy_at asc"), {"r": run_id},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def scalp_batches_open(run_id: int) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_scalp_batches where run_id = :r and status = 'resting_sell' order by buy_at asc"),
+            {"r": run_id},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def scalp_batches_between(start: str, end: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_scalp_batches where event_date between :a and :b order by buy_at asc"),
+            {"a": start, "b": end},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Book L: LIVE real-money orders. Own table (gap_l_orders), never touched by
+# the paper delete/reinsert path in pipeline.book_from_forecasts. Append-only
+# in spirit: rows are only ever inserted once (unique on event_date+ticker,
+# and again on client_order_id) and then updated in place as fills/cancels/
+# settlement happen.
+# ---------------------------------------------------------------------------
+
+def l_order_exists(event_date: str, market_ticker: str) -> bool:
+    with engine().connect() as conn:
+        row = conn.execute(
+            text("select id from gap_l_orders where event_date = cast(:d as date) and market_ticker = :t"),
+            {"d": event_date, "t": market_ticker},
+        ).mappings().first()
+    return row is not None
+
+
+def l_insert_order(row: dict) -> dict:
+    with engine().begin() as conn:
+        r = conn.execute(
+            text("""
+                insert into gap_l_orders (
+                    event_date, market_ticker, word, forecast_id, run_id, side,
+                    limit_price_cents, our_price_cents, contracts, cost_cents, gap_points,
+                    quote_bid_cents, quote_ask_cents, quote_captured_at,
+                    client_order_id, status, placed_at, cancel_deadline_at
+                ) values (
+                    cast(:event_date as date), :market_ticker, :word, :forecast_id, :run_id, :side,
+                    :limit_price_cents, :our_price_cents, :contracts, :cost_cents, :gap_points,
+                    :quote_bid_cents, :quote_ask_cents, :quote_captured_at,
+                    :client_order_id, :status, :placed_at, :cancel_deadline_at
+                )
+                on conflict (event_date, market_ticker) do nothing
+                returning *
+            """),
+            row,
+        ).mappings().first()
+    return dict(r) if r else {}
+
+
+def l_update_order(order_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    assignments = []
+    params: dict[str, Any] = {"id": order_id}
+    for i, (k, v) in enumerate(fields.items()):
+        key = f"p{i}"
+        assignments.append(f"{k} = :{key}")
+        params[key] = v
+    with engine().begin() as conn:
+        conn.execute(text(f"update gap_l_orders set {', '.join(assignments)} where id = :id"), params)
+
+
+def l_orders_for_date(event_date: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_l_orders where event_date = cast(:d as date) order by id asc"),
+            {"d": event_date},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def l_orders_open() -> list[dict]:
+    """Every L order that might still need a fill-poll or a cancel: not yet settled,
+    cancelled, expired or rejected."""
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("""
+                select * from gap_l_orders
+                where status not in ('settled', 'cancelled', 'expired', 'rejected')
+                order by placed_at asc
+            """),
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def l_orders_between(start: str, end: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_l_orders where event_date between :a and :b order by event_date asc, id asc"),
+            {"a": start, "b": end},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def l_orders_unsettled_for_settlement() -> list[dict]:
+    """Orders with a real fill that haven't been marked settled yet -- settle.py-style
+    sweep target for Book L."""
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("""
+                select * from gap_l_orders
+                where filled_contracts > 0 and status != 'settled'
+                order by event_date asc
+            """),
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def l_weekly_row(iso_week: str) -> dict | None:
+    with engine().connect() as conn:
+        row = conn.execute(
+            text("select * from gap_l_weekly where iso_week = :w"), {"w": iso_week},
+        ).mappings().first()
+    return dict(row) if row else None
+
+
+def l_weekly_add(iso_week: str, net_cents: int, trades: int = 1) -> dict:
+    with engine().begin() as conn:
+        r = conn.execute(
+            text("""
+                insert into gap_l_weekly (iso_week, net_cents, trades, updated_at)
+                values (:w, :n, :t, now())
+                on conflict (iso_week) do update set
+                    net_cents = gap_l_weekly.net_cents + excluded.net_cents,
+                    trades = gap_l_weekly.trades + excluded.trades,
+                    updated_at = now()
+                returning *
+            """),
+            {"w": iso_week, "n": net_cents, "t": trades},
+        ).mappings().first()
+    return dict(r)
+
+
+def l_weekly_pause(iso_week: str, reason: str) -> None:
+    with engine().begin() as conn:
+        conn.execute(
+            text("""
+                insert into gap_l_weekly (iso_week, paused, paused_at, paused_reason, updated_at)
+                values (:w, true, now(), :r, now())
+                on conflict (iso_week) do update set
+                    paused = true, paused_at = now(), paused_reason = :r, updated_at = now()
+            """),
+            {"w": iso_week, "r": reason},
+        )
+
+
+def l_weekly_unpause(iso_week: str) -> None:
+    with engine().begin() as conn:
+        conn.execute(
+            text("""
+                update gap_l_weekly set paused = false, paused_reason = null, updated_at = now()
+                where iso_week = :w
+            """),
+            {"w": iso_week},
+        )
+
+
+def l_weekly_between(start_week: str, end_week: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select * from gap_l_weekly where iso_week between :a and :b order by iso_week asc"),
+            {"a": start_week, "b": end_week},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def l_weekly_all() -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(text("select * from gap_l_weekly order by iso_week asc")).mappings().all()
+    return [dict(r) for r in rows]

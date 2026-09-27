@@ -253,4 +253,20 @@ def order_for_rule(rule: str, probability: int, bid: int | None, ask: int | None
         return d
     if rule == "edge_exec":
         return decide_exec(p, int(bid), int(ask), notional=notional)
+    if rule == "fade15_gate30_no":
+        # Book L (LIVE, real money). Deliberately NOT a new idea: this is the exact
+        # membership test for the pre-registered paper slice K (side=NO, Grok<=30,
+        # valid quote, |Grok-mid| strictly >15), just evaluated live instead of as a
+        # filter on Book A's paper fills after the fact. No new logic here on purpose.
+        mid = ((int(bid) + int(ask)) / 2.0) / 100.0
+        d = decide(p, mid, int(bid), int(ask), notional=notional)
+        if not d:
+            return None
+        if d["side"] != "NO":
+            return None
+        if p > 30:
+            return None
+        if not d.get("our_price_cents"):
+            d["our_price_cents"] = our_price_cents(d["side"], d["yes_price_cents"])
+        return d
     return None
