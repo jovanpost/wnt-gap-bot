@@ -578,7 +578,7 @@ with tab_k:
                                            "net $": st.column_config.NumberColumn(format="$%+.2f")})
                         tripped = worst["net"] < -C.L_CIRCUIT_BREAKER_WEEKLY_LOSS
                         show_note(md, "warning" if tripped else "info",
-                            f"Worst week at $10/word so far: {worst['week']} at ${worst['net']:+.2f} ({worst['trades']} trades). "
+                            f"Worst week at $10/word so far: {worst['scope']} at ${worst['net']:+.2f} ({worst['trades']} trades). "
                             f"Circuit breaker trips at -${C.L_CIRCUIT_BREAKER_WEEKLY_LOSS:g}/week -- "
                             + (f"K's worst real week on record already exceeds that, so the breaker would have tripped."
                                if tripped else "that threshold has never been touched by K's real history yet.")

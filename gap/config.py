@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.6.3"  # Book L fast-arm: ported nofade-bot's watch-until-active pattern (own thread, sub-second probe, give-up fallback to the normal 30s loop) instead of trusting open_time alone
+VERSION = "wnt-gap-v1.6.4"  # fix: K-weekly-table crash (worst['week'] -> worst['scope'], pre-existing v1.6.1 bug, unrelated to the fast-arm work)
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
