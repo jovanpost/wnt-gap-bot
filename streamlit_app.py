@@ -154,8 +154,22 @@ def boot():
             # load 6x.
             time.sleep(30)
 
+    def _l_fast_watch_loop():
+        # Book L's real-money fast path, its own dedicated thread separate from
+        # _poll_loop above -- same two-thread shape as wnt-nofade-bot's
+        # runner/collector split. Mostly a no-op DB read; only starts hitting
+        # Kalshi once tonight's real open_time is close (see live.fast_arm_watch_tick).
+        while True:
+            try:
+                live.fast_arm_watch_tick()
+            except Exception:
+                logging.getLogger("gap.l_fast").exception("fast_arm_watch_tick")
+            time.sleep(1)
+
     t = threading.Thread(target=_poll_loop, name="gap-poll", daemon=True)
     t.start()
+    t2 = threading.Thread(target=_l_fast_watch_loop, name="gap-l-fast-watch", daemon=True)
+    t2.start()
     return {"started_at": clock.now_ct().isoformat()}
 
 

@@ -440,6 +440,32 @@ def event_open_at(event: dict | None, markets: list[dict] | None = None) -> date
     return None
 
 
+def resolve_real_open(client: "KalshiClient", event_ticker: str, event_date: str) -> datetime | None:
+    """The REAL Kalshi open time for tonight's event, read from the API itself
+    (get_markets -> open_time/open_ts/start_time), never a guessed clock string.
+    Kalshi's own open time moves night to night -- sometimes before 12:30 CT,
+    sometimes after -- so nothing that gates real order placement should assume
+    a fixed time. Cached in gap_state once found (per event_date) so repeated
+    poll ticks don't re-hit the API; returns None (meaning: not known yet, keep
+    waiting) until Kalshi has actually published it for this event."""
+    from . import store  # local import: store has no dependency on this module
+
+    key = f"real_open_at:{event_date}"
+    cached = store.get_state(key)
+    if cached and cached.get("iso"):
+        dt = _parse_ts(cached["iso"])
+        if dt is not None:
+            return dt
+    try:
+        markets = client.get_markets(event_ticker)
+    except Exception:
+        markets = []
+    dt = event_open_at({"event_ticker": event_ticker}, markets)
+    if dt is not None:
+        store.set_state(key, {"iso": dt.isoformat()})
+    return dt
+
+
 def market_result(market: dict) -> str | None:
     """Official YES/NO from Kalshi only. Never infer from last price."""
     for key in ("result", "settlement_result", "market_result"):

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from . import clock, config as C, fills, live, notify, parser, prompt, quotes, scalp, settle, store, strategy
 from .kalshi import (
     KalshiClient,
+    resolve_real_open,
     uniquify_words,
     word_from_market,
 )
@@ -505,12 +506,19 @@ def _book_summary(saved, booked, expected, notes: list[str] | None = None) -> st
     return "\n".join(lines)
 
 
-def book_waiting_if_due() -> None:
+def book_waiting_if_due(client: KalshiClient | None = None) -> None:
     date_str = clock.today_ct()
-    if clock.before_decision(date_str):
-        return
     run = store.get_run_for_date(date_str)
     if not run or run.get("status") != "parsed_waiting_decision":
+        return
+    client = client or KalshiClient()
+    real_open = resolve_real_open(client, run["event_ticker"], date_str)
+    if real_open is None:
+        # Kalshi hasn't published tonight's real open time yet -- wait for it
+        # rather than guessing. find_event_early()'s poll will keep retrying.
+        return
+    gate = real_open + timedelta(minutes=C.DECISION_LAG_MIN)
+    if clock.now_ct() < gate.astimezone(C.CT):
         return
     forecasts = store.forecasts_for_run(run["id"])
     notes: list[str] = []

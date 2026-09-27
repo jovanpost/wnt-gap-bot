@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.6.1"  # v1.6.0 + Book L cancels at 5:29 CT like every paper book, $ markdown fix, K weekly P&L table
+VERSION = "wnt-gap-v1.6.3"  # Book L fast-arm: ported nofade-bot's watch-until-active pattern (own thread, sub-second probe, give-up fallback to the normal 30s loop) instead of trusting open_time alone
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -205,6 +205,19 @@ L_MAX_WORDS_PER_NIGHT = int(_num("L_MAX_WORDS_PER_NIGHT", 5))  # first N qualify
 L_CIRCUIT_BREAKER_WEEKLY_LOSS = float(_num("L_CIRCUIT_BREAKER_WEEKLY_LOSS", 30.0))
 L_FREEZE_MIN_FILLED = int(_num("L_FREEZE_MIN_FILLED", 30))
 L_FREEZE_WEEKS = int(_num("L_FREEZE_WEEKS", 6))
+# Fast-arm watch: same technique wnt-nofade-bot's _fast_arm/_fast_wait_and_watch
+# use (see its wnt/config.py FAST_* knobs) -- these are the same values,
+# just under an L_ prefix since only Book L uses them here. Starting this many
+# seconds before Kalshi's own published open_time, gap/live.py's dedicated
+# watch thread polls the real market status every L_FAST_WATCH_SECONDS and
+# fires the instant it reports active, instead of waiting on the regular 30s
+# poll loop. Gives up after L_FAST_GIVE_UP_SECONDS past open_time and falls
+# back to arm_tonight() on the normal loop (already gated on the same real
+# open time), exactly like nofade's own fallback to its "normal path".
+L_FAST_LEAD_SECONDS = float(_num("L_FAST_LEAD_SECONDS", 3.0))
+L_FAST_WATCH_SECONDS = float(_num("L_FAST_WATCH_SECONDS", 0.3))
+L_FAST_GIVE_UP_SECONDS = float(_num("L_FAST_GIVE_UP_SECONDS", 180.0))
+L_FAST_MAX_WORKERS = int(_num("L_FAST_MAX_WORKERS", 5))
 # L cancels at 5:29 CT (SHOW_CANCEL_CT below), the SAME cancel every paper book
 # (A/B/E/F/G/H/I) now uses -- one cancel time for every strategy, paper and live.
 # See gap/live.py's arm_tonight(), which computes this deadline the same way
