@@ -8,9 +8,10 @@ on:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - name: Curl ping
+      - name: Curl ping first
+        id: curl
         env:
           APP_URL: ${{ vars.APP_URL }}
         run: |
@@ -19,9 +20,56 @@ jobs:
           BASE="${BASE%/}"
           URL="${BASE}/?ping=true"
           echo "curl $URL"
-          CODE="$(curl -sS -o /dev/null -w "%{http_code}" \
-            --max-time 25 --max-redirs 0 \
-            -A "Mozilla/5.0 wnt-gap-keepalive" \
-            "$URL" || true)"
-          echo "http $CODE"
+          BODY="$(curl -sS -L --max-time 25 -w "\n%{http_code}" "$URL" || true)"
+          CODE="$(echo "$BODY" | tail -n1)"
+          TEXT="$(echo "$BODY" | sed '$d' | tr -d '\r' | tail -c 200)"
+          echo "http=$CODE"
+          echo "body=$TEXT"
+          if [ "$CODE" = "200" ] && echo "$TEXT" | grep -qiE '(^|[^a-z])(ok|alive)([^a-z]|$)'; then
+            echo "awake=true" >> "$GITHUB_OUTPUT"
+            echo "app is awake"
+            exit 0
+          fi
+          echo "awake=false" >> "$GITHUB_OUTPUT"
+          echo "curl miss — will try Playwright without Google apt"
           exit 0
+
+      - uses: actions/checkout@v4
+        if: steps.curl.outputs.awake != 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.curl.outputs.awake != 'true'
+        with:
+          node-version: "20"
+
+      - name: Playwright bundled Chromium (no --with-deps)
+        if: steps.curl.outputs.awake != 'true'
+        run: |
+          npm install playwright
+          npx playwright install chromium
+
+      - name: Wake the sleeping app
+        if: steps.curl.outputs.awake != 'true'
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          node -e '
+          const { chromium } = require("playwright");
+          (async () => {
+            const url = (process.env.APP_URL || "https://wnt-gap-bot.streamlit.app/")
+              .replace(/\/$/, "") + "/?ping=true";
+            const browser = await chromium.launch();
+            const page = await browser.newPage();
+            console.log("pinging " + url);
+            await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+            await page.waitForTimeout(6000);
+            const wake = page.getByRole("button", { name: /get this app back up/i });
+            if (await wake.count()) {
+              console.log("app was asleep, waking it");
+              await wake.first().click();
+              await page.waitForTimeout(20000);
+            }
+            console.log("done");
+            await browser.close();
+          })();
+          '
