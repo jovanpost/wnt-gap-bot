@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.6.4"  # fix: K-weekly-table crash (worst['week'] -> worst['scope'], pre-existing v1.6.1 bug, unrelated to the fast-arm work)
+VERSION = "wnt-gap-v1.6.5"  # add scripts/verify_live_api.py: read-only Book L pre-flight check (key/balance/resting orders/today's markets/storage backend)
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
