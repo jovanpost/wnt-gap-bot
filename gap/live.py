@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from . import clock, config as C, notify, store, strategy
 from .fees import fee_cents, hold_pnl_cents
 from .fills import _show_cancel_utc  # same 5:29 CT deadline every paper book now uses
-from .kalshi import KalshiClient, KalshiError, market_result, resolve_real_open
+from .kalshi import KalshiClient, KalshiError, book_metrics, market_result, resolve_real_open
 from .lab import verdict, wilson
 
 log = logging.getLogger("gap.live")
@@ -152,6 +152,32 @@ def _armed_key(event_date: str) -> str:
     return f"l_armed:{event_date}"
 
 
+def l_client_order_id(event_date: str, ticker: str, decision: dict) -> str:
+    """Kalshi's v2 order endpoint wants a UUID client_order_id -- nofade learned this on its
+    first live day (Sep 9) and switched to uuid5. Deterministic per (night, ticker, price,
+    size) exactly like nofade's, so a retry is refused by Kalshi as a duplicate instead of
+    resting a second real order."""
+    seed = (f"gapL|{event_date}|{ticker}|{int(decision['our_price_cents'])}|"
+            f"{float(decision['contracts']):.2f}|v2")
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+
+
+def _looks_like_duplicate(exc: Exception) -> bool:
+    """Same test as nofade's strategy._looks_like_duplicate."""
+    text = str(getattr(exc, "body", "") or exc).lower()
+    return "already_exist" in text or "already exist" in text or "duplicate" in text
+
+
+def _find_resting_by_coid(client: KalshiClient, coid: str) -> str | None:
+    try:
+        for o in client.get_resting_orders(series_prefix=C.SERIES):
+            if str(o.get("client_order_id") or "") == coid and o.get("order_id"):
+                return str(o["order_id"])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("L resting-order lookup failed: %s", exc)
+    return None
+
+
 def _prepare_l_night(run: dict) -> dict:
     """All the early gates + candidate selection for tonight, no order calls.
     Shared by arm_tonight() (the normal-path fallback) and fast_arm_watch_tick()
@@ -201,7 +227,21 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
         ticker = f["market_ticker"]
         if store.l_order_exists(date_str, ticker):
             return None
-        coid = f"gapL-{date_str}-{ticker}-{uuid.uuid4().hex[:8]}"
+        coid = l_client_order_id(date_str, ticker, d)
+        yes_limit = int(d["yes_price_cents"])
+
+        # Same take-if-cheap step as nofade's _place_one: if YES bids at or above our
+        # sell-YES limit are ALREADY on the book, a post_only order would be refused by
+        # Kalshi. Paper K counts that liquidity as filled on arrival, so L takes it too.
+        take_now = False
+        if C.L_TAKE_IF_ALREADY_CHEAP:
+            try:
+                book = client.get_orderbook(ticker, depth=10)
+                take_now = float(book_metrics(book, yes_limit).get("yes_size_that_would_fill_sell") or 0) > 0
+            except Exception as exc:  # noqa: BLE001
+                log.debug("L take-if-cheap book %s failed: %s", ticker, exc)
+        post_only = bool(C.POST_ONLY) and not take_now
+
         row = {
             "event_date": date_str,
             "market_ticker": ticker,
@@ -209,7 +249,7 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
             "forecast_id": f.get("id"),
             "run_id": run["id"],
             "side": d["side"],
-            "limit_price_cents": d["yes_price_cents"],
+            "limit_price_cents": yes_limit,
             "our_price_cents": int(d["our_price_cents"]),
             "contracts": d["contracts"],
             "cost_cents": d["cost_cents"],
@@ -222,27 +262,44 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
             "placed_at": placed_at,
             "cancel_deadline_at": deadline,
         }
+        # Claim the (night, ticker) row FIRST. The unique index lets exactly one caller win,
+        # so the fast-watch thread and the 30s poll thread can never both send a real order
+        # for the same word. Only the winner talks to Kalshi.
+        saved = store.l_insert_order(row)
+        if not saved:
+            return None
         try:
             resp = client.create_no_order(
                 ticker=ticker,
                 no_price_cents=int(d["our_price_cents"]),
                 count=d["contracts"],
                 client_order_id=coid,
-                post_only=C.POST_ONLY,
+                post_only=post_only,
                 expiration_epoch=int(deadline.timestamp()) if C.USE_SERVER_SIDE_EXPIRY else None,
             )
         except KalshiError as exc:
-            row["status"] = "rejected"
-            row["reject_reason"] = f"{exc.status}: {exc.body[:300]}"
-            store.l_insert_order(row)
-            log.warning("L order rejected for %s: %s", ticker, row["reject_reason"])
+            reason = f"{exc.status}: {exc.body[:300]}"
+            found = _find_resting_by_coid(client, coid) if _looks_like_duplicate(exc) else None
+            if found:
+                store.l_update_order(saved["id"], kalshi_order_id=found, status="resting",
+                                     reject_reason=f"duplicate on send, adopted resting order: {reason}"[:400])
+                return ("placed", f["word"])
+            store.l_update_order(saved["id"], status="rejected", reject_reason=reason)
+            log.warning("L order rejected for %s: %s", ticker, reason)
             return ("rejected", f["word"])
-        saved = store.l_insert_order(row)
-        if not saved:
-            return None  # unique index caught a race; another tick already placed it
+        except Exception as exc:  # noqa: BLE001  network error: the order MAY exist on Kalshi
+            found = _find_resting_by_coid(client, coid)
+            if found:
+                store.l_update_order(saved["id"], kalshi_order_id=found, status="resting",
+                                     reject_reason=f"send error, adopted resting order: {exc}"[:400])
+                return ("placed", f["word"])
+            store.l_update_order(saved["id"], status="rejected",
+                                 reject_reason=f"send error, nothing resting found: {exc}"[:400])
+            log.warning("L order send error for %s: %s", ticker, exc)
+            return ("rejected", f["word"])
         fields = {"kalshi_order_id": resp.get("order_id"), "status": "resting"}
         if resp.get("fill_count"):
-            fields["status"] = "filled" if resp["fill_count"] >= float(d["contracts"]) else "partially_filled"
+            fields["status"] = "filled" if resp["fill_count"] >= float(d["contracts"]) - 1e-6 else "partially_filled"
             fields["filled_contracts"] = resp["fill_count"]
             fields["avg_fill_price_cents"] = resp.get("avg_fill_price_cents") or int(d["our_price_cents"])
             fields["first_fill_at"] = _now()
@@ -289,13 +346,15 @@ def arm_tonight(run: dict) -> dict:
     date_str = prep["date_str"]
     if not prep["ready"]:
         reason = prep.get("reason", "not_ready")
-        if reason in ("l_live_off", "circuit_breaker"):
+        # v1.6.6: "l_live_off" no longer writes the armed flag. Before, if the app ran with
+        # L_LIVE_ON=false after tonight's run existed, the night was locked as "armed" and flipping
+        # L_LIVE_ON=true later that day placed nothing.
+        if reason == "circuit_breaker":
             store.set_state(_armed_key(date_str), {"armed_at": _now().isoformat(), "reason": reason})
-            if reason == "circuit_breaker":
-                store.log_activity(
-                    "l_skip_night",
-                    f"{date_str}: circuit breaker active for {prep.get('week')}, no L orders tonight",
-                )
+            store.log_activity(
+                "l_skip_night",
+                f"{date_str}: circuit breaker active for {prep.get('week')}, no L orders tonight",
+            )
         return {"ok": True, "reason": reason}
 
     client = _client()
@@ -408,40 +467,70 @@ def _to_cents(v):
     return int(round(d))
 
 
+def _fill_no_cents(fill: dict, fallback: int) -> int:
+    """NO cents paid on one fill. Same field order nofade's poll_fills uses."""
+    price = _to_cents(fill.get("no_price_dollars") or fill.get("no_price") or fill.get("price"))
+    if price is None and fill.get("yes_price_dollars") is not None:
+        yes_px = _to_cents(fill.get("yes_price_dollars"))
+        if yes_px is not None:
+            price = max(1, 100 - yes_px)
+    return int(price) if price is not None else int(fallback)
+
+
 def poll_fills_tick() -> None:
+    """v1.6.6 rewrite. Matches fills to OUR order by Kalshi order_id (not by ticker: nofade
+    rests NO on every word from the same account, so a ticker match counted its fills as
+    L's). And it SETS the total from the full list of that order's fills instead of adding
+    every fill again on every 30s tick (the old code re-added the same fill each tick until
+    a partial fill looked like a full one)."""
     open_orders = [o for o in store.l_orders_open() if o.get("kalshi_order_id")]
     if not open_orders:
         return
     client = _client()
-    try:
-        recent = client.get_fills(limit=200)
-    except Exception as exc:
-        log.warning("L fill poll failed: %s", exc)
-        return
-    by_ticker = {o["market_ticker"]: o for o in open_orders}
-    for fill in recent:
-        ticker = fill.get("ticker") or fill.get("market_ticker")
-        order = by_ticker.get(ticker)
-        if not order:
+    by_oid = {str(o["kalshi_order_id"]): o for o in open_orders}
+    tickers = sorted({o["market_ticker"] for o in open_orders})
+    totals: dict[str, dict] = {}
+    for ticker in tickers:
+        try:
+            fills = client.get_fills(ticker=ticker, limit=200)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("L fill poll failed for %s: %s", ticker, exc)
             continue
-        count = _to_count(fill.get("count_fp") or fill.get("count"))
-        price = _to_cents(fill.get("no_price_dollars") or fill.get("no_price") or fill.get("price"))
-        if not count or price is None:
-            continue
+        for fill in fills:
+            oid = str(fill.get("order_id") or "")
+            order = by_oid.get(oid)
+            if not order:
+                continue
+            fid = str(fill.get("trade_id") or fill.get("fill_id")
+                      or f"{oid}-{fill.get('created_time')}-{fill.get('count_fp') or fill.get('count')}")
+            t = totals.setdefault(oid, {"seen": set(), "count": 0.0, "cost": 0.0, "first": None})
+            if fid in t["seen"]:
+                continue
+            t["seen"].add(fid)
+            count = _to_count(fill.get("count_fp") or fill.get("count"))
+            if count <= 0:
+                continue
+            px = _fill_no_cents(fill, int(order.get("our_price_cents") or 0))
+            t["count"] += count
+            t["cost"] += count * px
+            created = fill.get("created_time")
+            if created and (t["first"] is None or str(created) < str(t["first"])):
+                t["first"] = created
+    for oid, t in totals.items():
+        order = by_oid[oid]
         already = float(order.get("filled_contracts") or 0)
         intended = float(order.get("contracts") or 0)
-        new_total = min(intended, already + count) if already + count > intended else already + count
+        new_total = min(t["count"], intended) if intended > 0 else t["count"]
         if new_total <= already + 1e-9:
-            continue
-        prev_cost = already * float(order.get("avg_fill_price_cents") or price)
-        added_cost = (new_total - already) * price
-        avg_px = (prev_cost + added_cost) / new_total if new_total > 0 else price
+            continue  # never move backwards; nothing new
+        avg_px = t["cost"] / t["count"] if t["count"] > 0 else float(order.get("our_price_cents") or 0)
         fields = {"filled_contracts": round(new_total, 4), "avg_fill_price_cents": int(round(avg_px))}
         if not order.get("first_fill_at"):
             fields["first_fill_at"] = _now()
-        fields["status"] = "filled" if new_total >= intended - 1e-6 else "partially_filled"
+        if order.get("status") not in ("cancelled", "expired"):
+            fields["status"] = "filled" if new_total >= intended - 1e-6 else "partially_filled"
         store.l_update_order(order["id"], **fields)
-        log.info("L fill: %s %.2f @ %dc (total %.2f/%.2f)", ticker, count, price, new_total, intended)
+        log.info("L fill: %s %.2f/%.2f @ %.1fc", order["market_ticker"], new_total, intended, avg_px)
 
 
 # ---------------------------------------------------------------------------
@@ -482,11 +571,13 @@ def cancel_if_due_tick() -> None:
         except Exception as exc:
             log.warning("L cancel failed for %s: %s", oid, exc)
             ok = False
-        fields = {"cancel_requested_at": now}
+        # v1.6.6: only stamp cancel_requested_at once Kalshi confirmed. Before, a failed
+        # cancel was stamped too, and the "already asked" check above then skipped it forever.
         if ok:
-            fields["cancel_confirmed_at"] = now
-            fields["status"] = "partially_filled" if float(order.get("filled_contracts") or 0) > 0 else "cancelled"
-        store.l_update_order(order["id"], **fields)
+            store.l_update_order(
+                order["id"], cancel_requested_at=now, cancel_confirmed_at=now,
+                status="partially_filled" if float(order.get("filled_contracts") or 0) > 0 else "cancelled",
+            )
         store.log_activity(
             "l_cancel",
             f"{order['event_date']} {order['market_ticker']}: cancel at 5:29 CT "

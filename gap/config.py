@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.6.5"  # add scripts/verify_live_api.py: read-only Book L pre-flight check (key/balance/resting orders/today's markets/storage backend)
+VERSION = "wnt-gap-v1.6.6"  # Book L: UUID order ids, claim-before-send, fills by order_id, take-if-cheap, cancel retry
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -218,6 +218,10 @@ L_FAST_LEAD_SECONDS = float(_num("L_FAST_LEAD_SECONDS", 3.0))
 L_FAST_WATCH_SECONDS = float(_num("L_FAST_WATCH_SECONDS", 0.3))
 L_FAST_GIVE_UP_SECONDS = float(_num("L_FAST_GIVE_UP_SECONDS", 180.0))
 L_FAST_MAX_WORKERS = int(_num("L_FAST_MAX_WORKERS", 5))
+# Same meaning as nofade's TAKE_IF_ALREADY_CHEAP: if YES bids at/above our sell-YES limit are
+# already on the book when L sends, send without post_only (Kalshi would refuse a post_only
+# order that crosses). Paper K counts that liquidity as filled on arrival.
+L_TAKE_IF_ALREADY_CHEAP = _flag("L_TAKE_IF_ALREADY_CHEAP", True)
 # L cancels at 5:29 CT (SHOW_CANCEL_CT below), the SAME cancel every paper book
 # (A/B/E/F/G/H/I) now uses -- one cancel time for every strategy, paper and live.
 # See gap/live.py's arm_tonight(), which computes this deadline the same way
