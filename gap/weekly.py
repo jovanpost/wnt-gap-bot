@@ -1984,7 +1984,7 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines.append(" 5 Fill-selection check    10 Rules and settings")
     lines.append(" 4B BOOK K, K_HIGH, K_LOW for A and B, A-vs-B  4C fills by Grok bucket  4D capacity, segment frequency, size sweep, long-rest shadow")
     lines.append(" 4E STRATEGY LAB: report-only variants taken at market, grid, growth check   4F BOOK M vs K_HIGH")
-    lines.append(" 4G FILL TIMING (adverse selection)   4H SCALP: buy<=70c / sell 85c / fallback at 5:29")
+    lines.append(f" 4G FILL TIMING (adverse selection)   4H SCALP: buy<=70c / sell 85c / market-sell at {C.SCALP_FALLBACK_HHMM}")
     lines.append(" 4I BOOK L (LIVE, real money): same rule as K, side by side")
 
     _hdr(lines, "1. NIGHT STATUS")

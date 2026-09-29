@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.7.1"  # Ledger tab (day/week), SCALP full times + fallback walks the book, L fills only from Kalshi fill list
+VERSION = "wnt-gap-v1.7.2"  # SCALP: last buy 16:30 CT, market-sell everything left from 17:00 CT
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -148,8 +148,8 @@ SCALP_QUALIFY_PROB = int(_num("SCALP_QUALIFY_PROB", 70))     # Grok >= this to q
 SCALP_BUY_MAX_CENTS = int(_num("SCALP_BUY_MAX_CENTS", 70))   # buy YES any time the ask is <= this
 SCALP_SELL_CENTS = int(_num("SCALP_SELL_CENTS", 85))         # every batch rests a sell at this price
 SCALP_BUDGET_DOLLARS = float(_num("SCALP_BUDGET_DOLLARS", 100.0))  # target per word, not a guarantee
-SCALP_BUY_CUTOFF_HHMM = _secret("SCALP_BUY_CUTOFF_HHMM", "17:25")   # CT, stop starting new buys
-SCALP_FALLBACK_HHMM = _secret("SCALP_FALLBACK_HHMM", "17:29")       # CT, sell anything unsold at market
+SCALP_BUY_CUTOFF_HHMM = _secret("SCALP_BUY_CUTOFF_HHMM", "16:30")   # CT, last new buy (v1.7.2: was 17:25)
+SCALP_FALLBACK_HHMM = _secret("SCALP_FALLBACK_HHMM", "17:00")       # CT, sell everything unsold at market (v1.7.2: was 17:29)
 # WORD HISTORY block sent to Grok: how many past nights (0 = off).
 WORD_HISTORY_NIGHTS = int(_num("WORD_HISTORY_NIGHTS", 10))
 # Paper fills are checked every poll tick (not only when someone opens the app).

@@ -339,7 +339,7 @@ with tab_ledger:
             "sold": _ct(b.get("sell_at")), "sell ¢": b.get("sell_price_cents"),
             "sold ct": round(float(b.get("sell_contracts") or 0), 2),
             "sell fee $": round((b.get("sell_fee_cents") or 0) / 100.0, 2),
-            "how": {"scalp_hit": "sold at target", "fallback_sold": "sold at market 5:29",
+            "how": {"scalp_hit": "sold at target", "fallback_sold": f"sold at market from {C.SCALP_FALLBACK_HHMM}",
                     "resting_sell": "still waiting"}.get(b.get("status"), b.get("status")),
             "net $": None if b.get("net_cents") is None else round(b["net_cents"] / 100.0, 2),
         } for b in _sc]))

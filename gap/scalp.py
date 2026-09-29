@@ -7,12 +7,12 @@ the market catches up, never hold to settlement if it doesn't have to.
 FROZEN RULE (do not tune before 30 filled trades or 6 weeks, whichever comes first):
   qualify: Grok >= SCALP_QUALIFY_PROB (currently 70) for this word
   buy:     YES in batches, any poll where the ask is <= SCALP_BUY_MAX_CENTS (70), from
-           the decision time until SCALP_BUY_CUTOFF_HHMM (17:25 CT), walking the real
+           the decision time until SCALP_BUY_CUTOFF_HHMM (16:30 CT), walking the real
            order book, until SCALP_BUDGET_DOLLARS (100) total is spent on this word or
            the buy cutoff hits or the book has nothing left at <= 70c
   sell:    every batch gets its own resting sell the moment it fills, at SCALP_SELL_CENTS
            (85)
-  fallback: anything still unsold at SCALP_FALLBACK_HHMM (17:29 CT) sells at market
+  fallback: anything still unsold at SCALP_FALLBACK_HHMM (17:00 CT) sells at market
            (best available bid), fees included
 
 Runs automatically from the poll loop (gap/pipeline.py:poll_once), same as the other
@@ -160,8 +160,44 @@ def _bid_levels(yes_book: list) -> list[list[float]]:
     return lv
 
 
+def _fb_key(date_str: str, ticker: str) -> str:
+    return f"scalp_fb_book:{date_str}:{ticker}"
+
+
+_SHOWN: dict = {}
+
+
+def _unused_bids(date_str: str, ticker: str, levels: list[list[float]]) -> list[list[float]]:
+    """v1.7.2: YES bids the paper market-sell has NOT already used. The first look counts the
+    whole book. Every later look counts only what is NEW at each price (size above what the
+    last look showed) plus what was left unused -- so a snapshot that has not changed (no-fade
+    saves one a minute, we look every 30s) can never be sold into twice."""
+    _SHOWN[(date_str, ticker)] = {str(int(p)): float(c) for p, c in levels}
+    st = store.get_state(_fb_key(date_str, ticker)) or {}
+    if not st.get("last") and not st.get("seen"):
+        return [[p, c] for p, c in levels]
+    last = {int(k): float(v) for k, v in (st.get("last") or {}).items()}
+    avail = {int(k): float(v) for k, v in (st.get("avail") or {}).items()}
+    out = []
+    for p, size in levels:
+        fresh = max(0.0, size - last.get(p, 0.0))
+        usable = min(size, avail.get(p, 0.0) + fresh)
+        if usable > 1e-9:
+            out.append([p, usable])
+    return out
+
+
+def _save_unused(date_str: str, ticker: str, levels_left: list[list[float]]) -> None:
+    """Remember what the book showed on this look and which of those bids are still unused."""
+    store.set_state(_fb_key(date_str, ticker), {
+        "seen": True,
+        "last": _SHOWN.get((date_str, ticker), {}),
+        "avail": {str(int(p)): float(c) for p, c in levels_left},
+    })
+
+
 def _fallback_tick(run: dict, batches: list[dict], now: datetime) -> None:
-    """Unsold at 17:29 CT: sell at market. v1.7.1: walks the YES bids from the best price
+    """Unsold at SCALP_FALLBACK_HHMM (17:00 CT): sell at market. v1.7.1: walks the YES bids from the best price
     down and USES UP the size as it goes, shared by every batch of the same word, so five
     batches can no longer all 'sell' into the same bids at the best price. Whatever the book
     cannot absorb stays resting and is tried again on the next poll."""
@@ -178,7 +214,8 @@ def _fallback_tick(run: dict, batches: list[dict], now: datetime) -> None:
             except Exception as exc:
                 log.warning("scalp fallback depth %s: %s", ticker, exc)
                 snap = None
-            levels_by_ticker[ticker] = _bid_levels((snap or {}).get("yes_book") or [])
+            levels_by_ticker[ticker] = _unused_bids(run["event_date_str"], ticker,
+                                                    _bid_levels((snap or {}).get("yes_book") or []))
         levels = levels_by_ticker[ticker]
         already = float(b["sell_contracts"] or 0)
         want = float(b["buy_contracts"]) - already
@@ -210,7 +247,8 @@ def _fallback_tick(run: dict, batches: list[dict], now: datetime) -> None:
             _finish(b, fields, "fallback_sold", now)
         store.update_scalp_batch(b["id"], **fields)
         b.update(fields)
-        store.log_activity("scalp_fallback", f"{b['word']} sold {took:.2f} @ avg {px}c (fallback, unsold at 5:29)")
+        _save_unused(run["event_date_str"], ticker, levels)
+        store.log_activity("scalp_fallback", f"{b['word']} sold {took:.2f} @ avg {px}c (fallback, unsold at {C.SCALP_FALLBACK_HHMM} CT)")
 
 
 def _finish(b: dict, fields: dict, status: str, now: datetime) -> None:
