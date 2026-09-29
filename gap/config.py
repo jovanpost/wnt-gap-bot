@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.6.6"  # Book L: UUID order ids, claim-before-send, fills by order_id, take-if-cheap, cancel retry
+VERSION = "wnt-gap-v1.7.0"  # Book L = Grok+15 on Grok<=30 at the open (no market quote); paper book N mirrors it; paper quotes never frozen before the real open
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -119,6 +119,10 @@ ALL_VARIANTS = (
     # would really pay (the ask to buy YES, the bid to buy NO), not the mid. See
     # strategy.decide_exec. Threshold: EDGE_EXEC_THRESHOLD below.
     {"id": "I", "notional": 1.0, "exit": "hold", "rule": "edge_exec", "cancel": "show529", "label": "I · $1 hold edge vs ask/bid"},
+    # v1.7.0: paper twin of live Book L. Same rule, same $10 size, same 5:29 cancel, so paper
+    # vs live compares one rule. Ignores the market like G/H: every word with Grok <= L_MAX_GROK
+    # gets SELL YES at Grok + L_OFFSET_CENTS (= BUY NO at 100 - Grok - offset).
+    {"id": "N", "notional": 10.0, "exit": "hold", "rule": "grok15_no", "cancel": "show529", "label": "N · $10 paper twin of L"},
 )
 # To retire books without touching code, set the Streamlit secret DISABLED_BOOKS, e.g. "G,H".
 # Old rows stay in the database; the books just stop being booked and shown.
@@ -128,6 +132,11 @@ VARIANTS = tuple(v for v in ALL_VARIANTS if v["id"] not in DISABLED_BOOKS)
 EDGE_EXEC_THRESHOLD = int(_num("EDGE_EXEC_THRESHOLD", 10))
 # Quotes: newest depth snapshot at/before the decision time, at most this old (seconds).
 QUOTE_MAX_AGE_S = int(_num("QUOTE_MAX_AGE_S", 600))
+# v1.7.0: paper quotes are never frozen before Kalshi's real open + this many seconds (or
+# DECISION_LAG_MIN, whichever is later) -- no-fade needs a moment to save the first books.
+PAPER_MIN_AFTER_OPEN_S = int(_num("PAPER_MIN_AFTER_OPEN_S", 120))
+# ...and if no-fade has not saved ANY book for tonight yet, keep waiting up to this long.
+NO_DEPTH_GRACE_S = int(_num("NO_DEPTH_GRACE_S", 900))
 # v1.5.9: wide spreads are TRADED. 0 = no spread rule. (It was 25 in v1.5.1-v1.5.8.) Only broken quotes
 # (bid<=1, ask<=1, bid>=99, bid>ask, a missing side) are skipped. Set the secret QUOTE_MAX_SPREAD to bring a limit back.
 QUOTE_MAX_SPREAD = int(_num("QUOTE_MAX_SPREAD", 0))
@@ -186,9 +195,8 @@ USE_SERVER_SIDE_EXPIRY = _flag("USE_SERVER_SIDE_EXPIRY", True)
 USER_AGENT = f"wnt-gap-bot/{VERSION}"
 
 # ---------------------------------------------------------------------------
-# Book L: LIVE real-money trading. Mirrors Book K's exact rule (side=NO,
-# Grok<=30, valid quote, |Grok-mid| strictly >15) -- see strategy.order_for_rule's
-# "fade15_gate30_no" branch. No new signal, no new logic; only the money is real.
+# Book L: LIVE real-money trading. v1.7.0 rule "grok15_no" (see strategy.order_for_rule):
+# Grok <= L_MAX_GROK -> SELL YES at Grok + L_OFFSET_CENTS. Paper book N is its twin.
 #
 # L_LIVE_ON is a hard kill switch, default OFF. Nothing in gap/live.py places a
 # real order unless this is explicitly set to true in Streamlit secrets, in
@@ -199,6 +207,13 @@ USER_AGENT = f"wnt-gap-bot/{VERSION}"
 # comes first -- an early live read is only honest if nothing moves under it.
 # ---------------------------------------------------------------------------
 L_LIVE_ON = _flag("L_LIVE_ON", False)
+# v1.7.0 rule (replaces the Book K rule): every word with Grok <= L_MAX_GROK gets a LIMIT
+# order to SELL YES at Grok + L_OFFSET_CENTS (= BUY NO at 100 - Grok - offset). No market
+# quote is needed. The order may take right away (at the buyers' better price, paying the
+# taker fee); whatever is left rests until the 5:29 CT cancel. Lowest Grok goes first when
+# the nightly cap cannot fit every word.
+L_MAX_GROK = int(_num("L_MAX_GROK", 30))
+L_OFFSET_CENTS = int(_num("L_OFFSET_CENTS", 15))
 L_NOTIONAL_DOLLARS = float(_num("L_NOTIONAL_DOLLARS", 10.0))  # $ per word. Fixed, not a %, not scaled.
 L_NIGHTLY_CAP_DOLLARS = float(_num("L_NIGHTLY_CAP_DOLLARS", 50.0))
 L_MAX_WORDS_PER_NIGHT = int(_num("L_MAX_WORDS_PER_NIGHT", 5))  # first N qualifying words; never scaled down
@@ -218,10 +233,9 @@ L_FAST_LEAD_SECONDS = float(_num("L_FAST_LEAD_SECONDS", 3.0))
 L_FAST_WATCH_SECONDS = float(_num("L_FAST_WATCH_SECONDS", 0.3))
 L_FAST_GIVE_UP_SECONDS = float(_num("L_FAST_GIVE_UP_SECONDS", 180.0))
 L_FAST_MAX_WORKERS = int(_num("L_FAST_MAX_WORKERS", 5))
-# Same meaning as nofade's TAKE_IF_ALREADY_CHEAP: if YES bids at/above our sell-YES limit are
-# already on the book when L sends, send without post_only (Kalshi would refuse a post_only
-# order that crosses). Paper K counts that liquidity as filled on arrival.
-L_TAKE_IF_ALREADY_CHEAP = _flag("L_TAKE_IF_ALREADY_CHEAP", True)
+# v1.7.0: L orders are sent WITHOUT post_only on purpose: a limit that crosses fills at once
+# at the buyers' (better) price. L_POST_ONLY=true would make Kalshi refuse those instead.
+L_POST_ONLY = _flag("L_POST_ONLY", False)
 # L cancels at 5:29 CT (SHOW_CANCEL_CT below), the SAME cancel every paper book
 # (A/B/E/F/G/H/I) now uses -- one cancel time for every strategy, paper and live.
 # See gap/live.py's arm_tonight(), which computes this deadline the same way

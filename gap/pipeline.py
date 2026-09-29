@@ -365,9 +365,43 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
         run["id"], date_str, run["event_ticker"],
         C.HARNESS, C.PROMPT_VERSION, forecast_rows,
     )
+    # v1.7.0: paper books need a real market price, so they wait for the real open
+    # (quotes.paper_ready_at). Book L does NOT need a price: it sends at the open.
+    fz = quotes.freeze_run_quotes(run)
+    if fz.get("waiting"):
+        store.update_run(run["id"], status="parsed_waiting_decision")
+        _FROZEN_SEEN.discard(run["id"])
+        live_note = _l_after_parse(run)
+        ready = quotes.paper_ready_at(run)
+        return (
+            f"parsed {len(saved)}/{len(expected)} -- saved.\n"
+            f"Market not open yet (or no order book saved yet): paper books will book "
+            f"{'at ' + clock.fmt(ready) if ready else 'once Kalshi publishes the open time'}.\n"
+            f"{live_note}"
+        )
     notes: list[str] = []
     booked = book_from_forecasts(run, saved, notes)
-    return _book_summary(saved, booked, expected, notes)
+    summary = _book_summary(saved, booked, expected, notes)
+    return summary + "\n" + _l_after_parse(run)
+
+
+def _l_after_parse(run: dict) -> str:
+    """Try Book L right away (it no-ops unless the market is open and L is on).
+    Before the open, the fast-watch thread fires it at the open itself."""
+    if not C.L_LIVE_ON:
+        return "Book L (live): OFF"
+    try:
+        from . import live
+        out = live.arm_tonight(store.get_run_for_date(str(run["event_date"])[:10]) or run)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("L arm after parse")
+        return f"Book L (live): error {str(exc)[:120]} -- the poll loop will retry"
+    reason = out.get("reason")
+    if reason == "armed":
+        return f"Book L (live): orders sent ({len(out.get('placed') or [])} placed, {len(out.get('rejected') or [])} rejected)"
+    if reason in ("waiting_open", "waiting_market_active"):
+        return "Book L (live): ON -- orders go out the moment the market opens"
+    return f"Book L (live): {reason}"
 
 
 def _i(x):
@@ -496,7 +530,7 @@ def _book_summary(saved, booked, expected, notes: list[str] | None = None) -> st
             f"  {spec['id']} ${spec['notional']:.0f} {spec['exit']}: "
             f"{len(rows)} ({n_no} NO / {n_yes} YES) booked ${spent:.2f}"
         )
-    lines.append(f"live: {'on' if C.may_place_live() else 'off'}")
+    lines.append(f"paper books A-I, N: paper only · Book L (live real money): {'ON' if C.L_LIVE_ON else 'off'}")
     if notes:
         lines.append("")
         lines.append(f"{len(notes)} INVALID QUOTE(S) — no market-based trade on these:")
@@ -511,14 +545,10 @@ def book_waiting_if_due(client: KalshiClient | None = None) -> None:
     run = store.get_run_for_date(date_str)
     if not run or run.get("status") != "parsed_waiting_decision":
         return
-    client = client or KalshiClient()
-    real_open = resolve_real_open(client, run["event_ticker"], date_str)
-    if real_open is None:
-        # Kalshi hasn't published tonight's real open time yet -- wait for it
-        # rather than guessing. find_event_early()'s poll will keep retrying.
-        return
-    gate = real_open + timedelta(minutes=C.DECISION_LAG_MIN)
-    if clock.now_ct() < gate.astimezone(C.CT):
+    # v1.7.0: book once the real open (+ a short wait) has passed AND the quotes could be
+    # frozen from a real order book. freeze_run_quotes says "waiting" until then.
+    fz = quotes.freeze_run_quotes(run)
+    if fz.get("waiting"):
         return
     forecasts = store.forecasts_for_run(run["id"])
     notes: list[str] = []
@@ -541,6 +571,8 @@ def freeze_if_due() -> None:
     if dec is None or clock.now_ct() < dec.astimezone(C.CT):
         return
     out = quotes.freeze_run_quotes(run)
+    if out.get("waiting"):
+        return  # before the real open: try again next tick (v1.7.0)
     if out["added"]:
         store.log_activity(
             "quotes_frozen",

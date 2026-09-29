@@ -240,12 +240,10 @@ tab_live, tab_books, tab_four, tab_k, tab_l, tab_lab, tab_scalp, tab_timing, tab
 with tab_live:
     slot_live = st.container()
     md = MD("Tonight")
-    if C.PAPER:
-        show_note(md, "info", "**PAPER** — capped-sweep rows only. No Kalshi place_order.")
-    elif C.may_place_live():
-        show_note(md, "error", "**LIVE** — Phase 1 should not be here.")
-    else:
-        show_note(md, "warning", "Live flags mixed. Placement blocked.")
+    show_note(md, "warning" if C.L_LIVE_ON else "info",
+              "Paper books (A–I, N) never place orders. "
+              + ("**Book L is LIVE: real Kalshi orders** — see the L (Live) tab."
+                 if C.L_LIVE_ON else "Book L (live) is off."))
 
     st.code(C.summary())
     md.code(C.summary())
@@ -701,11 +699,9 @@ with tab_l:
               "L_LIVE_ON is off. No real orders are placed. Numbers below (if any) are from real orders placed "
               "while it was previously on.")
     show_p(md,
-        f"Same rule as Book K, no new logic: side=NO, Grok≤30, valid quote, |Grok−mid| strictly >15. "
-        f"**{C.L_NOTIONAL_DOLLARS:g} dollars fixed per word** (not a %, not scaled) — nightly cap "
-        f"**{C.L_NIGHTLY_CAP_DOLLARS:g} dollars** (first {C.L_MAX_WORDS_PER_NIGHT} qualifying words, excess skipped, "
-        f"never size-scaled) — cancel at **{C.SHOW_CANCEL_CT} CT**, the same time every paper book uses — "
-        f"hold to settlement, no early exit.")
+        f"**{C.L_NOTIONAL_DOLLARS:g} dollars per word** — nightly cap **{C.L_NIGHTLY_CAP_DOLLARS:g} dollars** "
+        f"(max {C.L_MAX_WORDS_PER_NIGHT} words) — cancel at **{C.SHOW_CANCEL_CT} CT** — hold to settlement. "
+        f"Paper twin: book **N** (Books · P&L tab).")
     try:
         L = live.status_report()
         L_ERR = None
@@ -746,39 +742,18 @@ with tab_l:
                 "filled": float(o["filled_contracts"] or 0), "entry ¢": o["our_price_cents"],
                 "cost $": (o["cost_cents"] or 0) / 100.0, "result": o.get("result") or "pending",
                 "net $": None if o.get("realized_pnl_cents") is None else o["realized_pnl_cents"] / 100.0,
-                "gap": o["gap_points"],
             } for o in today]))
 
-        show_h(md, "K (paper) vs L (live) — same rule, side by side")
-        show_cap(md, "The single most useful comparison this book can produce right now: does K's paper hit rate "
-                    "hold up when the fills are real? K rows come from the Book K + blend tab's per-week table; "
-                    "only weeks with a plain YYYY-Wnn label match up (a 'CUMULATIVE'/'OLD TIMING' row has no single week).")
-        import re as _re
-        k_rows = (PANEL.get("k", {}).get("rows") or []) if PANEL else []
-        by_week_l = {r["iso_week"]: r for r in store.l_weekly_all()}
-        cmp_rows = []
-        weeks = set(by_week_l.keys())
-        k_by_week = {}
-        for r in k_rows:
-            m = _re.search(r"\d{4}-W\d{2}", str(r.get("label") or ""))
-            if m:
-                k_by_week[m.group(0)] = r
-                weeks.add(m.group(0))
-        for wk in sorted(weeks):
-            kr = k_by_week.get(wk)
-            lr = by_week_l.get(wk)
-            cmp_rows.append({
-                "week": wk,
-                "K paper hit %": kr.get("hit") if kr else None,
-                "K paper net $": (kr.get("net") / 100.0) if kr and kr.get("net") is not None else None,
-                "L live trades": lr["trades"] if lr else 0,
-                "L live net $": (lr["net_cents"] / 100.0) if lr else 0.0,
-                "L paused": bool(lr and lr.get("paused")),
-            })
-        if cmp_rows:
-            show_df(md, pd.DataFrame(cmp_rows))
+        show_h(md, "L (live) by week")
+        show_cap(md, "Real money only. Compare with paper book N on the Books · P&L tab (same rule, paper fills).")
+        wk_rows = [{
+            "week": r["iso_week"], "trades": r["trades"], "net $": r["net_cents"] / 100.0,
+            "paused": bool(r.get("paused")),
+        } for r in store.l_weekly_all()]
+        if wk_rows:
+            show_df(md, pd.DataFrame(wk_rows))
         else:
-            show_note(md, "info", "No weeks to compare yet.")
+            show_note(md, "info", "No settled L weeks yet.")
 
         show_h(md, "All Book L orders (real)")
         with st.expander(f"All {len(L['orders'])} Book L orders", expanded=False):

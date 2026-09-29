@@ -557,6 +557,8 @@ def _included_orders(data):
 def _why_no_order(rule, p, bid, ask, valid, reason) -> str:
     if rule == "grok10":
         return f"Grok says {p}: no side (50 has no side)"
+    if rule == "grok15_no":
+        return f"Grok says {p}: above {C.L_MAX_GROK}, not a Book L/N word"
     if not valid:
         return f"INVALID QUOTE ({reason or 'bad quote'}) - market-based books must skip"
     if rule in ("fade15", "fade15_gate50"):
@@ -1311,8 +1313,9 @@ def _l_block(data) -> list[str]:
         f"cancel {C.SHOW_CANCEL_CT} CT (same cancel time every paper book uses -- A/B/E/F/G/H/I -- "
         f"one deadline for every strategy, paper and live) | circuit breaker: pause if net < "
         f"-${C.L_CIRCUIT_BREAKER_WEEKLY_LOSS:g} in a week",
-        "Rule is IDENTICAL to K (side=NO, Grok<=30, valid quote, |Grok-mid| strictly >15). No new signal -- "
-        "this only tests whether K's paper edge survives contact with a real resting order.",
+        f"Rule (v1.7.0, from 2026-09-29): every word with Grok <= {C.L_MAX_GROK} -> limit SELL YES at Grok+{C.L_OFFSET_CENTS} "
+        "(= BUY NO at 100-Grok-offset), sent at the open, may take at once. Paper twin = book N. "
+        "Orders before 2026-09-29 used the old K rule.",
         "",
     ]
     rep = live.status_report()
@@ -1335,8 +1338,8 @@ def _l_block(data) -> list[str]:
         lines.append("no Book L orders this week")
         return lines
 
-    lines.append("K (paper, Book A slice) vs L (live) -- same rule, same week:")
-    lines.append(f"{'metric':<22}{'K paper':>12}{'L live':>12}")
+    lines.append("L (live) this week -- compare with paper book N (same rule) in the books section:")
+    lines.append(f"{'metric':<22}{'':>12}{'L live':>12}")
     l_hit = None
     l_settled_week = [o for o in week_orders if o.get("status") == "settled" and o.get("result") in ("yes", "no")]
     if l_settled_week:
@@ -1346,7 +1349,7 @@ def _l_block(data) -> list[str]:
     lines.append(f"{'trades':<22}{'n/a':>12}{len(l_settled_week):>12}")
     lines.append(f"{'hit %':<22}{'n/a':>12}{_fx(l_hit, 0):>12}")
     lines.append(f"{'net $':<22}{'n/a':>12}{l_net:>+12.2f}")
-    lines.append("(K's own per-week paper numbers are in section 4B above -- match by week id to compare directly.)")
+    lines.append("(Book N's paper numbers for the same nights are in the books section above.)")
     lines.append("")
 
     lines.append("FILL-SELECTION CHECK for L (same idea as section 5, computed on real fills):")
@@ -1354,13 +1357,12 @@ def _l_block(data) -> list[str]:
     for o in week_orders:
         lines.append(f"{_trunc(o['word'], 23):<24}{o['status']:<14}{o['our_price_cents']:>8}"
                      f"{float(o.get('filled_contracts') or 0):>8.2f}{(o.get('result') or ''):>7}"
-                     f"{'' if o.get('realized_pnl_cents') is None else o['realized_pnl_cents']/100.0:>+8.2f}")
+                     f"{('' if o.get('realized_pnl_cents') is None else format(o['realized_pnl_cents'] / 100.0, '+.2f')):>8}")
     n_words = len(week_orders)
     n_filled = sum(1 for o in week_orders if float(o.get("filled_contracts") or 0) > 0)
     lines.append("")
     lines.append(f"fill rate this week: {n_filled}/{n_words} words got any real fill "
-                 f"({100.0 * n_filled / n_words:.0f}%) -- this is the first live test of whether K's paper "
-                 f"fills were representative or optimistic.")
+                 f"({100.0 * n_filled / n_words:.0f}%) -- compare with book N's paper fill rate.")
     return lines
 
 

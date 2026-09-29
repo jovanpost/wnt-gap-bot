@@ -217,6 +217,32 @@ def grok10_limit(probability: int) -> dict | None:
     }
 
 
+def grok15_no_order(probability: int, notional: float) -> dict | None:
+    """v1.7.0 Book L / N. Grok <= L_MAX_GROK: SELL YES at Grok + L_OFFSET_CENTS, i.e. BUY NO
+    at 100 - Grok - offset. No market quote needed. A limit that crosses the book fills at
+    once at the buyers' better price; the rest rests until the 5:29 cancel."""
+    p = int(probability)
+    if p > C.L_MAX_GROK:
+        return None
+    yes_limit = p + C.L_OFFSET_CENTS
+    our_px = our_price_cents("NO", yes_limit)
+    if yes_limit <= 0 or yes_limit >= 100 or our_px <= 0 or our_px >= 100:
+        return None
+    contracts = round(notional / (our_px / 100.0), 2) if notional else 0.0
+    return {
+        "side": "NO",
+        "kalshi_action": "sell_yes",
+        "yes_price_cents": yes_limit,
+        "our_price_cents": our_px,
+        "limit_price_cents": yes_limit,
+        "contracts": contracts,
+        "cost_cents": int(round(contracts * our_px)),
+        "gap_points": 0.0,  # not used by this rule (no market); column is NOT NULL
+        "threshold": C.L_OFFSET_CENTS,
+        "notional_dollars": notional,
+    }
+
+
 def order_for_rule(rule: str, probability: int, bid: int | None, ask: int | None,
                    valid: bool, notional: float) -> dict | None:
     """What a book with this rule SHOULD book for one word. The booking code and the
@@ -238,6 +264,8 @@ def order_for_rule(rule: str, probability: int, bid: int | None, ask: int | None
             "gap_points": 0.0,
             "threshold": 0,
         }
+    if rule == "grok15_no":  # Book L (live) and its paper twin N. Ignores the market.
+        return grok15_no_order(p, notional)
     # Every other rule needs a real market. Invalid or one-sided quote = no order.
     if not valid or bid is None or ask is None:
         return None

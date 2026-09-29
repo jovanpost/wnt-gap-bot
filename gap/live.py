@@ -1,12 +1,12 @@
 """Book L: LIVE real-money trading. Real Kalshi orders, real dollars.
 
-Mirrors Book K's exact rule (side=NO, Grok<=30, valid quote, |Grok-mid| strictly
->15) via strategy.order_for_rule("fade15_gate30_no", ...) -- no new signal, no
-new logic. Order mechanics mirror Book A: rest 8c from mid toward Grok, cancel
-at 5:29 CT (show529) -- the SAME cancel every paper book (A/B/E/F/G/H/I) uses
-since the v1.5.10 timing overhaul. An earlier draft of this spec gave L its
-own send+60min window; that's been dropped on your instruction to keep every
-strategy, paper and live, on one cancel time.
+v1.7.0 rule ("grok15_no", strategy.order_for_rule -- paper book N uses the same
+function): every word with Grok <= L_MAX_GROK gets ONE limit order to SELL YES at
+Grok + L_OFFSET_CENTS (= BUY NO at 100 - Grok - offset), $L_NOTIONAL_DOLLARS each.
+No market price is read. Orders go out the moment the market opens (like nofade's
+fast open) or right after the JSON is parsed if the market is already open. A limit
+that crosses fills at once at the buyers' better price (taker fee); the rest rests
+until the 5:29 CT cancel, the same cancel every paper book uses.
 
 Real order placement/cancellation is gap/kalshi.py's create_no_order /
 cancel_order / batch_cancel / get_fills -- ported from wnt-nofade-bot's
@@ -49,13 +49,13 @@ from datetime import datetime, timedelta, timezone
 from . import clock, config as C, notify, store, strategy
 from .fees import fee_cents, hold_pnl_cents
 from .fills import _show_cancel_utc  # same 5:29 CT deadline every paper book now uses
-from .kalshi import KalshiClient, KalshiError, book_metrics, market_result, resolve_real_open
+from .kalshi import KalshiClient, KalshiError, market_result, resolve_real_open
 from .lab import verdict, wilson
 
 log = logging.getLogger("gap.live")
 
 VARIANT_ID = "L"
-RULE = "fade15_gate30_no"
+RULE = "grok15_no"
 
 
 def _now() -> datetime:
@@ -113,27 +113,21 @@ def _i(x):
         return None
 
 
-def qualifying_words(run: dict, forecasts: list[dict], frozen: dict) -> list[dict]:
-    """Same predicate as K, evaluated live. Order = the order `forecasts` is in,
-    i.e. the same natural order pipeline.book_from_forecasts processes words in."""
+def qualifying_words(run: dict, forecasts: list[dict], frozen: dict | None = None) -> list[dict]:
+    """v1.7.0: every word with Grok <= L_MAX_GROK, priced at Grok + L_OFFSET_CENTS by the
+    SAME function paper book N uses (strategy.order_for_rule "grok15_no"). No market quote
+    is read. Sorted lowest Grok first, so the nightly cap keeps the most confident NO words.
+    `frozen` is ignored (kept so old callers still work)."""
     out = []
     for f in forecasts:
-        q = frozen.get(f["market_ticker"]) or {}
-        bid, ask = _i(q.get("yes_bid_cents")), _i(q.get("yes_ask_cents"))
-        valid = bool(q.get("valid"))
         p = f.get("probability")
         if p is None:
             continue
-        decision = strategy.order_for_rule(RULE, int(p), bid, ask, valid, C.L_NOTIONAL_DOLLARS)
+        decision = strategy.order_for_rule(RULE, int(p), None, None, False, C.L_NOTIONAL_DOLLARS)
         if not decision:
             continue
-        out.append({
-            "forecast": f,
-            "bid": bid,
-            "ask": ask,
-            "captured_at": q.get("captured_at"),
-            "decision": decision,
-        })
+        out.append({"forecast": f, "bid": None, "ask": None, "captured_at": None, "decision": decision})
+    out.sort(key=lambda s: (int(s["forecast"]["probability"]), str(s["forecast"].get("word") or "")))
     return out
 
 
@@ -181,8 +175,7 @@ def _find_resting_by_coid(client: KalshiClient, coid: str) -> str | None:
 def _prepare_l_night(run: dict) -> dict:
     """All the early gates + candidate selection for tonight, no order calls.
     Shared by arm_tonight() (the normal-path fallback) and fast_arm_watch_tick()
-    (the fast path) so the two can never disagree about who qualifies or how
-    many -- same purpose as nofade's shared preflight in _fast_run step 1."""
+    (the fast path) so the two can never disagree about who qualifies or how many."""
     date_str = str(run.get("event_date") or "")[:10]
     out = {"date_str": date_str, "ready": False}
     if not date_str:
@@ -200,13 +193,11 @@ def _prepare_l_night(run: dict) -> dict:
         out["reason"] = "circuit_breaker"
         out["week"] = week
         return out
-    from . import quotes as quotes_mod
     forecasts = store.forecasts_for_run(run["id"])
     if not forecasts:
         out["reason"] = "no_forecasts_yet"
         return out
-    frozen = quotes_mod.ensure_frozen(run)
-    candidates = qualifying_words(run, forecasts, frozen)
+    candidates = qualifying_words(run, forecasts)
     cap = nightly_word_cap()
     take = candidates[:cap]
     out.update(ready=True, take=take, cap=cap, candidates=len(candidates))
@@ -217,11 +208,11 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
                     cap: int, n_candidates: int) -> dict:
     """Actually place tonight's L orders. Concurrent (small thread pool, same idea
     as nofade's _fast_send ThreadPoolExecutor) so a multi-word night doesn't lose
-    time sending them one at a time right when the book is thinnest."""
+    time sending them one at a time right at the open."""
     placed_at = _now()
     deadline = _show_cancel_utc(date_str) or (placed_at + timedelta(minutes=60))
 
-    def _place_one(sig: dict) -> tuple[str, str] | None:
+    def _place_one(sig: dict) -> dict | None:
         f = sig["forecast"]
         d = sig["decision"]
         ticker = f["market_ticker"]
@@ -229,19 +220,8 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
             return None
         coid = l_client_order_id(date_str, ticker, d)
         yes_limit = int(d["yes_price_cents"])
-
-        # Same take-if-cheap step as nofade's _place_one: if YES bids at or above our
-        # sell-YES limit are ALREADY on the book, a post_only order would be refused by
-        # Kalshi. Paper K counts that liquidity as filled on arrival, so L takes it too.
-        take_now = False
-        if C.L_TAKE_IF_ALREADY_CHEAP:
-            try:
-                book = client.get_orderbook(ticker, depth=10)
-                take_now = float(book_metrics(book, yes_limit).get("yes_size_that_would_fill_sell") or 0) > 0
-            except Exception as exc:  # noqa: BLE001
-                log.debug("L take-if-cheap book %s failed: %s", ticker, exc)
-        post_only = bool(C.POST_ONLY) and not take_now
-
+        info = {"word": f["word"], "grok": int(f.get("probability") or 0), "yes": yes_limit,
+                "no": int(d["our_price_cents"]), "filled": 0.0, "kind": "placed"}
         row = {
             "event_date": date_str,
             "market_ticker": ticker,
@@ -253,10 +233,10 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
             "our_price_cents": int(d["our_price_cents"]),
             "contracts": d["contracts"],
             "cost_cents": d["cost_cents"],
-            "gap_points": d["gap_points"],
-            "quote_bid_cents": sig["bid"],
-            "quote_ask_cents": sig["ask"],
-            "quote_captured_at": sig["captured_at"],
+            "gap_points": d.get("gap_points"),
+            "quote_bid_cents": None,
+            "quote_ask_cents": None,
+            "quote_captured_at": None,
             "client_order_id": coid,
             "status": "pending",
             "placed_at": placed_at,
@@ -274,7 +254,7 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
                 no_price_cents=int(d["our_price_cents"]),
                 count=d["contracts"],
                 client_order_id=coid,
-                post_only=post_only,
+                post_only=bool(C.L_POST_ONLY),
                 expiration_epoch=int(deadline.timestamp()) if C.USE_SERVER_SIDE_EXPIRY else None,
             )
         except KalshiError as exc:
@@ -283,37 +263,38 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
             if found:
                 store.l_update_order(saved["id"], kalshi_order_id=found, status="resting",
                                      reject_reason=f"duplicate on send, adopted resting order: {reason}"[:400])
-                return ("placed", f["word"])
+                return info
             store.l_update_order(saved["id"], status="rejected", reject_reason=reason)
             log.warning("L order rejected for %s: %s", ticker, reason)
-            return ("rejected", f["word"])
+            return dict(info, kind="rejected", reason=reason[:120])
         except Exception as exc:  # noqa: BLE001  network error: the order MAY exist on Kalshi
             found = _find_resting_by_coid(client, coid)
             if found:
                 store.l_update_order(saved["id"], kalshi_order_id=found, status="resting",
                                      reject_reason=f"send error, adopted resting order: {exc}"[:400])
-                return ("placed", f["word"])
+                return info
             store.l_update_order(saved["id"], status="rejected",
                                  reject_reason=f"send error, nothing resting found: {exc}"[:400])
             log.warning("L order send error for %s: %s", ticker, exc)
-            return ("rejected", f["word"])
+            return dict(info, kind="rejected", reason=str(exc)[:120])
         fields = {"kalshi_order_id": resp.get("order_id"), "status": "resting"}
         if resp.get("fill_count"):
             fields["status"] = "filled" if resp["fill_count"] >= float(d["contracts"]) - 1e-6 else "partially_filled"
             fields["filled_contracts"] = resp["fill_count"]
             fields["avg_fill_price_cents"] = resp.get("avg_fill_price_cents") or int(d["our_price_cents"])
             fields["first_fill_at"] = _now()
+            info["filled"] = float(resp["fill_count"])
         store.l_update_order(saved["id"], **fields)
-        return ("placed", f["word"])
+        return info
 
-    placed, rejected = [], []
+    results: list[dict] = []
     if take:
-        with ThreadPoolExecutor(max_workers=min(C.L_FAST_MAX_WORKERS, len(take))) as pool:
+        with ThreadPoolExecutor(max_workers=max(1, min(C.L_FAST_MAX_WORKERS, len(take)))) as pool:
             for res in pool.map(_place_one, take):
-                if res is None:
-                    continue
-                kind, word = res
-                (placed if kind == "placed" else rejected).append(word)
+                if res is not None:
+                    results.append(res)
+    placed = [r["word"] for r in results if r["kind"] == "placed"]
+    rejected = [r["word"] for r in results if r["kind"] == "rejected"]
 
     store.set_state(_armed_key(date_str), {
         "armed_at": placed_at.isoformat(), "placed": placed, "rejected": rejected,
@@ -324,31 +305,44 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
         f"{date_str}: placed {len(placed)} real L orders "
         f"({', '.join(placed) or 'none'}); rejected {len(rejected)}",
     )
-    if placed or rejected:
-        lines = [f"\U0001F4B5 <b>Book L -- LIVE real-money orders placed</b> ({date_str})"]
-        for w in placed:
-            lines.append(f"  rested NO {w} · ${C.L_NOTIONAL_DOLLARS:g}")
-        for w in rejected:
-            lines.append(f"  REJECTED {w}")
+    if results:
+        lines = [f"\U0001F4B5 <b>Book L -- LIVE real-money orders placed</b> ({date_str})",
+                 f"rule: Grok &lt;= {C.L_MAX_GROK} -> sell YES at Grok+{C.L_OFFSET_CENTS} · ${C.L_NOTIONAL_DOLLARS:g}/word"]
+        for r in sorted(results, key=lambda x: x["grok"]):
+            if r["kind"] == "rejected":
+                lines.append(f"  REJECTED {r['word']}: {r.get('reason', '')}")
+                continue
+            tail = f" · filled now {r['filled']:g}" if r["filled"] else " · resting"
+            lines.append(f"  {r['word']} (Grok {r['grok']}): NO &lt;= {r['no']}¢ (sell YES {r['yes']}¢){tail}")
+        skipped = n_candidates - len(take)
+        if skipped > 0:
+            lines.append(f"({skipped} more qualified but the nightly cap is {cap} words)")
         lines.append("cancel at 5:29 CT if unfilled · hold to settlement")
         notify.send("\n".join(lines))
     return {"ok": True, "reason": "armed", "placed": placed, "rejected": rejected}
 
 
+def _probe_market_status(client: KalshiClient, ticker: str) -> str | None:
+    try:
+        mkt = client.get_market(ticker)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("L probe failed for %s: %s", ticker, exc)
+        return None
+    status = str((mkt or {}).get("status") or "").strip().lower()
+    return status or None
+
+
 def arm_tonight(run: dict) -> dict:
-    """Place tonight's real L orders. This is the NORMAL-PATH fallback, called
-    every ~30s from the regular poll loop -- safe to call every tick, it no-ops
-    instantly once armed. fast_arm_watch_tick() below is the fast path (its own
-    dedicated thread, watches the real market and fires the instant it opens);
-    this function is what fires if that fast path ever gives up, exactly like
-    nofade's normal loop picks up after its own fast-open path times out."""
+    """Place tonight's real L orders. NORMAL-PATH fallback, called every ~30s from the
+    poll loop and right after the JSON is parsed -- safe to call any time, it no-ops
+    once armed. Like nofade: no market price is needed, only an OPEN market. If the JSON
+    arrives before the open it waits; fast_arm_watch_tick() fires at the open itself."""
     prep = _prepare_l_night(run)
     date_str = prep["date_str"]
     if not prep["ready"]:
         reason = prep.get("reason", "not_ready")
-        # v1.6.6: "l_live_off" no longer writes the armed flag. Before, if the app ran with
-        # L_LIVE_ON=false after tonight's run existed, the night was locked as "armed" and flipping
-        # L_LIVE_ON=true later that day placed nothing.
+        # "l_live_off" never writes the armed flag, so flipping L_LIVE_ON later that
+        # day still works.
         if reason == "circuit_breaker":
             store.set_state(_armed_key(date_str), {"armed_at": _now().isoformat(), "reason": reason})
             store.log_activity(
@@ -357,53 +351,35 @@ def arm_tonight(run: dict) -> dict:
             )
         return {"ok": True, "reason": reason}
 
-    client = _client()
-    real_open = resolve_real_open(client, run["event_ticker"], date_str)
-    if real_open is None:
-        # Kalshi hasn't published tonight's real open time yet -- real money,
-        # so we wait for the actual API value rather than assume any clock time.
-        return {"ok": True, "reason": "waiting_real_open"}
-    gate = real_open + timedelta(minutes=C.DECISION_LAG_MIN)
-    if _now() < gate:
-        return {"ok": True, "reason": "waiting_real_open", "opens_at": gate.isoformat()}
-
     take, cap, n_candidates = prep["take"], prep["cap"], prep["candidates"]
-    skipped = n_candidates - len(take)
-    if skipped > 0:
-        store.log_activity(
-            "l_nightly_cap",
-            f"{date_str}: {n_candidates} words qualified for L, cap is {cap} "
-            f"(${C.L_NIGHTLY_CAP_DOLLARS:g} / ${C.L_NOTIONAL_DOLLARS:g}/word); "
-            f"took first {len(take)}, skipped {skipped} -- no size-scaling",
-        )
     if not take:
         store.set_state(_armed_key(date_str), {"armed_at": _now().isoformat(), "reason": "no_qualifying_words"})
+        store.log_activity("l_no_words", f"{date_str}: no word with Grok <= {C.L_MAX_GROK}")
         return {"ok": True, "reason": "no_qualifying_words", "candidates": n_candidates}
 
+    client = _client()
+    real_open = resolve_real_open(client, run["event_ticker"], date_str)
+    if real_open is None or _now() < real_open:
+        return {"ok": True, "reason": "waiting_open"}
+    status = _probe_market_status(client, take[0]["forecast"]["market_ticker"])
+    if status not in ("active", "open"):
+        return {"ok": True, "reason": "waiting_market_active", "status": status}
+    if n_candidates > len(take):
+        store.log_activity(
+            "l_nightly_cap",
+            f"{date_str}: {n_candidates} words qualified for L, cap is {cap}; "
+            f"took the {len(take)} lowest-Grok words",
+        )
     return _fire_l_orders(client, run, date_str, take, cap, n_candidates)
 
 
-def _probe_market_status(client: KalshiClient, ticker: str) -> str | None:
-    try:
-        mkt = client.get_market(ticker)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("L fast probe failed for %s: %s", ticker, exc)
-        return None
-    status = str((mkt or {}).get("status") or "").strip().lower()
-    return status or None
-
-
 def fast_arm_watch_tick() -> None:
-    """One tick of the fast path, called every ~1s from its own dedicated thread
-    (see streamlit_app.py) -- separate from the 30s poll loop, same two-thread
-    shape as nofade-bot's runner/collector split. Ports nofade's
-    _fast_arm/_fast_wait_and_watch/_fast_fire: once tonight's real open_time is
-    known (resolve_real_open, cached), it does nothing until L_FAST_LEAD_SECONDS
-    before that time, then watches the actual market status every
-    L_FAST_WATCH_SECONDS and fires the instant Kalshi reports it active --
-    not on the next poll tick. Gives up after L_FAST_GIVE_UP_SECONDS past
-    open_time; arm_tonight() on the normal loop (same real-open gate) then
-    takes over, exactly like nofade falling back to its normal path."""
+    """One tick of the fast path, called every ~1s from its own thread (see
+    streamlit_app.py). Same idea as nofade's fast open: once tonight's real open_time
+    is known, do nothing until L_FAST_LEAD_SECONDS before it, then watch the market
+    status every L_FAST_WATCH_SECONDS and send every order the instant Kalshi says it
+    is active. Gives up L_FAST_GIVE_UP_SECONDS after open_time; arm_tonight() on the
+    normal loop then takes over."""
     date_str = clock.today_ct()
     run = store.get_run_for_date(date_str)
     if not run:
@@ -421,24 +397,18 @@ def fast_arm_watch_tick() -> None:
     give_up_at = real_open + timedelta(seconds=C.L_FAST_GIVE_UP_SECONDS)
     now = _now()
     if now < lead_at or now >= give_up_at:
-        return  # too early to watch closely yet, or this window already passed
+        return
 
     prep = _prepare_l_night(run)
     if not prep["ready"] or not prep["take"]:
-        return  # arm_tonight() on the normal loop logs/handles every other case
+        return  # no JSON yet (or nothing qualifies): arm_tonight() handles it
 
     take, cap, n_candidates = prep["take"], prep["cap"], prep["candidates"]
     probe_ticker = take[0]["forecast"]["market_ticker"]
-
     while _now() < give_up_at:
         if store.get_state(_armed_key(date_str)):
-            return  # normal path (or a previous tick) already armed it
-        status = _probe_market_status(client, probe_ticker)
-        if status in ("active", "open"):
-            gate = real_open + timedelta(minutes=C.DECISION_LAG_MIN)
-            remaining = (gate - _now()).total_seconds()
-            if remaining > 0:
-                time.sleep(remaining)
+            return
+        if _probe_market_status(client, probe_ticker) in ("active", "open"):
             _fire_l_orders(client, run, date_str, take, cap, n_candidates)
             return
         time.sleep(C.L_FAST_WATCH_SECONDS)

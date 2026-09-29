@@ -19,7 +19,7 @@ Now:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import clock, config as C, store
 
@@ -109,24 +109,62 @@ def build_row(run_id: int, ticker: str, snap: dict | None, moment: datetime,
     }
 
 
+def paper_ready_at(run: dict) -> datetime | None:
+    """v1.7.0: the earliest moment paper quotes may be frozen = Kalshi's REAL open time
+    for tonight + max(DECISION_LAG_MIN, PAPER_MIN_AFTER_OPEN_S). Before the open there is
+    no order book, so a quote frozen then is empty forever (the Sep 28 bug). None means
+    the open time is not known yet."""
+    from .kalshi import KalshiClient, resolve_real_open  # local: avoid import cycles
+    date_str = str(run.get("event_date") or "")[:10]
+    try:
+        real_open = resolve_real_open(KalshiClient(), run.get("event_ticker") or "", date_str)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("real open lookup failed: %s", exc)
+        real_open = None
+    if real_open is None:
+        return None
+    wait_s = max(int(C.DECISION_LAG_MIN) * 60, int(C.PAPER_MIN_AFTER_OPEN_S))
+    return real_open + timedelta(seconds=wait_s)
+
+
 def freeze_run_quotes(run: dict, now: datetime | None = None) -> dict:
-    """Freeze quotes for every market of the run that has none yet. Idempotent."""
+    """Freeze quotes for every market of the run that has none yet. Idempotent.
+
+    v1.7.0: never freezes before paper_ready_at(run). Returns waiting=True (and saves
+    nothing) until then, and also while no-fade has not saved a single order book for
+    tonight yet (up to NO_DEPTH_GRACE_S after the ready time), so an empty book is never
+    frozen as the night's price."""
     now = now or clock.now_ct().astimezone(timezone.utc)
     run_id = int(run["id"])
     date_str = str(run.get("event_date"))[:10]
-    moment = moment_for(run, now)
     decision_at = clock.parse_dt(run.get("decision_at"))
+    ready = paper_ready_at(run)
+    if ready is None:
+        # Open time unknown. Old nights (long past their decision time) keep the old
+        # behaviour; tonight waits.
+        if decision_at is None or now < decision_at + timedelta(hours=3):
+            return {"added": 0, "valid": 0, "invalid": 0, "moment": None, "waiting": True}
+        moment = moment_for(run, now)
+    else:
+        if now < ready:
+            return {"added": 0, "valid": 0, "invalid": 0, "moment": None, "waiting": True}
+        moment = max(moment_for(run, now), ready)
+        moment = min(moment, now)
     have = {q["market_ticker"] for q in store.frozen_quotes_for_run(run_id)}
-    added = valid = invalid = 0
-    for m in store.markets_for_run(run_id):
-        t = m["market_ticker"]
-        if t in have:
-            continue
+    todo = [m["market_ticker"] for m in store.markets_for_run(run_id) if m["market_ticker"] not in have]
+    snaps: dict = {}
+    for t in todo:
         try:
-            snap = store.latest_nofade_depth(t, date_str, as_of=moment, max_age_s=C.QUOTE_MAX_AGE_S)
+            snaps[t] = store.latest_nofade_depth(t, date_str, as_of=moment, max_age_s=C.QUOTE_MAX_AGE_S)
         except Exception as exc:
             log.warning("depth lookup %s: %s", t, exc)
-            snap = None
+            snaps[t] = None
+    if todo and not any(snaps.values()) and ready is not None \
+            and now < ready + timedelta(seconds=C.NO_DEPTH_GRACE_S):
+        return {"added": 0, "valid": 0, "invalid": 0, "moment": moment, "waiting": True}
+    added = valid = invalid = 0
+    for t in todo:
+        snap = snaps.get(t)
         row = build_row(run_id, t, snap, moment, decision_at)
         store.insert_frozen_quote(row)
         try:  # keep the full book at the decision moment (the shared depth table gets pruned)
@@ -136,7 +174,7 @@ def freeze_run_quotes(run: dict, now: datetime | None = None) -> dict:
         added += 1
         valid += 1 if row["valid"] else 0
         invalid += 0 if row["valid"] else 1
-    return {"added": added, "valid": valid, "invalid": invalid, "moment": moment}
+    return {"added": added, "valid": valid, "invalid": invalid, "moment": moment, "waiting": False}
 
 
 def ensure_frozen(run: dict, now: datetime | None = None) -> dict[str, dict]:
