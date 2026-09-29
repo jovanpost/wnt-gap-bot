@@ -277,14 +277,12 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
                                  reject_reason=f"send error, nothing resting found: {exc}"[:400])
             log.warning("L order send error for %s: %s", ticker, exc)
             return dict(info, kind="rejected", reason=str(exc)[:120])
-        fields = {"kalshi_order_id": resp.get("order_id"), "status": "resting"}
+        # v1.7.1: only the Kalshi order_id is saved here. The instant fill (if any) is counted by
+        # poll_fills_tick() from /portfolio/fills, which has the real NO price; Kalshi's order reply
+        # gives the average at the YES price (nolive showed +$11.19 instead of +$1.77 from this).
+        store.l_update_order(saved["id"], kalshi_order_id=resp.get("order_id"), status="resting")
         if resp.get("fill_count"):
-            fields["status"] = "filled" if resp["fill_count"] >= float(d["contracts"]) - 1e-6 else "partially_filled"
-            fields["filled_contracts"] = resp["fill_count"]
-            fields["avg_fill_price_cents"] = resp.get("avg_fill_price_cents") or int(d["our_price_cents"])
-            fields["first_fill_at"] = _now()
             info["filled"] = float(resp["fill_count"])
-        store.l_update_order(saved["id"], **fields)
         return info
 
     results: list[dict] = []
@@ -491,9 +489,10 @@ def poll_fills_tick() -> None:
         already = float(order.get("filled_contracts") or 0)
         intended = float(order.get("contracts") or 0)
         new_total = min(t["count"], intended) if intended > 0 else t["count"]
-        if new_total <= already + 1e-9:
-            continue  # never move backwards; nothing new
         avg_px = t["cost"] / t["count"] if t["count"] > 0 else float(order.get("our_price_cents") or 0)
+        if abs(new_total - already) <= 1e-9 and order.get("avg_fill_price_cents") == int(round(avg_px)):
+            continue  # nothing changed
+        # Kalshi's fill list is the truth: set (not add) the totals, so a wrong row is corrected.
         fields = {"filled_contracts": round(new_total, 4), "avg_fill_price_cents": int(round(avg_px))}
         if not order.get("first_fill_at"):
             fields["first_fill_at"] = _now()
@@ -559,6 +558,39 @@ def cancel_if_due_tick() -> None:
 # Settle against Kalshi's official result
 # ---------------------------------------------------------------------------
 
+def _exact_fills(client: KalshiClient, order: dict) -> dict | None:
+    """Every Kalshi fill of this order: contracts, weighted NO price (cents, float), fees (cents)."""
+    oid = str(order.get("kalshi_order_id") or "")
+    if not oid:
+        return None
+    try:
+        fills = [f for f in client.get_fills(ticker=order["market_ticker"], limit=200)
+                 if str(f.get("order_id") or "") == oid]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("L exact fills %s: %s", order["market_ticker"], exc)
+        return None
+    seen, c, cost, fees = set(), 0.0, 0.0, 0.0
+    for f in fills:
+        fid = str(f.get("trade_id") or f.get("fill_id") or id(f))
+        if fid in seen:
+            continue
+        seen.add(fid)
+        n = _to_count(f.get("count_fp") or f.get("count"))
+        if n <= 0:
+            continue
+        c += n
+        cost += n * _fill_no_cents(f, int(order.get("our_price_cents") or 0))
+        fee_raw = f.get("fee_cost") if f.get("fee_cost") not in (None, "") else f.get("fee_paid")
+        try:
+            fv = float(fee_raw) if fee_raw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            fv = 0.0
+        fees += fv * 100.0 if 0 < abs(fv) < 1 or (isinstance(fee_raw, str) and "." in fee_raw) else fv
+    if c <= 0:
+        return None
+    return {"contracts": c, "avg_cents": cost / c, "fees_cents": fees}
+
+
 def settle_tick() -> None:
     pending = store.l_orders_unsettled_for_settlement()
     if not pending:
@@ -578,14 +610,23 @@ def settle_tick() -> None:
         if outcome not in ("yes", "no", "void"):
             continue
         filled = float(order.get("filled_contracts") or 0)
-        our_px = int(order.get("avg_fill_price_cents") or order.get("our_price_cents") or 0)
-        fee = fee_cents(filled, our_px)
+        our_px = float(order.get("avg_fill_price_cents") or order.get("our_price_cents") or 0)
+        exact = _exact_fills(client, order)
+        if exact:
+            # v1.7.1: Kalshi's own fill list -- exact contracts, exact NO price, exact fee
+            # (a maker fill pays 0; the old estimate charged every fill the taker fee).
+            filled, our_px, fee = exact["contracts"], exact["avg_cents"], exact["fees_cents"]
+        else:
+            fee = fee_cents(filled, int(round(our_px)))  # hand-placed / no fill list: estimate
         if outcome == "void":
             net = 0
         else:
-            net = hold_pnl_cents(order.get("side") or "NO", filled, our_px, outcome, fee)
+            won = outcome == "no" if (order.get("side") or "NO") == "NO" else outcome == "yes"
+            gross = filled * ((100.0 - our_px) if won else -our_px)
+            net = int(round(gross - fee))
         store.l_update_order(
-            order["id"], status="settled", result=outcome, fees_cents=fee,
+            order["id"], status="settled", result=outcome, fees_cents=int(round(fee)),
+            filled_contracts=round(filled, 4), avg_fill_price_cents=int(round(our_px)),
             realized_pnl_cents=net, settled_at=_now(),
         )
         week = _iso_week(order.get("placed_at") if isinstance(order.get("placed_at"), datetime) else _now())

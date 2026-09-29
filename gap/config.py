@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.7.0"  # Book L = Grok+15 on Grok<=30 at the open (no market quote); paper book N mirrors it; paper quotes never frozen before the real open
+VERSION = "wnt-gap-v1.7.1"  # Ledger tab (day/week), SCALP full times + fallback walks the book, L fills only from Kalshi fill list
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt

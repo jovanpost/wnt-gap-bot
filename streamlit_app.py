@@ -232,9 +232,136 @@ with st.sidebar:
         st.rerun()
     st.caption("Research tabs read the database only (no Kalshi calls) and refresh every 3 minutes.")
 
-tab_live, tab_books, tab_four, tab_k, tab_l, tab_lab, tab_scalp, tab_timing, tab_curve = st.tabs(
-    ["Tonight", "Books · P&L", "All nights · books", "Book K + blend", "L (Live)", "Strategy lab", "SCALP", "Fill timing", "Cancel-window curve"]
+tab_ledger, tab_live, tab_books, tab_four, tab_k, tab_l, tab_lab, tab_scalp, tab_timing, tab_curve = st.tabs(
+    ["Ledger (day / week)", "Tonight", "Books · P&L", "All nights · books", "Book K + blend", "L (Live)", "Strategy lab", "SCALP", "Fill timing", "Cancel-window curve"]
 )
+
+
+def _ct(value) -> str:
+    """Any timestamp -> 'Sep 28 5:29:04 PM' in Central time. Blank if missing."""
+    dt = clock.parse_dt(value) if value not in (None, "") else None
+    if dt is None:
+        return ""
+    return dt.astimezone(C.CT).strftime("%b %d %-I:%M:%S %p")
+
+
+def _iso_week(d: str) -> str:
+    from datetime import date as _date
+    y, w, _ = _date.fromisoformat(str(d)[:10]).isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def _period_picker(dates, key):
+    from datetime import date as _date
+    ds = sorted({str(d)[:10] for d in dates if d}, reverse=True)
+    c1, c2 = st.columns([1, 3])
+    mode = c1.radio("Show", ["Day", "Week", "All"], horizontal=True, key=f"{key}_mode")
+    if mode == "Day":
+        picked = c2.date_input("Day", value=_date.fromisoformat(ds[0]) if ds else _date.fromisoformat(clock.today_ct()),
+                               key=f"{key}_day").isoformat()
+        return picked, (lambda x, p=picked: str(x)[:10] == p)
+    if mode == "Week":
+        weeks = sorted({_iso_week(d) for d in ds}, reverse=True) or [_iso_week(clock.today_ct())]
+        wk = c2.selectbox("Week", weeks, key=f"{key}_week")
+        return f"week {wk}", (lambda x, w=wk: bool(x) and _iso_week(x) == w)
+    return "all dates", (lambda x: True)
+
+
+def _said(result):
+    return {"yes": "SAID (YES)", "no": "not said (NO)", "void": "void"}.get(result or "", "waiting for result")
+
+
+# ---------------------------------------------------------------------------
+with tab_ledger:
+    slot_ledger = st.container()
+    try:
+        _l_all = store.l_orders_between("2000-01-01", "2100-01-01")
+        _sc_all = store.scalp_batches_between("2000-01-01", "2100-01-01")
+        _paper_all = store.all_paper_orders()
+        LEDGER_ERR = None
+    except Exception as exc:
+        _l_all, _sc_all, _paper_all, LEDGER_ERR = [], [], [], str(exc)
+    _dates = [o["event_date"] for o in _l_all] + [b["event_date"] for b in _sc_all] + [o["event_date"] for o in _paper_all]
+    _plabel, _pmatch = _period_picker(_dates, "ledger")
+    md = MD(f"Ledger · {_plabel}")
+    if LEDGER_ERR:
+        show_note(md, "error", f"Ledger could not load: {LEDGER_ERR}")
+    show_cap(md, f"Showing: {_plabel}. All times are Central. Real money first (Book L), then SCALP and the paper books.")
+
+    # ---- Book L (real money)
+    show_h(md, "Book L — real money")
+    _l = [o for o in _l_all if _pmatch(o["event_date"])]
+    if not _l:
+        show_note(md, "info", "No Book L orders in this period.")
+    else:
+        _rows = []
+        for o in _l:
+            filled = float(o.get("filled_contracts") or 0)
+            avg = o.get("avg_fill_price_cents")
+            cost = filled * float(avg or 0) / 100.0
+            _rows.append({
+                "date": str(o["event_date"])[:10], "word": o["word"],
+                "placed": _ct(o.get("placed_at")),
+                "order": f"buy NO at {o['our_price_cents']}¢ or less (sell YES {o['limit_price_cents']}¢) x {float(o['contracts']):g}",
+                "filled": round(filled, 2), "first fill": _ct(o.get("first_fill_at")),
+                "avg NO price ¢": avg, "cost $": round(cost, 2),
+                "fees $": round(float(o.get("fees_cents") or 0) / 100.0, 2),
+                "ended": o.get("status"),
+                "cancelled": _ct(o.get("cancel_confirmed_at")),
+                "result": _said(o.get("result")) if filled > 0 else "not filled",
+                "settled": _ct(o.get("settled_at")),
+                "paid out $": (round(filled, 2) if o.get("result") == "no" else 0.0) if (o.get("result") and filled > 0) else None,
+                "P&L $": None if o.get("realized_pnl_cents") is None else round(o["realized_pnl_cents"] / 100.0, 2),
+                "reject": o.get("reject_reason") or "",
+            })
+        _done = [r for r in _rows if r["P&L $"] is not None]
+        show_metrics(md, [
+            ("Orders", len(_rows), None),
+            ("Filled", sum(1 for r in _rows if r["filled"] > 0), None),
+            ("Won / settled", f"{sum(1 for r in _done if r['result'].startswith('not said'))} / {len(_done)}", None),
+            ("Money in fills", f"${sum(r['cost $'] for r in _rows):.2f}", None),
+            ("Net P&L (after fees)", f"{sum(r['P&L $'] for r in _done):+.2f}", None),
+        ])
+        show_df(md, pd.DataFrame(_rows))
+
+    # ---- SCALP (paper)
+    show_h(md, "SCALP (paper)")
+    _sc = [b for b in _sc_all if _pmatch(b["event_date"])]
+    if not _sc:
+        show_note(md, "info", "No SCALP batches in this period.")
+    else:
+        show_df(md, pd.DataFrame([{
+            "date": str(b["event_date"])[:10], "word": b["word"], "Grok": b.get("grok_probability"),
+            "bought": _ct(b.get("buy_at")), "buy ¢": b.get("buy_price_cents"),
+            "contracts": round(float(b.get("buy_contracts") or 0), 2),
+            "cost $": round((b.get("buy_cost_cents") or 0) / 100.0, 2),
+            "buy fee $": round((b.get("buy_fee_cents") or 0) / 100.0, 2),
+            "sold": _ct(b.get("sell_at")), "sell ¢": b.get("sell_price_cents"),
+            "sold ct": round(float(b.get("sell_contracts") or 0), 2),
+            "sell fee $": round((b.get("sell_fee_cents") or 0) / 100.0, 2),
+            "how": {"scalp_hit": "sold at target", "fallback_sold": "sold at market 5:29",
+                    "resting_sell": "still waiting"}.get(b.get("status"), b.get("status")),
+            "net $": None if b.get("net_cents") is None else round(b["net_cents"] / 100.0, 2),
+        } for b in _sc]))
+
+    # ---- paper books
+    show_h(md, "Paper books")
+    _books = ["all"] + [v["id"] for v in C.ALL_VARIANTS]
+    _bk = st.selectbox("Book", _books, key="ledger_book",
+                       format_func=lambda b: "all books" if b == "all" else next(v["label"] for v in C.ALL_VARIANTS if v["id"] == b))
+    _pp = [o for o in _paper_all if _pmatch(o["event_date"]) and (_bk == "all" or o.get("variant_id") == _bk)]
+    if not _pp:
+        show_note(md, "info", "No paper orders in this period.")
+    else:
+        _prow = board.enrich_orders(_pp, results={})
+        show_df(md, pd.DataFrame([{
+            "date": str(r["event_date"])[:10], "book": r.get("variant_id"), "word": r["word"],
+            "order": r["action"], "wanted": r["intended_ct"], "filled": r["filled_ct"],
+            "first fill": _ct(r.get("first_fill_at")), "status": r["fill_label"],
+            "cost $": round(r["cost_dollars"], 2),
+            "P&L $": None if r["pnl_dollars"] is None else round(r["pnl_dollars"], 2),
+        } for r in _prow]))
+    copy_box(slot_ledger, md, "md_ledger", "gap-ledger.md")
 
 # ---------------------------------------------------------------------------
 with tab_live:
@@ -987,9 +1114,9 @@ with tab_scalp:
                 bview = batches if SEL == "All weeks" else [b for b in batches if weekly._week_id(str(b["event_date"])[:10]) == SEL]
                 show_df(md, pd.DataFrame([{
                     "date": str(b["event_date"])[:10], "word": b["word"], "grok": b["grok_probability"],
-                    "buy time": clock.fmt(clock.parse_dt(b["buy_at"]))[-8:] if b.get("buy_at") else "",
+                    "buy time": _ct(b.get("buy_at")),
                     "buy ¢": b["buy_price_cents"], "contracts": float(b["buy_contracts"]),
-                    "sell time": clock.fmt(clock.parse_dt(b["sell_at"]))[-8:] if b.get("sell_at") else "",
+                    "sell time": _ct(b.get("sell_at")),
                     "sell ¢": b["sell_price_cents"], "status": b["status"], "net $": (b["net_cents"] or 0) / 100.0,
                 } for b in bview]))
     copy_box(slot_scalp, md, "md_scalp", f"gap-scalp-{SEL}.md")

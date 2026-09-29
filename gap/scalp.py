@@ -153,37 +153,64 @@ def _sell_tick(run: dict, batches: list[dict], now: datetime) -> None:
         store.log_activity("scalp_sell", f"{b['word']} +{take:.2f} @ {px}c ({b['status'] if new_sold+1e-6 < float(b['buy_contracts']) else 'scalp_hit'})")
 
 
+def _bid_levels(yes_book: list) -> list[list[float]]:
+    """YES bids, best (highest) first, as [price, size] pairs we can use up."""
+    lv = [[int(p), float(c)] for p, c in (yes_book or []) if c and float(c) > 0 and int(p) > 0]
+    lv.sort(key=lambda x: -x[0])
+    return lv
+
+
 def _fallback_tick(run: dict, batches: list[dict], now: datetime) -> None:
+    """Unsold at 17:29 CT: sell at market. v1.7.1: walks the YES bids from the best price
+    down and USES UP the size as it goes, shared by every batch of the same word, so five
+    batches can no longer all 'sell' into the same bids at the best price. Whatever the book
+    cannot absorb stays resting and is tried again on the next poll."""
     if now < _hhmm_utc(run["event_date_str"], C.SCALP_FALLBACK_HHMM):
         return
+    levels_by_ticker: dict[str, list] = {}
     for b in batches:
         if b["status"] != "resting_sell":
             continue
         ticker = b["market_ticker"]
-        try:
-            snap = store.latest_nofade_depth(ticker, run["event_date_str"])
-        except Exception as exc:
-            log.warning("scalp fallback depth %s: %s", ticker, exc)
-            continue
-        yes_book = (snap or {}).get("yes_book") or []
-        size, best_yes = fills.crossing({"yes": yes_book, "no": []}, "NO", 1)   # any positive price
+        if ticker not in levels_by_ticker:
+            try:
+                snap = store.latest_nofade_depth(ticker, run["event_date_str"])
+            except Exception as exc:
+                log.warning("scalp fallback depth %s: %s", ticker, exc)
+                snap = None
+            levels_by_ticker[ticker] = _bid_levels((snap or {}).get("yes_book") or [])
+        levels = levels_by_ticker[ticker]
         already = float(b["sell_contracts"] or 0)
         want = float(b["buy_contracts"]) - already
-        if size <= 0 or best_yes is None or want <= 0:
+        if want <= 1e-9 or not levels:
             continue   # no bid at all right now: leave resting, try again next poll
-        take = min(want, size)
-        px = int(best_yes)
-        fee = fees.fee_cents(take, px)
-        new_sold = already + take
+        took = 0.0
+        proceeds = 0.0
+        for lv in levels:
+            if want - took <= 1e-9:
+                break
+            q = min(lv[1], want - took)
+            if q <= 0:
+                continue
+            took += q
+            proceeds += q * lv[0]
+            lv[1] -= q
+        levels[:] = [lv for lv in levels if lv[1] > 1e-9]
+        if took <= 1e-9:
+            continue
+        px = int(round(proceeds / took))
+        fee = fees.fee_cents(took, px)
+        new_sold = already + took
         fields = {
             "sell_contracts": round(new_sold, 4),
-            "sell_proceeds_cents": int(b["sell_proceeds_cents"] or 0) + int(round(take * px)),
+            "sell_proceeds_cents": int(b["sell_proceeds_cents"] or 0) + int(round(proceeds)),
             "sell_fee_cents": int(b["sell_fee_cents"] or 0) + fee,
         }
-        _finish(b, fields, "fallback_sold", now)
+        if new_sold + 1e-6 >= float(b["buy_contracts"]):
+            _finish(b, fields, "fallback_sold", now)
         store.update_scalp_batch(b["id"], **fields)
         b.update(fields)
-        store.log_activity("scalp_fallback", f"{b['word']} sold {take:.2f} @ {px}c (fallback, unsold at 5:29)")
+        store.log_activity("scalp_fallback", f"{b['word']} sold {took:.2f} @ avg {px}c (fallback, unsold at 5:29)")
 
 
 def _finish(b: dict, fields: dict, status: str, now: datetime) -> None:
