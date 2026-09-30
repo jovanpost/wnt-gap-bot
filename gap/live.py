@@ -93,7 +93,7 @@ def _maybe_trip_breaker(iso_week: str) -> None:
         store.l_weekly_pause(iso_week, reason)
         store.log_activity("l_circuit_breaker", reason)
         notify.send(
-            f"\U0001F6D1 <b>Book L circuit breaker tripped</b>\n{reason}\n"
+            f"\U0001F6D1 Book L circuit breaker tripped\n{reason}\n"
             f"No new live orders will be placed this week. Existing resting orders "
             f"still get cancelled/settled normally. Clear it manually once you've "
             f"looked -- nothing here auto-adjusts the rule or size."
@@ -304,14 +304,14 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
         f"({', '.join(placed) or 'none'}); rejected {len(rejected)}",
     )
     if results:
-        lines = [f"\U0001F4B5 <b>Book L -- LIVE real-money orders placed</b> ({date_str})",
-                 f"rule: Grok &lt;= {C.L_MAX_GROK} -> sell YES at Grok+{C.L_OFFSET_CENTS} · ${C.L_NOTIONAL_DOLLARS:g}/word"]
+        lines = [f"\U0001F4B5 Book L -- LIVE real-money orders placed ({date_str})",
+                 f"rule: Grok <= {C.L_MAX_GROK} -> sell YES at Grok+{C.L_OFFSET_CENTS} · ${C.L_NOTIONAL_DOLLARS:g}/word"]
         for r in sorted(results, key=lambda x: x["grok"]):
             if r["kind"] == "rejected":
                 lines.append(f"  REJECTED {r['word']}: {r.get('reason', '')}")
                 continue
             tail = f" · filled now {r['filled']:g}" if r["filled"] else " · resting"
-            lines.append(f"  {r['word']} (Grok {r['grok']}): NO &lt;= {r['no']}¢ (sell YES {r['yes']}¢){tail}")
+            lines.append(f"  {r['word']} (Grok {r['grok']}): NO <= {r['no']}¢ (sell YES {r['yes']}¢){tail}")
         skipped = n_candidates - len(take)
         if skipped > 0:
             lines.append(f"({skipped} more qualified but the nightly cap is {cap} words)")
@@ -357,7 +357,7 @@ def arm_tonight(run: dict) -> dict:
 
     client = _client()
     real_open = resolve_real_open(client, run["event_ticker"], date_str)
-    if real_open is None or _now() < real_open:
+    if real_open is None or _now() < real_open + timedelta(seconds=C.L_FIRE_DELAY_S):
         return {"ok": True, "reason": "waiting_open"}
     status = _probe_market_status(client, take[0]["forecast"]["market_ticker"])
     if status not in ("active", "open"):
@@ -391,8 +391,9 @@ def fast_arm_watch_tick() -> None:
     real_open = resolve_real_open(client, run["event_ticker"], date_str)
     if real_open is None:
         return
-    lead_at = real_open - timedelta(seconds=C.L_FAST_LEAD_SECONDS)
-    give_up_at = real_open + timedelta(seconds=C.L_FAST_GIVE_UP_SECONDS)
+    fire_at = real_open + timedelta(seconds=C.L_FIRE_DELAY_S)   # v1.7.3
+    lead_at = fire_at - timedelta(seconds=C.L_FAST_LEAD_SECONDS)
+    give_up_at = fire_at + timedelta(seconds=C.L_FAST_GIVE_UP_SECONDS)
     now = _now()
     if now < lead_at or now >= give_up_at:
         return
@@ -406,7 +407,7 @@ def fast_arm_watch_tick() -> None:
     while _now() < give_up_at:
         if store.get_state(_armed_key(date_str)):
             return
-        if _probe_market_status(client, probe_ticker) in ("active", "open"):
+        if _now() >= fire_at and _probe_market_status(client, probe_ticker) in ("active", "open"):
             _fire_l_orders(client, run, date_str, take, cap, n_candidates)
             return
         time.sleep(C.L_FAST_WATCH_SECONDS)

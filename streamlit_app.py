@@ -844,9 +844,8 @@ with tab_l:
                 f"(limit -${C.L_CIRCUIT_BREAKER_WEEKLY_LOSS:g}). No new L orders until this is cleared manually. "
                 f"Nothing auto-widens or auto-adjusts the rule or size.")
         fr = L["freeze"]
-        show_cap(md, f"Freeze: {fr['filled_trades']}/{fr['min_filled']} filled trades, "
-                    f"{fr['weeks_running'] if fr['weeks_running'] is not None else 0}/{fr['freeze_weeks']} weeks running. "
-                    f"{'Freeze window is OVER — a real read is possible.' if fr['frozen_window_over'] else 'Still inside the freeze window — no rule/size changes yet.'}")
+        show_cap(md, f"Filled trades so far: {fr['filled_trades']} · weeks running: "
+                    f"{fr['weeks_running'] if fr['weeks_running'] is not None else 0}")
         show_note(md, "success" if L["verdict"].startswith("CLEAR") else ("info" if L["n_settled"] < 10 else "warning"),
                   "STATUS: " + L["verdict"])
         lo, hi = L["range_90"]
@@ -1052,14 +1051,8 @@ with tab_lab:
 with tab_scalp:
     slot_scalp = st.container()
     md = MD("SCALP")
-    show_p(md,
-        f"Not a hold book: buys YES in batches any time the ask is **≤ {C.SCALP_BUY_MAX_CENTS}c**, from the decision time until "
-        f"**{C.SCALP_BUY_CUTOFF_HHMM} CT**, up to **${C.SCALP_BUDGET_DOLLARS:.0f} per word** (a target, not a guarantee — thin "
-        f"books partially fill and that's expected). Every batch rests its own sell at **{C.SCALP_SELL_CENTS}c** the moment it "
-        f"fills. Anything still unsold at **{C.SCALP_FALLBACK_HHMM} CT** sells at market. Qualify: Grok **≥ {C.SCALP_QUALIFY_PROB}%**.")
-    show_note(md, "info",
-        "Backed by a trade-by-trade backtest (Aug 17–Sep 23, 29 qualifying words, 14 nights): net ROI 16.7%–26.0% across every "
-        "sell target tried 75–95c, best cluster at 85/90c. **FROZEN** — do not tune before 30 completed round trips or 6 weeks.")
+    show_cap(md, f"Last buy {C.SCALP_BUY_CUTOFF_HHMM} CT · market-sell from {C.SCALP_FALLBACK_HHMM} CT · "
+                 f"${C.SCALP_BUDGET_DOLLARS:.0f} per word.")
     if PANEL is None:
         show_note(md, "error", f"SCALP could not load: {PANEL_ERR}")
     else:

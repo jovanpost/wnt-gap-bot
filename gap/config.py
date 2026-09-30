@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.7.2"  # SCALP: last buy 16:30 CT, market-sell everything left from 17:00 CT
+VERSION = "wnt-gap-v1.7.3"  # Book L fires L_FIRE_DELAY_S after the real open (default 5 min); plain-text Telegram; no freeze wording
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -214,6 +214,9 @@ L_LIVE_ON = _flag("L_LIVE_ON", False)
 # the nightly cap cannot fit every word.
 L_MAX_GROK = int(_num("L_MAX_GROK", 30))
 L_OFFSET_CENTS = int(_num("L_OFFSET_CENTS", 15))
+# v1.7.3: seconds AFTER Kalshi's real open before L sends. At the first second the book is
+# nearly empty, so a crossing limit fills at its worst allowed price (Pentagon, Sep 29).
+L_FIRE_DELAY_S = int(_num("L_FIRE_DELAY_S", 300))
 L_NOTIONAL_DOLLARS = float(_num("L_NOTIONAL_DOLLARS", 10.0))  # $ per word. Fixed, not a %, not scaled.
 L_NIGHTLY_CAP_DOLLARS = float(_num("L_NIGHTLY_CAP_DOLLARS", 50.0))
 L_MAX_WORDS_PER_NIGHT = int(_num("L_MAX_WORDS_PER_NIGHT", 5))  # first N qualifying words; never scaled down

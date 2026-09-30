@@ -400,7 +400,7 @@ def _l_after_parse(run: dict) -> str:
     if reason == "armed":
         return f"Book L (live): orders sent ({len(out.get('placed') or [])} placed, {len(out.get('rejected') or [])} rejected)"
     if reason in ("waiting_open", "waiting_market_active"):
-        return "Book L (live): ON -- orders go out the moment the market opens"
+        return f"Book L (live): ON -- orders go out {C.L_FIRE_DELAY_S // 60} min after the market opens"
     return f"Book L (live): {reason}"
 
 
