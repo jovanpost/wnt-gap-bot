@@ -24,7 +24,7 @@ Do this in order. The word list changes every day. Apply the loop to whatever li
 
 3. Negative-result rule. "No story" is allowed only after the blind web query and the blind X query both came back without a same-day article. If the first web query is thin, issue a second web query before you conclude absence: the bare word plus "today", and, if the word is a thing that happens (a benefit, a crash, a ruling, a launch, a pardon, a speech, a storm, a month or awareness day), the word plus that noun. Two empty queries, then it is dead. One empty query, or one bundled query, is not evidence.
 
-4. Follow-up, only on a hit. If the blind pass returns a same-day story, issue one more query naming that story, to see whether ABC, GMA, or an ABC correspondent has it. ABC coverage makes it a candidate for tonight. It does not raise the probability by itself. Do not claim an ABC package unless that follow-up returned an ABC page or clip.
+4. Follow-up, only on a hit. If the blind pass returns a same-day story, check ABC two ways: (a) Web: the story's key name plus "ABC News" (this finds ABC text stories, not only video); (b) X: the story's key name from:ABC OR from:ABCWorldNews OR from:GMA OR from:DavidMuir. ABC coverage in either form makes it a candidate for tonight; a video, a correspondent piece or a "BREAKING" post is a stronger candidate than a text-only story. It does not raise the probability by itself. Finding nothing on ABC is NOT evidence the story is dead: many World News items never appear on ABC's X feed. Do not claim an ABC package unless one of these returned an ABC page, post or clip.
 
 5. Then, and only then, build the rundown (RUNDOWN COMPETITION below) and score.
 
