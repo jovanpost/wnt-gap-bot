@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.9.2"  # feeds read as bytes (correct apostrophes); a 0-request limit fails at once instead of retrying
+VERSION = "wnt-gap-v1.9.3"  # a parsed night can never go back to waiting/expired: read-only /gap_resend, safe re-paste
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt

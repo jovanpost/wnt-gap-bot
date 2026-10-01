@@ -238,6 +238,19 @@ def _start_challengers(date_str: str, event_ticker: str, words: list[dict], past
         log.exception("challengers not started")
 
 
+def _has_forecasts(run: dict | None) -> bool:
+    """v1.9.3: the night already has Grok's numbers stored. From then on nothing may push it back
+    to 'waiting for the JSON' (Oct 1: a /gap_resend did, and at 4:30 the night was marked expired)."""
+    if not run:
+        return False
+    if run.get("status") in ("parsed", "parsed_waiting_decision"):
+        return True
+    try:
+        return bool(store.forecasts_for_run(run["id"]))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> dict:
     """Send the .txt only after detect + 60m, unless force."""
     date_str = clock.today_ct()
@@ -247,6 +260,19 @@ def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> 
         if not found.get("ok"):
             return found
         run = found["run"]
+
+    if force and _has_forecasts(run):
+        # v1.9.3: READ-ONLY resend. Sends tonight's file again so it can be read, but changes nothing:
+        # no status change, no new word list, no new file text, no challengers.
+        paste = run.get("prompt_text") or ""
+        if not paste:
+            return {"ok": False, "reason": "no stored file for tonight", "run": run}
+        notify.send_document(
+            f"gap-{date_str}-READ-ONLY.txt", paste,
+            f"WNT gap {date_str} -- READ-ONLY copy.\nTonight already has Grok's numbers. "
+            "Do NOT paste a JSON back; nothing about tonight was changed.")
+        store.log_activity("prompt_resent_readonly", f"{run.get('event_ticker')} status kept: {run.get('status')}")
+        return {"ok": True, "reason": "sent_readonly", "run": run}
 
     if run.get("status") not in ("detected", "awaiting_json") and not force:
         return {"ok": True, "reason": f"status_{run.get('status')}", "run": run}
@@ -320,7 +346,12 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
         return f"file not sent yet — waiting until {clock.fmt(due)}"
     if run.get("status") == "parsed" and not C.PAPER:
         return "already parsed today"
-    if clock.past_json_deadline(date_str) and run.get("status") != "parsed":
+    if store.l_orders_for_date(date_str):
+        # v1.9.3: second lock next to Book L's own once-per-night lock. Real orders exist tonight,
+        # so a new forecast must not re-book anything.
+        store.log_activity("parse_reject", "re-paste ignored: Book L already has real orders tonight")
+        return "Book L already placed real orders tonight — not re-parsing. Nothing was changed."
+    if clock.past_json_deadline(date_str) and not _has_forecasts(run):
         store.update_run(run["id"], status="expired", parse_error="past json deadline")
         return f"past {C.JSON_DEADLINE_CT} CT deadline — no trade today"
 
@@ -344,6 +375,10 @@ def ingest_json(raw: str, _msg: dict | None = None) -> str:
     try:
         parsed = parser.validate(raw, expected, event_date=date_str)
     except parser.ParseError as exc:
+        if _has_forecasts(run):
+            # v1.9.3: a broken re-paste must not undo a night that is already parsed.
+            store.log_activity("parse_reject", f"re-paste rejected, night kept as is: {exc}")
+            return f"rejected: {exc} (tonight's earlier forecast is kept, nothing changed)"
         store.update_run(
             run["id"],
             raw_response=raw[:20000],
@@ -623,7 +658,7 @@ def expire_if_needed() -> None:
     if not clock.past_json_deadline(date_str):
         return
     run = store.get_run_for_date(date_str)
-    if run and run.get("status") in ("awaiting_json", "detected"):
+    if run and run.get("status") in ("awaiting_json", "detected") and not _has_forecasts(run):
         store.update_run(run["id"], status="expired", parse_error="past json deadline")
         notify.send(f"{date_str}: JSON deadline passed — no gap trades today.")
         store.log_activity("expired", date_str)
@@ -709,6 +744,9 @@ def register_commands() -> None:
         out = dispatch_prompt(force=True)
         if not out.get("ok"):
             return f"resend failed: {out.get('reason')}"
+        if out.get("reason") == "sent_readonly":
+            return ("read-only copy sent: tonight already has Grok's numbers, so nothing was changed "
+                    f"(status stays {out['run'].get('status')}). Do not paste a JSON back.")
         return f"sent {out.get('n')} words — paste into a NEW Expert chat"
 
     def _sendnow(_args, _msg):
