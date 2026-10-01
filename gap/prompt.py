@@ -48,7 +48,7 @@ def __getattr__(name: str):
 
 
 def build_user_message(event_date: str, event_ticker: str, words: list[dict],
-                       history_block: str = "", headlines_block: str = "") -> str:
+                       history_block: str = "", headlines_block: str = "", abc_block: str = "") -> str:
     lines = [
         f"Date: {event_date}",
         f"Event: {event_ticker}",
@@ -59,12 +59,15 @@ def build_user_message(event_date: str, event_ticker: str, words: list[dict],
         lines.append(f"{i}. {w['word']}")
     if history_block:
         lines.append(history_block)
+    if abc_block:
+        lines.append(abc_block)
     if headlines_block:
         lines.append(headlines_block)
     lines += [
         "",
         "First do the MANDATORY RESEARCH PHASE for every word above (each side of a slash word separately, never two",
-        "list words in one query): read its GOOGLE NEWS HEADLINES above, fetch its Google News RSS, run its blind web",
+        "list words in one query): read its ABC NEWS FEEDS matches and its GOOGLE NEWS HEADLINES above, fetch its",
+        "Google News RSS, run its blind web",
         "search, its X search sorted Top, and its from:ABC X search (Top). A same-day US story using the word in a news",
         "sense is a hit, even an interview or a 'would consider'. Only after every word has been searched, write your",
         "final answer: valid JSON only, matching the schema, every reasoning starting with 'Blind: ...'.",
@@ -81,20 +84,34 @@ def build_paste_file(event_date: str, event_ticker: str, words: list[dict]) -> s
         except Exception:
             # Never let a history problem stop tonight's file. Grok works without it.
             log.exception("word history skipped")
-    heads = ""
-    try:
-        from . import headlines
-        heads = headlines.headlines_block(words)
-    except Exception:
-        # Never let a headlines problem stop tonight's file. Grok still searches itself.
-        log.exception("headlines skipped")
-    user = build_user_message(event_date, event_ticker, words, hist, heads)
+    heads, abc = _news_blocks(words)
+    user = build_user_message(event_date, event_ticker, words, hist, heads, abc)
     return (
         get_system_prompt().rstrip()
         + "\n\n---\n\n"
         + user
         + "\n"
     )
+
+
+def _news_blocks(words: list[dict]) -> tuple[str, str]:
+    """Google News (per word) and ABC feeds (one pass) fetched AT THE SAME TIME, so the file is
+    not delayed by both. Each has its own time budget; any failure gives "" for that block only."""
+    from concurrent.futures import ThreadPoolExecutor
+    from . import abcfeeds, headlines
+
+    def safe(fn, name):
+        try:
+            return fn(words)
+        except Exception:
+            # Never let a news problem stop tonight's file. Grok still searches itself.
+            log.exception("%s skipped", name)
+            return ""
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        g = pool.submit(safe, headlines.headlines_block, "headlines")
+        a = pool.submit(safe, abcfeeds.abc_block, "abc feeds")
+        return g.result(), a.result()
 
 
 def build_telegram_caption(event_date: str, event_ticker: str, n: int) -> str:

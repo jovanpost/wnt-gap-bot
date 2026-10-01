@@ -1,0 +1,75 @@
+"""Read-only preview of the news blocks that go into tonight's Grok file.
+
+    python3 scripts/preview_news.py            # today's words from Kalshi, ABC + Google News
+    python3 scripts/preview_news.py --abc-only # just ABC's feeds
+
+Touches NOTHING: no database, no Telegram, no orders, no Kalshi key (word list comes from
+Kalshi's public market list). Safe to run any time, even while orders are resting.
+Use this instead of /gap_resend to test: /gap_resend re-sends the file AND resets tonight's
+run to "waiting for JSON", which after the 4:30 PM CT deadline marks the night expired.
+
+Output has no secrets in it (titles, counts, times only), so it is safe to paste into chat.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from gap import abcfeeds, clock, config as C, headlines, netlimit  # noqa: E402
+from gap.kalshi import KalshiClient, uniquify_words, word_from_market  # noqa: E402
+
+
+def todays_words() -> tuple[str, list[dict]]:
+    client = KalshiClient(key_id="", private_key_pem="", private_key_path="")  # public data only
+    date_str = clock.today_ct()
+    tokens = clock.event_date_tokens(date_str)
+    events = client.get_events(C.SERIES, status="open")
+    hits = [e for e in events if any(t in (e.get("event_ticker") or "").upper() for t in tokens)]
+    event = hits[0] if hits else (events[0] if events else None)
+    if not event:
+        raise SystemExit(f"no open {C.SERIES} event found for {date_str}")
+    rows = []
+    for m in client.get_markets(event["event_ticker"]):
+        if (m.get("status") or "").lower() in ("settled", "closed", "finalized"):
+            continue
+        rows.append({"market_ticker": m.get("ticker"), "title": m.get("title") or "", "word": word_from_market(m)})
+    return event["event_ticker"], [{"word": r["word"]} for r in uniquify_words(rows)]
+
+
+def main(argv: list[str] | None = None, words: list[dict] | None = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--abc-only", action="store_true")
+    args = ap.parse_args(argv)
+
+    print(f"{C.VERSION} | news preview | read-only")
+    if words is None:
+        event_ticker, words = todays_words()
+        print(f"event {event_ticker}: {len(words)} words")
+
+    t0 = time.monotonic()
+    abc = abcfeeds.abc_block(words)
+    t_abc = time.monotonic() - t0
+    print(abc or "(ABC feeds switched off: ABC_FEEDS_ON=false)")
+
+    if not args.abc_only:
+        t1 = time.monotonic()
+        g = headlines.headlines_block(words)
+        t_g = time.monotonic() - t1
+        print(g or "(Google headlines switched off or empty)")
+    else:
+        t_g = 0.0
+
+    st = netlimit.stats()
+    print("")
+    print(f"SUMMARY: ABC {t_abc:.1f}s, Google {t_g:.1f}s, {st['requests']} web requests, "
+          f"{st['waited_s']:.1f}s total spacing wait (speed limit: {C.NET_MIN_GAP_S}s apart per site, "
+          f"max {C.NET_MAX_PARALLEL} at once)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.7.5"  # bot fetches Google News headlines per word into the Grok file; prompt: X Top + unconditional from:ABC + Google News RSS
+VERSION = "wnt-gap-v1.7.6"  # ABC News own RSS feeds in the Grok file (one pass per file) + shared per-site speed limit for news fetches
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -140,6 +140,21 @@ HEADLINES_TIMEOUT_S = float(_num("HEADLINES_TIMEOUT_S", 6))
 HEADLINES_BUDGET_S = float(_num("HEADLINES_BUDGET_S", 25))  # total time for all words; never delays the file more
 HEADLINES_WORKERS = int(_num("HEADLINES_WORKERS", 4))       # searches running at the same time
 HEADLINES_STAGGER_S = float(_num("HEADLINES_STAGGER_S", 0.2))  # small gap between starts, gentle on Google
+# v1.7.6: ABC News' own RSS feeds, read ONCE per Grok file (not per word): Top 25, then US,
+# Politics, World, GMA 15 each; Health 15 only when tonight's list has a health-type word.
+ABC_FEEDS_ON = _flag("ABC_FEEDS_ON", True)
+ABC_TOP_N = int(_num("ABC_TOP_N", 25))
+ABC_SECTION_N = int(_num("ABC_SECTION_N", 15))
+ABC_MAX_AGE_H = int(_num("ABC_MAX_AGE_H", 36))           # older items are dropped
+ABC_TIMEOUT_S = float(_num("ABC_TIMEOUT_S", 8))
+ABC_BUDGET_S = float(_num("ABC_BUDGET_S", 20))           # total time for all ABC feeds
+ABC_CACHE_S = int(_num("ABC_CACHE_S", 300))              # /gap_resend within 5 min reuses the feeds
+ABC_MATCHES_PER_WORD = int(_num("ABC_MATCHES_PER_WORD", 4))
+ABC_SKIP_FEEDS = {x.strip().lower() for x in _secret("ABC_SKIP_FEEDS", "").split(",") if x.strip()}
+# v1.7.6: shared speed limit for every outside news fetch, per website: requests start at least
+# NET_MIN_GAP_S apart, and at most NET_MAX_PARALLEL run at once. Google and ABC don't wait for each other.
+NET_MIN_GAP_S = float(_num("NET_MIN_GAP_S", 0.25))
+NET_MAX_PARALLEL = int(_num("NET_MAX_PARALLEL", 3))
 # v1.7.0: paper quotes are never frozen before Kalshi's real open + this many seconds (or
 # DECISION_LAG_MIN, whichever is later) -- no-fade needs a moment to save the first books.
 PAPER_MIN_AFTER_OPEN_S = int(_num("PAPER_MIN_AFTER_OPEN_S", 120))

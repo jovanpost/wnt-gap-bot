@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 
 import requests
 
-from . import config as C
+from . import config as C, netlimit
 
 log = logging.getLogger("gap.headlines")
 
@@ -70,16 +70,21 @@ def parse_rss(xml_text: str, limit: int) -> list[dict]:
     return items
 
 
-def fetch_one(term: str, limit: int | None = None) -> tuple[list[dict], str | None]:
-    """(items, error). error is None on success, else a short reason like 'HTTP 429' or 'timeout'."""
+def fetch_one(term: str, limit: int | None = None, deadline: float | None = None) -> tuple[list[dict], str | None]:
+    """(items, error). error is None on success, else a short reason like 'HTTP 429' or 'timeout'.
+    v1.7.6: every request takes a ticket from the shared per-site speed limit first (netlimit)."""
     limit = limit or C.HEADLINES_PER_TERM
     q = quote_plus(f'"{term}" when:1d')
+    url = RSS_SEARCH.format(q=q)
     try:
-        r = requests.get(RSS_SEARCH.format(q=q), timeout=C.HEADLINES_TIMEOUT_S, headers={"User-Agent": UA})
+        with netlimit.ticket(url, deadline):
+            r = requests.get(url, timeout=C.HEADLINES_TIMEOUT_S, headers={"User-Agent": UA})
         if r.status_code != 200:
             log.warning("headlines %s: HTTP %s", term, r.status_code)
             return [], f"HTTP {r.status_code}"
         return parse_rss(r.text, limit), None
+    except TimeoutError:
+        return [], "out of time"
     except requests.Timeout:
         log.warning("headlines %s: timeout", term)
         return [], "timeout"
@@ -106,19 +111,20 @@ def headlines_block(words: list[dict], fetcher=None) -> str:
         return ""
     now = datetime.now(timezone.utc).astimezone(C.CT).strftime("%-I:%M %p CT")
     jobs = [(w["word"], term) for w in words for term in search_terms(w["word"])]
+    deadline = time.monotonic() + C.HEADLINES_BUDGET_S
 
     def run(term: str):
         if fetcher is None:
-            return fetch_one(term, C.HEADLINES_PER_TERM)
+            return fetch_one(term, C.HEADLINES_PER_TERM, deadline)
         out = fetcher(term)
         return (out, None) if isinstance(out, list) else out
 
     results: dict = {}
     pool = ThreadPoolExecutor(max_workers=max(1, C.HEADLINES_WORKERS))
     futures = {}
-    for i, (_word, term) in enumerate(jobs):
+    for _word, term in jobs:
         if term not in futures:
-            futures[term] = pool.submit(_staggered, run, term, C.HEADLINES_STAGGER_S if i else 0.0)
+            futures[term] = pool.submit(run, term)  # spacing between starts is done by netlimit
     done, _not_done = wait(list(futures.values()), timeout=C.HEADLINES_BUDGET_S)
     pool.shutdown(wait=False, cancel_futures=True)
     for term, fut in futures.items():
