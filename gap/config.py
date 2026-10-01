@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.8.0"  # challenger forecasts (Gemini + no-AI baseline), paper only, scored vs Grok on Saturday
+VERSION = "wnt-gap-v1.8.1"  # Gemini retries the same request up to 30 min (no news re-fetch), downgrades only after 20 min
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -163,6 +163,8 @@ GEMINI_API_KEY = _secret("GEMINI_API_KEY", "").strip()   # Google AI Studio key;
 GEMINI_MODEL = _secret("GEMINI_MODEL", "auto").strip()   # "auto" = newest Flash the key can use
 GEMINI_SEARCH = _flag("GEMINI_SEARCH", False)            # Google Search grounding (needs billing on)
 GEMINI_TIMEOUT_S = float(_num("GEMINI_TIMEOUT_S", 300))
+GEMINI_RETRY_BUDGET_S = float(_num("GEMINI_RETRY_BUDGET_S", 1800))      # keep retrying the same request up to 30 min
+GEMINI_DOWNGRADE_AFTER_S = float(_num("GEMINI_DOWNGRADE_AFTER_S", 1200))  # step down a model only after 20 min of failures
 BASELINE_ON = _flag("BASELINE_ON", True)
 # v1.7.0: paper quotes are never frozen before Kalshi's real open + this many seconds (or
 # DECISION_LAG_MIN, whichever is later) -- no-fade needs a moment to save the first books.

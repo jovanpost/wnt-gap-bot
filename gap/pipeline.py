@@ -725,6 +725,8 @@ def register_commands() -> None:
         if isinstance(words, str):
             import json as _json
             words = _json.loads(words)
+        if shadow.is_running():
+            return "challengers are still running (Gemini may be retrying, up to 30 min) -- the table comes here when done"
         done = store.shadow_models_for(date_str)
         need_gemini = bool(C.GEMINI_API_KEY) and not any(m.startswith("gemini:") for m in done)
         need_base = C.BASELINE_ON and shadow.BASELINE not in done

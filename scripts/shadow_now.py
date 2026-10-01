@@ -73,7 +73,10 @@ def main() -> int:
     if db_url:
         apply_shadow_table()
     paste = prompt.build_paste_file(date_str, event_ticker, words)
-    rep = shadow.run(date_str, event_ticker, words, paste, save=bool(db_url))
+    print("if Google is busy it retries the SAME request for up to "
+          f"{C.GEMINI_RETRY_BUDGET_S / 60:.0f} min (Ctrl-C to stop; nothing is lost)")
+    rep = shadow.run(date_str, event_ticker, words, paste, save=bool(db_url),
+                     on_attempt=lambda msg: print("  gemini", msg, flush=True))
     grok = {}
     if db_url:
         grok = {f["word"]: f["probability"] for f in store.grok_forecasts_for_date(date_str)}

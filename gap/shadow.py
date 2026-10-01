@@ -89,11 +89,32 @@ def _gemini_text(resp: dict) -> str:
     return "".join(p.get("text", "") for p in parts if not p.get("thought"))
 
 
-def gemini_forecast(paste: str, words: list[str], event_date: str) -> dict:
-    """{"model", "forecasts": [...], "seconds"}. Tries candidate models in order; a model the free
-    tier refuses (429/403/404) just moves on to the next one."""
+RETRYABLE = {429, 500, 502, 503, 504}
+BACKOFF_S = (30, 60, 120, 180, 300)          # wait after try 1, 2, 3, 4, then 300s each time
+
+
+def _err_status(r) -> str:
+    try:
+        return (r.json().get("error") or {}).get("status", "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def gemini_forecast(paste: str, words: list[str], event_date: str, *, budget_s: float | None = None,
+                    sleep=None, now=None, on_attempt=None) -> dict:
+    """{"model", "forecasts", "seconds", "attempts", "waited_s"}.
+
+    v1.8.1 retry rule (Jovan, Oct 1): the SAME request (same file text, no new news fetch) is sent
+    again and again while Google says it is busy (429/5xx), timeouts or bad JSON -- waiting 30s,
+    60s, 120s, 180s, then 300s between tries -- for up to GEMINI_RETRY_BUDGET_S (30 min).
+    It stays on the best model; only after GEMINI_DOWNGRADE_AFTER_S (20 min) of failures does it
+    step down one model per failed try. A model the key cannot use at all (403/404) is skipped at once."""
     if not C.GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
+    sleep = sleep or time.sleep
+    now = now or time.monotonic
+    budget = C.GEMINI_RETRY_BUDGET_S if budget_s is None else budget_s
+    say = on_attempt or (lambda msg: log.info("gemini: %s", msg))
     tools = ("You may use Google Search." if C.GEMINI_SEARCH
              else "You have NO web, X or browsing tools in this run.")
     body = {
@@ -105,35 +126,72 @@ def gemini_forecast(paste: str, words: list[str], event_date: str) -> dict:
         body["tools"] = [{"google_search": {}}]
     else:
         body["generationConfig"]["responseMimeType"] = "application/json"
+    payload = json.dumps(body)                  # built ONCE: every retry sends exactly this
 
-    errors = []
-    for model in gemini_candidates()[:4]:
-        url = f"{GEMINI_BASE}/models/{model}:generateContent"
-        t0 = time.monotonic()
+    start = now()
+    cands: list[str] = []
+    level = 0
+    attempt = 0
+    waited = 0.0
+    last = ""
+    while True:
+        attempt += 1
+        err = None
+        model = None
+        t0 = now()
         try:
+            if not cands:
+                cands = gemini_candidates()
+                if not cands:
+                    raise RuntimeError("no Gemini Flash model available to this key")
+            model = cands[min(level, len(cands) - 1)]
+            url = f"{GEMINI_BASE}/models/{model}:generateContent"
             with netlimit.ticket(url):
-                r = requests.post(url, headers=_gemini_headers(), data=json.dumps(body), timeout=C.GEMINI_TIMEOUT_S)
+                r = requests.post(url, headers=_gemini_headers(), data=payload, timeout=C.GEMINI_TIMEOUT_S)
+            if r.status_code == 200:
+                try:
+                    data = parser.validate(_gemini_text(r.json()), words, event_date)
+                    return {"model": f"gemini:{model}", "forecasts": data["forecasts"],
+                            "seconds": round(now() - t0, 1), "attempts": attempt, "waited_s": round(waited)}
+                except Exception as exc:  # noqa: BLE001
+                    err = f"bad answer ({str(exc)[:120]})"
+            elif r.status_code in (403, 404):
+                cands.remove(model)             # this key cannot use it: skip, no waiting
+                level = min(level, max(len(cands) - 1, 0))
+                last = f"{model}: HTTP {r.status_code} {_err_status(r)}".strip()
+                say(f"try {attempt}: {last} -> skipping that model")
+                if not cands:
+                    raise RuntimeError(f"Gemini failed: no usable model ({last})")
+                continue
+            elif r.status_code in RETRYABLE:
+                err = f"HTTP {r.status_code} {_err_status(r)}".strip()
+            else:
+                raise RuntimeError(f"Gemini failed: {model}: HTTP {r.status_code} {_err_status(r)}".strip())
         except requests.Timeout:
-            errors.append(f"{model}: timeout")
-            continue
-        if r.status_code in (403, 404, 429, 500, 503):
-            msg = ""
-            try:
-                msg = (r.json().get("error") or {}).get("status", "")
-            except Exception:  # noqa: BLE001
-                pass
-            errors.append(f"{model}: HTTP {r.status_code} {msg}".strip())
-            continue
-        if r.status_code != 200:
-            raise RuntimeError(f"{model}: HTTP {r.status_code}")
-        txt = _gemini_text(r.json())
-        try:
-            data = parser.validate(txt, words, event_date)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{model}: bad JSON ({exc})")
-            continue
-        return {"model": f"gemini:{model}", "forecasts": data["forecasts"], "seconds": round(time.monotonic() - t0, 1)}
-    raise RuntimeError("Gemini failed: " + "; ".join(errors or ["no models available"]))
+            err = "timeout"
+        except requests.RequestException as exc:
+            err = type(exc).__name__
+        except RuntimeError as exc:
+            if str(exc).startswith("Gemini failed"):
+                raise
+            m = re.search(r"model list: HTTP (\d+)", str(exc))
+            if not m or int(m.group(1)) not in RETRYABLE:
+                raise RuntimeError(f"Gemini failed: {exc}") from exc   # e.g. a wrong key: no point waiting
+            err = str(exc)                      # model list busy: retry it like any busy answer
+
+        last = f"{model or 'model list'}: {err}"
+        elapsed = now() - start
+        delay = BACKOFF_S[min(attempt - 1, len(BACKOFF_S) - 1)]
+        if elapsed + delay > budget:
+            raise RuntimeError(f"Gemini failed: gave up after {attempt} tries in {elapsed / 60:.0f} min "
+                               f"(last: {last})")
+        if cands and elapsed >= C.GEMINI_DOWNGRADE_AFTER_S and level < len(cands) - 1:
+            level += 1
+            say(f"try {attempt}: {last}; over {C.GEMINI_DOWNGRADE_AFTER_S // 60:.0f} min of failures -> "
+                f"next try uses {cands[level]}")
+        say(f"try {attempt}: {last}; same request again in {delay}s")
+        sleep(delay)
+        waited += delay
 
 
 # ---------------------------------------------------------------- no-AI baseline
@@ -204,7 +262,7 @@ def baseline_forecast(words: list[dict], news: dict, history_block: str) -> list
 # ---------------------------------------------------------------- run + store
 
 def run(event_date: str, event_ticker: str, words: list[dict], paste: str, history_block: str = "",
-        save: bool = True, force: bool = False) -> dict:
+        save: bool = True, force: bool = False, on_attempt=None) -> dict:
     """Run every challenger once for the night. Returns {model: {"ok", "n"|"error", "forecasts"}}.
     With save=False nothing is written (used by the Mac test script without a database)."""
     report: dict = {}
@@ -212,7 +270,6 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
         return report
     by_word = {w["word"]: w for w in words}
     done = store.shadow_models_for(event_date) if (save and not force) else set()
-    news = abcfeeds.news_data(words)          # reuses the Grok file's news if fresh
 
     def keep(model: str, rows: list[dict], seconds=None, raw=None):
         stored = [{
@@ -227,6 +284,7 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
 
     if C.BASELINE_ON and (force or BASELINE not in done):
         try:
+            news = abcfeeds.news_data(words)   # reuses the Grok file's news if fresh; Gemini never fetches news
             keep(BASELINE, baseline_forecast(words, news, history_block or paste))  # paste carries WORD HISTORY
         except Exception as exc:  # noqa: BLE001
             log.exception("baseline failed")
@@ -234,8 +292,9 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
 
     if C.GEMINI_API_KEY and (force or not any(m.startswith("gemini:") for m in done)):
         try:
-            g = gemini_forecast(paste, [w["word"] for w in words], event_date)
+            g = gemini_forecast(paste, [w["word"] for w in words], event_date, on_attempt=on_attempt)
             keep(g["model"], g["forecasts"], g["seconds"])
+            report[g["model"]].update(attempts=g["attempts"], waited_s=g["waited_s"])
         except Exception as exc:  # noqa: BLE001
             log.warning("gemini failed: %s", exc)
             report["gemini"] = {"ok": False, "error": str(exc)[:300]}
@@ -251,7 +310,10 @@ def summary_text(event_date: str, words: list[dict], report: dict, grok: dict[st
     lines = [f"CHALLENGERS {event_date} (paper only, never traded)"]
     for m, r in report.items():
         if r.get("ok"):
-            lines.append(f"- {m}: {r['n']} words" + (f", {r['seconds']}s" if r.get("seconds") else ""))
+            extra = f", {r['seconds']}s" if r.get("seconds") else ""
+            if r.get("attempts", 1) > 1:
+                extra += f", {r['attempts']} tries, waited {r['waited_s'] // 60:.0f} min {r['waited_s'] % 60:.0f}s"
+            lines.append(f"- {m}: {r['n']} words{extra}")
         else:
             lines.append(f"- {m}: FAILED ({r.get('error')})")
     lines.append("")
@@ -262,6 +324,10 @@ def summary_text(event_date: str, words: list[dict], report: dict, grok: dict[st
         cells += [str(report[m]["forecasts"].get(word, "-")) for m in models]
         lines.append(" | ".join(cells))
     return "\n".join(lines)
+
+
+def is_running() -> bool:
+    return _running.locked()
 
 
 def run_async(event_date: str, event_ticker: str, words: list[dict], paste: str, history_block: str = "",
