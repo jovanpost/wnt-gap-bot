@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.7.6"  # ABC News own RSS feeds in the Grok file (one pass per file) + shared per-site speed limit for news fetches
+VERSION = "wnt-gap-v1.7.7"  # ABC matcher: title vs summary tags, FlyDubai-style joined words, ABC items from Google News, International feed
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -141,7 +141,7 @@ HEADLINES_BUDGET_S = float(_num("HEADLINES_BUDGET_S", 25))  # total time for all
 HEADLINES_WORKERS = int(_num("HEADLINES_WORKERS", 4))       # searches running at the same time
 HEADLINES_STAGGER_S = float(_num("HEADLINES_STAGGER_S", 0.2))  # small gap between starts, gentle on Google
 # v1.7.6: ABC News' own RSS feeds, read ONCE per Grok file (not per word): Top 25, then US,
-# Politics, World, GMA 15 each; Health 15 only when tonight's list has a health-type word.
+# Politics, International 15 each (v1.7.7: World and GMA feeds are empty at ABC); Health 15 only when tonight's list has a health-type word.
 ABC_FEEDS_ON = _flag("ABC_FEEDS_ON", True)
 ABC_TOP_N = int(_num("ABC_TOP_N", 25))
 ABC_SECTION_N = int(_num("ABC_SECTION_N", 15))

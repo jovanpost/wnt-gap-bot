@@ -95,23 +95,14 @@ def build_paste_file(event_date: str, event_ticker: str, words: list[dict]) -> s
 
 
 def _news_blocks(words: list[dict]) -> tuple[str, str]:
-    """Google News (per word) and ABC feeds (one pass) fetched AT THE SAME TIME, so the file is
-    not delayed by both. Each has its own time budget; any failure gives "" for that block only."""
-    from concurrent.futures import ThreadPoolExecutor
-    from . import abcfeeds, headlines
-
-    def safe(fn, name):
-        try:
-            return fn(words)
-        except Exception:
-            # Never let a news problem stop tonight's file. Grok still searches itself.
-            log.exception("%s skipped", name)
-            return ""
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        g = pool.submit(safe, headlines.headlines_block, "headlines")
-        a = pool.submit(safe, abcfeeds.abc_block, "abc feeds")
-        return g.result(), a.result()
+    """(google_block, abc_block). Fetched together; any failure gives "" for that block only."""
+    try:
+        from . import abcfeeds
+        return abcfeeds.news_blocks(words)
+    except Exception:
+        # Never let a news problem stop tonight's file. Grok still searches itself.
+        log.exception("news blocks skipped")
+        return "", ""
 
 
 def build_telegram_caption(event_date: str, event_ticker: str, n: int) -> str:

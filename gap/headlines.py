@@ -103,14 +103,13 @@ def _ct(dt: datetime | None) -> str:
     return dt.astimezone(C.CT).strftime("%b %d %-I:%M %p CT")
 
 
-def headlines_block(words: list[dict], fetcher=None) -> str:
-    """The text block for the Grok file. Fetches every term in parallel (HEADLINES_WORKERS at a
-    time, a small gap between starts) inside one HEADLINES_BUDGET_S time limit. Returns "" only
-    when headlines are switched off; if Google blocked every request it returns one line saying so."""
-    if not C.HEADLINES_ON:
-        return ""
-    now = datetime.now(timezone.utc).astimezone(C.CT).strftime("%-I:%M %p CT")
+def fetch_all(words: list[dict], fetcher=None) -> tuple[list[tuple], dict]:
+    """Fetch every term in parallel (HEADLINES_WORKERS at a time, spacing by netlimit) inside one
+    HEADLINES_BUDGET_S time limit. Returns (jobs, results): jobs = [(word, term)], results =
+    {term: (items, error)}. v1.7.7: split from the text so the ABC block can reuse ABC-sourced items."""
     jobs = [(w["word"], term) for w in words for term in search_terms(w["word"])]
+    if not C.HEADLINES_ON:
+        return jobs, {}
     deadline = time.monotonic() + C.HEADLINES_BUDGET_S
 
     def run(term: str):
@@ -128,8 +127,18 @@ def headlines_block(words: list[dict], fetcher=None) -> str:
     done, _not_done = wait(list(futures.values()), timeout=C.HEADLINES_BUDGET_S)
     pool.shutdown(wait=False, cancel_futures=True)
     for term, fut in futures.items():
-        results[term] = fut.result() if fut in done else ([], "out of time")
+        try:
+            results[term] = fut.result() if fut in done else ([], "out of time")
+        except Exception as exc:  # noqa: BLE001
+            results[term] = ([], type(exc).__name__)
+    return jobs, results
 
+
+def render(jobs: list[tuple], results: dict) -> str:
+    """The Google News text block. "" when headlines are off or nothing came back."""
+    if not C.HEADLINES_ON:
+        return ""
+    now = datetime.now(timezone.utc).astimezone(C.CT).strftime("%-I:%M %p CT")
     lines = [
         "",
         f"GOOGLE NEWS HEADLINES (fetched by the bot at {now}; Google News search, last 24 hours, raw).",
@@ -159,6 +168,13 @@ def headlines_block(words: list[dict], fetcher=None) -> str:
         return (f"\nGOOGLE NEWS HEADLINES: unavailable today ({common}). "
                 "Do every search step yourself; nothing here means anything about any word.")
     return "\n".join(lines) if got_any else ""
+
+
+def headlines_block(words: list[dict], fetcher=None) -> str:
+    """Fetch + text in one call (kept for older callers and tests)."""
+    if not C.HEADLINES_ON:
+        return ""
+    return render(*fetch_all(words, fetcher))
 
 
 def _staggered(fn, term: str, delay: float):

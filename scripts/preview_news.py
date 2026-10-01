@@ -19,7 +19,7 @@ import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from gap import abcfeeds, clock, config as C, headlines, netlimit  # noqa: E402
+from gap import abcfeeds, clock, config as C, netlimit  # noqa: E402
 from gap.kalshi import KalshiClient, uniquify_words, word_from_market  # noqa: E402
 
 
@@ -51,21 +51,18 @@ def main(argv: list[str] | None = None, words: list[dict] | None = None) -> int:
         print(f"event {event_ticker}: {len(words)} words")
 
     t0 = time.monotonic()
-    abc = abcfeeds.abc_block(words)
-    t_abc = time.monotonic() - t0
-    print(abc or "(ABC feeds switched off: ABC_FEEDS_ON=false)")
-
-    if not args.abc_only:
-        t1 = time.monotonic()
-        g = headlines.headlines_block(words)
-        t_g = time.monotonic() - t1
-        print(g or "(Google headlines switched off or empty)")
+    if args.abc_only:
+        g, abc = "", abcfeeds.abc_block(words)
     else:
-        t_g = 0.0
+        g, abc = abcfeeds.news_blocks(words)   # exactly what the Grok file gets
+    took = time.monotonic() - t0
+    print(abc or "(ABC feeds switched off: ABC_FEEDS_ON=false)")
+    if not args.abc_only:
+        print(g or "(Google headlines switched off or empty)")
 
     st = netlimit.stats()
     print("")
-    print(f"SUMMARY: ABC {t_abc:.1f}s, Google {t_g:.1f}s, {st['requests']} web requests, "
+    print(f"SUMMARY: {took:.1f}s total (ABC and Google at the same time), {st['requests']} web requests, "
           f"{st['waited_s']:.1f}s total spacing wait (speed limit: {C.NET_MIN_GAP_S}s apart per site, "
           f"max {C.NET_MAX_PARALLEL} at once)")
     return 0
