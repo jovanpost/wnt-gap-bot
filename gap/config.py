@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.7.3"  # Book L fires L_FIRE_DELAY_S after the real open (default 5 min); plain-text Telegram; no freeze wording
+VERSION = "wnt-gap-v1.7.4"  # Grok prompt: mandatory per-word blind search before any score; user message no longer says "JSON only, no preamble"
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt

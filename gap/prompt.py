@@ -61,7 +61,10 @@ def build_user_message(event_date: str, event_ticker: str, words: list[dict],
         lines.append(history_block)
     lines += [
         "",
-        "Output valid JSON only, matching the schema. No preamble, no markdown fences.",
+        "First do the MANDATORY RESEARCH PHASE: for every word above, its own blind web search and its own X search",
+        "for today's date (each side of a slash word separately, never two list words in one query, no ABC filter on",
+        "this pass; two empty searches before you call a word dead). Only after every word has been searched,",
+        "write your final answer: valid JSON only, matching the schema, every reasoning starting with 'Blind: ...'.",
     ]
     return "\n".join(lines)
 
