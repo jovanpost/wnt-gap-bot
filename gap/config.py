@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.9.1"  # other networks + wires in the Grok file; challengers obey Retry-After, OpenRouter fallbacks, 10-min answers
+VERSION = "wnt-gap-v1.9.2"  # feeds read as bytes (correct apostrophes); a 0-request limit fails at once instead of retrying
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt

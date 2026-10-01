@@ -195,3 +195,31 @@ def test_default_lineup():
     assert "mistral:mistral-small" in C.CHALLENGERS
     assert "nvidia:nvidia/nemotron-3-ultra-550b-a55b" in C.CHALLENGERS
     assert not any(c.startswith("nvidia:qwen") for c in C.CHALLENGERS)   # NVIDIA lists no Qwen today
+
+
+# ---------- v1.9.2 ----------
+
+def test_feed_bytes_keep_apostrophes(monkeypatch):
+    xml = ("<?xml version='1.0' encoding='utf-8'?><rss><channel><item><title>Trump says he’d consider pardoning"
+           f"</title><pubDate>{format_datetime(NOW)}</pubDate></item></channel></rss>").encode("utf-8")
+
+    class Raw:
+        status_code, content = 200, xml
+
+        @property
+        def text(self):                      # what requests guesses without a charset header
+            return xml.decode("latin-1")
+    monkeypatch.setattr(morefeeds.requests, "get", lambda url, **kw: Raw())
+    items, err = morefeeds.fetch_feed("yahoo", "https://news.yahoo.com/rss", "net")
+    assert err is None and items[0]["title"] == "Trump says he’d consider pardoning"
+
+
+def test_zero_allowance_fails_at_once(monkeypatch):
+    monkeypatch.setattr(C, "MISTRAL_API_KEY", "k")
+    monkeypatch.setattr(CH.requests, "post", lambda url, **kw: R(
+        429, js={"message": "Rate limit exceeded"},
+        headers={"x-ratelimit-limit-req-minute": "0", "x-ratelimit-remaining-req-minute": "0"}))
+    slept = []
+    with pytest.raises(CH.Fatal, match="0 requests a minute"):
+        CH.forecast("mistral", "mistral-small-2603", "file", WORDS, "2026-10-01", shadow.PREFACE, sleep=slept.append)
+    assert slept == []

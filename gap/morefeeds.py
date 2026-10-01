@@ -29,7 +29,7 @@ from email.utils import parsedate_to_datetime
 import requests
 
 from . import config as C, netlimit
-from .headlines import search_terms
+from .headlines import body_of, search_terms
 
 log = logging.getLogger("gap.morefeeds")
 UA = "Mozilla/5.0 (compatible; wnt-gap-bot news-feeds)"
@@ -117,7 +117,7 @@ def fetch_feed(key: str, url: str, kind: str, deadline: float | None = None) -> 
             r = requests.get(url, timeout=C.MORE_FEEDS_TIMEOUT_S, headers={"User-Agent": UA}, allow_redirects=True)
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}"
-        items = parse(r.text, C.MORE_FEEDS_N, strip_source=(kind != "net"))
+        items = parse(body_of(r), C.MORE_FEEDS_N, strip_source=(kind != "net"))
         why = check(items)
         out = ([], why) if why else (items, None)
     except TimeoutError:

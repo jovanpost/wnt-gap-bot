@@ -178,6 +178,16 @@ def _limit_info(r) -> tuple[str, float | None]:
     return ("; ".join(keep), ra)
 
 
+def _zero_allowance(r) -> bool:
+    """True when the service says this key's limit itself is 0 (e.g. Mistral without a plan:
+    x-ratelimit-limit-req-minute=0). Retrying cannot help then."""
+    try:
+        h = {k.lower(): str(v).strip() for k, v in (r.headers or {}).items()}
+    except Exception:  # noqa: BLE001
+        return False
+    return any(k.startswith("x-ratelimit-limit") and v == "0" for k, v in h.items())
+
+
 def _err_msg(r) -> str:
     try:
         js = r.json()
@@ -235,6 +245,9 @@ def forecast(provider: str, model: str, paste: str, words: list[str], event_date
                 raise Fatal(f"{label}: key refused (HTTP {r.status_code}) {_err_msg(r)}".strip())
             elif r.status_code == 404:
                 raise Fatal(f"{label}: model not found (HTTP 404) {_err_msg(r)}".strip())
+            elif r.status_code == 429 and _zero_allowance(r):
+                raise Fatal(f"{label}: this account is allowed 0 requests a minute -- the free plan is not "
+                            "switched on for this key (waiting will not help)")
             elif r.status_code in RETRYABLE:
                 info, retry_after = _limit_info(r)
                 err = f"HTTP {r.status_code} {_err_msg(r)}".strip() + (f" [{info}]" if info else "")

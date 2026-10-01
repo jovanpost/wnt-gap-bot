@@ -31,6 +31,13 @@ RSS_SEARCH = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en
 UA = "Mozilla/5.0 (compatible; wnt-gap-bot headlines)"
 
 
+def body_of(r):
+    """The raw bytes of a feed answer, so the XML's own encoding line decides how letters are read.
+    v1.9.2: r.text guessed Latin-1 for feeds without a charset header, turning he'd into heâ\x80\x99d."""
+    raw = getattr(r, "content", None)
+    return raw if isinstance(raw, (bytes, bytearray)) and raw else r.text
+
+
 def search_terms(word: str) -> list[str]:
     """'Trump (5+ times)' -> ['Trump']; 'SpaceX / NASA' -> ['SpaceX', 'NASA']."""
     base = re.sub(r"\([^)]*\)", " ", word or "")
@@ -82,7 +89,7 @@ def fetch_one(term: str, limit: int | None = None, deadline: float | None = None
         if r.status_code != 200:
             log.warning("headlines %s: HTTP %s", term, r.status_code)
             return [], f"HTTP {r.status_code}"
-        return parse_rss(r.text, limit), None
+        return parse_rss(body_of(r), limit), None
     except TimeoutError:
         return [], "out of time"
     except requests.Timeout:

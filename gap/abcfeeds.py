@@ -30,7 +30,7 @@ from email.utils import parsedate_to_datetime
 import requests
 
 from . import config as C, netlimit
-from .headlines import search_terms
+from .headlines import body_of, search_terms
 
 log = logging.getLogger("gap.abcfeeds")
 
@@ -139,7 +139,7 @@ def fetch_feed(name: str, limit: int, deadline: float | None = None) -> tuple[li
         if r.status_code != 200:
             log.warning("abc feed %s: HTTP %s", name, r.status_code)
             return [], f"HTTP {r.status_code}"
-        items = parse_feed(r.text, limit)
+        items = parse_feed(body_of(r), limit)
         with _cache_lock:
             _cache[url] = (time.time(), items)
         return items[:], None
