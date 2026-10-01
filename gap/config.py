@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.7.4"  # Grok prompt: mandatory per-word blind search before any score; user message no longer says "JSON only, no preamble"
+VERSION = "wnt-gap-v1.7.5"  # bot fetches Google News headlines per word into the Grok file; prompt: X Top + unconditional from:ABC + Google News RSS
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -132,6 +132,14 @@ VARIANTS = tuple(v for v in ALL_VARIANTS if v["id"] not in DISABLED_BOOKS)
 EDGE_EXEC_THRESHOLD = int(_num("EDGE_EXEC_THRESHOLD", 10))
 # Quotes: newest depth snapshot at/before the decision time, at most this old (seconds).
 QUOTE_MAX_AGE_S = int(_num("QUOTE_MAX_AGE_S", 600))
+# v1.7.5: the bot fetches Google News search RSS for every word (each side of a slash word)
+# and prints the top titles into the Grok file. Off switch + size + timeout per request.
+HEADLINES_ON = _flag("HEADLINES_ON", True)
+HEADLINES_PER_TERM = int(_num("HEADLINES_PER_TERM", 6))
+HEADLINES_TIMEOUT_S = float(_num("HEADLINES_TIMEOUT_S", 6))
+HEADLINES_BUDGET_S = float(_num("HEADLINES_BUDGET_S", 25))  # total time for all words; never delays the file more
+HEADLINES_WORKERS = int(_num("HEADLINES_WORKERS", 4))       # searches running at the same time
+HEADLINES_STAGGER_S = float(_num("HEADLINES_STAGGER_S", 0.2))  # small gap between starts, gentle on Google
 # v1.7.0: paper quotes are never frozen before Kalshi's real open + this many seconds (or
 # DECISION_LAG_MIN, whichever is later) -- no-fade needs a moment to save the first books.
 PAPER_MIN_AFTER_OPEN_S = int(_num("PAPER_MIN_AFTER_OPEN_S", 120))

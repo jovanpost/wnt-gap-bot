@@ -48,7 +48,7 @@ def __getattr__(name: str):
 
 
 def build_user_message(event_date: str, event_ticker: str, words: list[dict],
-                       history_block: str = "") -> str:
+                       history_block: str = "", headlines_block: str = "") -> str:
     lines = [
         f"Date: {event_date}",
         f"Event: {event_ticker}",
@@ -59,12 +59,15 @@ def build_user_message(event_date: str, event_ticker: str, words: list[dict],
         lines.append(f"{i}. {w['word']}")
     if history_block:
         lines.append(history_block)
+    if headlines_block:
+        lines.append(headlines_block)
     lines += [
         "",
-        "First do the MANDATORY RESEARCH PHASE: for every word above, its own blind web search and its own X search",
-        "for today's date (each side of a slash word separately, never two list words in one query, no ABC filter on",
-        "this pass; two empty searches before you call a word dead). Only after every word has been searched,",
-        "write your final answer: valid JSON only, matching the schema, every reasoning starting with 'Blind: ...'.",
+        "First do the MANDATORY RESEARCH PHASE for every word above (each side of a slash word separately, never two",
+        "list words in one query): read its GOOGLE NEWS HEADLINES above, fetch its Google News RSS, run its blind web",
+        "search, its X search sorted Top, and its from:ABC X search (Top). A same-day US story using the word in a news",
+        "sense is a hit, even an interview or a 'would consider'. Only after every word has been searched, write your",
+        "final answer: valid JSON only, matching the schema, every reasoning starting with 'Blind: ...'.",
     ]
     return "\n".join(lines)
 
@@ -78,7 +81,14 @@ def build_paste_file(event_date: str, event_ticker: str, words: list[dict]) -> s
         except Exception:
             # Never let a history problem stop tonight's file. Grok works without it.
             log.exception("word history skipped")
-    user = build_user_message(event_date, event_ticker, words, hist)
+    heads = ""
+    try:
+        from . import headlines
+        heads = headlines.headlines_block(words)
+    except Exception:
+        # Never let a headlines problem stop tonight's file. Grok still searches itself.
+        log.exception("headlines skipped")
+    user = build_user_message(event_date, event_ticker, words, hist, heads)
     return (
         get_system_prompt().rstrip()
         + "\n\n---\n\n"
