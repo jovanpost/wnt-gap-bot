@@ -1985,7 +1985,7 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines.append(" 4B BOOK K, K_HIGH, K_LOW for A and B, A-vs-B  4C fills by Grok bucket  4D capacity, segment frequency, size sweep, long-rest shadow")
     lines.append(" 4E STRATEGY LAB: report-only variants taken at market, grid, growth check   4F BOOK M vs K_HIGH")
     lines.append(f" 4G FILL TIMING (adverse selection)   4H SCALP: buy<=70c / sell 85c / market-sell at {C.SCALP_FALLBACK_HHMM}")
-    lines.append(" 4I BOOK L (LIVE, real money): same rule as K, side by side")
+    lines.append(" 4I BOOK L (LIVE, real money): same rule as K, side by side   4J CHALLENGERS: Gemini + no-AI baseline vs Grok")
 
     _hdr(lines, "1. NIGHT STATUS")
     lines += _nights_status_block(data)
@@ -2013,6 +2013,12 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines += _scalp_block(data)
     _hdr(lines, "4I. BOOK L (LIVE, real money): same rule as K, side by side")
     lines += _l_block(data)
+    _hdr(lines, "4J. CHALLENGERS (paper only): Gemini and the no-AI baseline vs Grok, Brier on the same words")
+    try:
+        from . import shadow
+        lines += shadow.weekly_block(data["start"], data["end"])
+    except Exception as exc:  # never let this section break the dump
+        lines.append(f"(challenger section failed: {type(exc).__name__})")
     _hdr(lines, "5. FILL-SELECTION CHECK (do fills happen mostly when the market moves against us?)")
     lines += _fill_selection_block(data)
     _hdr(lines, "6. HOW GOOD IS GROK? (every word with a result; market comparisons use valid quotes only)")

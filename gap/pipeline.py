@@ -224,6 +224,20 @@ def detect_event(client: KalshiClient | None = None) -> dict:
     return {"ok": True, "reason": "detected", "run": store.get_run_for_date(date_str), "n": len(words), "how": how}
 
 
+def _start_challengers(date_str: str, event_ticker: str, words: list[dict], paste: str) -> None:
+    """v1.8.0: paper-only challenger forecasts (Gemini + no-AI baseline) in a background thread,
+    with the same news as the Grok file. Never touches orders; any failure is only logged.
+    Runs once per night (a resend does not re-ask models that already answered)."""
+    if not C.SHADOW_ON:
+        return
+    try:
+        from . import shadow
+        shadow.run_async(date_str, event_ticker, words, paste,
+                         notify_fn=lambda t: notify.send(t, quiet=True))
+    except Exception:
+        log.exception("challengers not started")
+
+
 def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> dict:
     """Send the .txt only after detect + 60m, unless force."""
     date_str = clock.today_ct()
@@ -280,6 +294,7 @@ def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> 
 
     msg_id = notify.send_document(f"gap-{date_str}.txt", paste, caption)
     store.update_run(run["id"], telegram_msg_id=msg_id, status="awaiting_json")
+    _start_challengers(date_str, event["event_ticker"], words, paste)
     store.log_activity(
         "prompt_sent",
         f"{event['event_ticker']} n={len(words)} msg={msg_id} force={force} "
@@ -699,6 +714,26 @@ def register_commands() -> None:
     def _sendnow(_args, _msg):
         return _resend(_args, _msg)
 
+    def _shadow(_args, _msg):
+        """/gap_shadow: show tonight's challenger numbers; run the missing ones (paper only)."""
+        from . import shadow
+        date_str = clock.today_ct()
+        run = store.get_run_for_date(date_str)
+        if not run or not run.get("prompt_text"):
+            return "no Grok file built tonight yet -- nothing to compare"
+        words = run.get("word_list") or []
+        if isinstance(words, str):
+            import json as _json
+            words = _json.loads(words)
+        done = store.shadow_models_for(date_str)
+        need_gemini = bool(C.GEMINI_API_KEY) and not any(m.startswith("gemini:") for m in done)
+        need_base = C.BASELINE_ON and shadow.BASELINE not in done
+        if need_gemini or need_base:
+            shadow.run_async(date_str, run.get("event_ticker") or "", words, run["prompt_text"],
+                             notify_fn=lambda t: notify.send(t, quiet=True))
+            return "challengers started (paper only) -- the table arrives here in a few minutes"
+        return shadow.stored_summary(date_str, words) or "no challenger numbers stored tonight"
+
     def _pnl(_args, _msg):
         orders = store.orders_for_date(clock.today_ct())
         if not orders:
@@ -723,6 +758,7 @@ def register_commands() -> None:
     notify.register("status", _status)
     notify.register("gap_prep", _prep)
     notify.register("gap_resend", _resend)
+    notify.register("gap_shadow", _shadow)
     notify.register("gap_sendnow", _sendnow)
     def _settle(_args, _msg):
         start, end, week_id = clock.week_mon_fri()

@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.7.7"  # ABC matcher: title vs summary tags, FlyDubai-style joined words, ABC items from Google News, International feed
+VERSION = "wnt-gap-v1.8.0"  # challenger forecasts (Gemini + no-AI baseline), paper only, scored vs Grok on Saturday
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -155,6 +155,15 @@ ABC_SKIP_FEEDS = {x.strip().lower() for x in _secret("ABC_SKIP_FEEDS", "").split
 # NET_MIN_GAP_S apart, and at most NET_MAX_PARALLEL run at once. Google and ABC don't wait for each other.
 NET_MIN_GAP_S = float(_num("NET_MIN_GAP_S", 0.25))
 NET_MAX_PARALLEL = int(_num("NET_MAX_PARALLEL", 3))
+# v1.8.0: challenger forecasters (PAPER ONLY, never traded), run right after the Grok file is
+# sent, with the same news. Scored against Grok every Saturday. SHADOW_ON=false turns all off.
+SHADOW_ON = _flag("SHADOW_ON", True)
+NEWS_REUSE_S = int(_num("NEWS_REUSE_S", 900))            # challengers reuse the Grok file's news if this fresh
+GEMINI_API_KEY = _secret("GEMINI_API_KEY", "").strip()   # Google AI Studio key; empty = Gemini off
+GEMINI_MODEL = _secret("GEMINI_MODEL", "auto").strip()   # "auto" = newest Flash the key can use
+GEMINI_SEARCH = _flag("GEMINI_SEARCH", False)            # Google Search grounding (needs billing on)
+GEMINI_TIMEOUT_S = float(_num("GEMINI_TIMEOUT_S", 300))
+BASELINE_ON = _flag("BASELINE_ON", True)
 # v1.7.0: paper quotes are never frozen before Kalshi's real open + this many seconds (or
 # DECISION_LAG_MIN, whichever is later) -- no-fade needs a moment to save the first books.
 PAPER_MIN_AFTER_OPEN_S = int(_num("PAPER_MIN_AFTER_OPEN_S", 120))

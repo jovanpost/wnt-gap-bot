@@ -305,11 +305,27 @@ def abc_block(words: list[dict], fetcher=None, google_results: dict | None = Non
     return render(words, feeds, got, errors, google_abc_items(google_results))
 
 
-def news_blocks(words: list[dict]) -> tuple[str, str]:
-    """(google_block, abc_block) for the Grok file. Google News and ABC feeds are fetched AT THE
-    SAME TIME (separate websites, separate speed limits), then ABC's block also uses the Google
-    items whose source is ABC News. Any failure empties only its own block."""
+_last_news: dict = {}
+_last_news_lock = threading.Lock()
+
+
+def _words_key(words: list[dict]) -> tuple:
+    return tuple(sorted(w["word"] for w in words))
+
+
+def news_data(words: list[dict], max_age_s: float | None = None) -> dict:
+    """Raw news for these words: {"at", "google": (jobs, results) | None, "abc": (feeds, got, errors) | None}.
+    Google News and ABC are fetched AT THE SAME TIME (separate sites, separate speed limits).
+    v1.8.0: the last result is kept for NEWS_REUSE_S seconds, so the challenger forecasters
+    (gap/shadow.py) use exactly the news the Grok file got, without fetching again."""
     from . import headlines
+
+    max_age = C.NEWS_REUSE_S if max_age_s is None else max_age_s
+    key = _words_key(words)
+    with _last_news_lock:
+        hit = _last_news.get(key)
+        if hit and time.time() - hit["at"] <= max_age:
+            return hit
 
     def safe(fn, *a):
         try:
@@ -322,11 +338,24 @@ def news_blocks(words: list[dict]) -> tuple[str, str]:
     with ThreadPoolExecutor(max_workers=2) as pool:
         g = pool.submit(safe, headlines.fetch_all, words)
         a = pool.submit(safe, fetch_all, words)
-        g_out, a_out = g.result(), a.result()
+        out = {"at": time.time(), "google": g.result(), "abc": a.result()}
+    with _last_news_lock:
+        _last_news.clear()
+        _last_news[key] = out
+    return out
 
+
+def blocks_from(words: list[dict], data: dict) -> tuple[str, str]:
+    """(google_block, abc_block) text from news_data(). Any failure empties only its own block."""
+    from . import headlines
+
+    g_out, a_out = data.get("google"), data.get("abc")
     google_txt = ""
     if g_out is not None:
-        google_txt = safe(headlines.render, *g_out) or ""
+        try:
+            google_txt = headlines.render(*g_out) or ""
+        except Exception:
+            log.exception("google render skipped")
     abc_txt = ""
     if C.ABC_FEEDS_ON:
         if a_out is None:
@@ -335,5 +364,13 @@ def news_blocks(words: list[dict]) -> tuple[str, str]:
         else:
             feeds, got, errors = a_out
         gabc = google_abc_items(g_out[1]) if g_out is not None else {}
-        abc_txt = safe(render, words, feeds, got, errors, gabc) or ""
+        try:
+            abc_txt = render(words, feeds, got, errors, gabc) or ""
+        except Exception:
+            log.exception("abc render skipped")
     return google_txt, abc_txt
+
+
+def news_blocks(words: list[dict]) -> tuple[str, str]:
+    """(google_block, abc_block) for the Grok file: fetch (or reuse) the news, then render it."""
+    return blocks_from(words, news_data(words, max_age_s=0))

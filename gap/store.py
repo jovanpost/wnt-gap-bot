@@ -33,6 +33,7 @@ MIGRATION_FILES = [
     Path(__file__).resolve().parent.parent / "sql" / "006_lab.sql",
     Path(__file__).resolve().parent.parent / "sql" / "007_v1510.sql",
     Path(__file__).resolve().parent.parent / "sql" / "008_book_l.sql",
+    Path(__file__).resolve().parent.parent / "sql" / "009_shadow_forecasts.sql",
 ]
 
 
@@ -1040,3 +1041,62 @@ def l_weekly_all() -> list[dict]:
     with engine().connect() as conn:
         rows = conn.execute(text("select * from gap_l_weekly order by iso_week asc")).mappings().all()
     return [dict(r) for r in rows]
+
+
+# ---------- v1.8.0: challenger (shadow) forecasts, paper only ----------
+
+def insert_shadow_forecasts(rows: list[dict]) -> int:
+    """Insert challenger forecasts; a row that already exists (same night, model, word) is kept as
+    it was (first forecast of the night wins, like Grok's). Returns rows actually inserted."""
+    n = 0
+    with engine().begin() as conn:
+        for r in rows:
+            res = conn.execute(text(
+                """
+                insert into gap_shadow_forecasts
+                  (event_date, event_ticker, market_ticker, word, model, probability, reasoning, raw, seconds)
+                values (:event_date, :event_ticker, :market_ticker, :word, :model, :probability, :reasoning, :raw, :seconds)
+                on conflict (event_date, model, word) do nothing
+                """), {
+                    "event_date": r["event_date"], "event_ticker": r.get("event_ticker"),
+                    "market_ticker": r.get("market_ticker"), "word": r["word"], "model": r["model"],
+                    "probability": int(r["probability"]), "reasoning": r.get("reasoning"),
+                    "raw": r.get("raw"), "seconds": r.get("seconds"),
+                })
+            n += res.rowcount or 0
+    return n
+
+
+def shadow_forecasts(start: str, end: str | None = None) -> list[dict]:
+    end = end or start
+    with engine().connect() as conn:
+        rows = conn.execute(text(
+            "select * from gap_shadow_forecasts where event_date between :s and :e order by event_date, model, word"),
+            {"s": start, "e": end}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def shadow_models_for(event_date: str) -> set[str]:
+    with engine().connect() as conn:
+        rows = conn.execute(text(
+            "select distinct model from gap_shadow_forecasts where event_date = :d"), {"d": event_date}).all()
+    return {r[0] for r in rows}
+
+
+def grok_forecasts_for_date(event_date: str) -> list[dict]:
+    """Grok's forecasts for the night (latest run for that date)."""
+    run = get_run_for_date(event_date)
+    if not run:
+        return []
+    return forecasts_for_run(run["id"])
+
+
+def official_results(tickers: list[str]) -> dict[str, str]:
+    tickers = [t for t in tickers if t]
+    if not tickers:
+        return {}
+    with engine().connect() as conn:
+        rows = conn.execute(
+            text("select market_ticker, result from gap_results where market_ticker in :t").bindparams(
+                bindparam("t", expanding=True)), {"t": tickers}).all()
+    return {r[0]: r[1] for r in rows}
