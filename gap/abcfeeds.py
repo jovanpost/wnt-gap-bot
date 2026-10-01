@@ -45,6 +45,9 @@ FEEDS = (
     # v1.7.7: ABC's "worldnewsheadlines" and "gmaheadlines" feeds are empty at ABC itself (0 items
     # on Oct 1). "internationalheadlines" is ABC's live world feed (25 items). GMA dropped.
     ("intl", "International", "internationalheadlines", "ABC_SECTION_N", "always"),
+    # v1.9.1: back on Jovan's list. When ABC leaves them empty they are listed as dropped, not printed.
+    ("world", "World", "worldnewsheadlines", "ABC_SECTION_N", "always"),
+    ("gma", "GMA", "gmaheadlines", "ABC_SECTION_N", "always"),
     ("health", "Health", "healthheadlines", "ABC_SECTION_N", "health_words"),
 )
 
@@ -283,14 +286,16 @@ def render(words: list[dict], feeds: list[tuple], got: dict, errors: dict,
             f"[{where}{'' if tag == 'title' else ', summary only'}] {title}" for where, title, tag in hits[:n])
         more = f" (+{len(hits) - n} more)" if len(hits) > n else ""
         lines.append(f"- {w['word']}: {len(hits)} ABC item(s): {shown}{more}")
+    empty = [label for key, label, _name, _n in feeds if key not in errors and not got.get(key)]
+    if empty:
+        lines += ["", "ABC feeds empty right now (dropped): " + ", ".join(empty)]
     for key, label, _name, _n in feeds:
-        lines.append("")
         if key in errors:
-            lines.append(f"ABC {label}: (not fetched: {errors[key]})")
+            lines += ["", f"ABC {label}: (not fetched: {errors[key]})"]
             continue
         if not got.get(key):
-            lines.append(f"ABC {label}: (empty right now)")
             continue
+        lines.append("")
         lines.append(f"ABC {label}:")
         for it in got[key]:
             lines.append(f"  {it['rank']}. {it['title']}")
@@ -335,10 +340,12 @@ def news_data(words: list[dict], max_age_s: float | None = None) -> dict:
             log.exception("news fetch skipped: %s", getattr(fn, "__name__", fn))
             return None
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    from . import morefeeds
+    with ThreadPoolExecutor(max_workers=3) as pool:
         g = pool.submit(safe, headlines.fetch_all, words)
         a = pool.submit(safe, fetch_all, words)
-        out = {"at": time.time(), "google": g.result(), "abc": a.result()}
+        m = pool.submit(safe, morefeeds.fetch_all)            # v1.9.1: other networks + wires, once
+        out = {"at": time.time(), "google": g.result(), "abc": a.result(), "more": m.result()}
     with _last_news_lock:
         _last_news.clear()
         _last_news[key] = out
@@ -374,3 +381,17 @@ def blocks_from(words: list[dict], data: dict) -> tuple[str, str]:
 def news_blocks(words: list[dict]) -> tuple[str, str]:
     """(google_block, abc_block) for the Grok file: fetch (or reuse) the news, then render it."""
     return blocks_from(words, news_data(words, max_age_s=0))
+
+
+def all_blocks(words: list[dict]) -> tuple[str, str, str]:
+    """(google_block, abc_block, other_networks_block) for the Grok file, from ONE fresh fetch."""
+    from . import morefeeds
+    data = news_data(words, max_age_s=0)
+    g, a = blocks_from(words, data)
+    more = ""
+    if data.get("more"):
+        try:
+            more = morefeeds.render(words, data["more"]) or ""
+        except Exception:
+            log.exception("other networks render skipped")
+    return g, a, more

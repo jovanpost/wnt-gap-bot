@@ -113,9 +113,31 @@ def list_models(provider: str, timeout: float = 30) -> list[str]:
     return [str(m.get("id")) for m in (rows or []) if isinstance(m, dict) and m.get("id")]
 
 
+def pick_models(provider: str, wanted: str, ids: list[str], n: int = 3) -> list[str]:
+    """Like pick_model but the best n (OpenRouter fallbacks). Free models from different makers first,
+    so one busy host (e.g. Google for Gemma) does not take down every fallback at once."""
+    first = pick_model(provider, wanted, ids)
+    if not first:
+        return []
+    rest = [i for i in ids if i != first and pick_model(provider, wanted, [i]) == i]
+    rest.sort(key=_version_key, reverse=True)
+    out, makers = [first], {first.split("/")[0]}
+    for i in rest:
+        if i.split("/")[0] not in makers:
+            out.append(i)
+            makers.add(i.split("/")[0])
+        if len(out) >= n:
+            break
+    return out
+
+
 def resolve(provider: str, wanted: str) -> str:
+    return resolve_list(provider, wanted)[0]
+
+
+def resolve_list(provider: str, wanted: str) -> list[str]:
     ids = list_models(provider)
-    got = pick_model(provider, wanted, ids)
+    got = pick_models(provider, wanted, ids, 3 if provider == "openrouter" else 1)
     if not got:
         raise Fatal(f"{provider}: no model matching {wanted!r} ({len(ids)} models listed)")
     return got
@@ -139,6 +161,23 @@ def _answer_text(resp: dict) -> str:
     return txt
 
 
+def _limit_info(r) -> tuple[str, float | None]:
+    """(short text of the service's own rate-limit headers, Retry-After seconds or None)."""
+    try:
+        h = {k.lower(): v for k, v in (r.headers or {}).items()}
+    except Exception:  # noqa: BLE001
+        return "", None
+    keep = [f"{k}={v}" for k, v in sorted(h.items())
+            if ("ratelimit" in k or k == "retry-after") and len(str(v)) < 40][:6]
+    ra = None
+    try:
+        if "retry-after" in h:
+            ra = float(h["retry-after"])
+    except ValueError:
+        ra = None
+    return ("; ".join(keep), ra)
+
+
 def _err_msg(r) -> str:
     try:
         js = r.json()
@@ -153,7 +192,8 @@ def _err_msg(r) -> str:
 
 
 def forecast(provider: str, model: str, paste: str, words: list[str], event_date: str, preface: str, *,
-             budget_s: float | None = None, sleep=None, now=None, on_attempt=None) -> dict:
+             budget_s: float | None = None, sleep=None, now=None, on_attempt=None,
+             fallbacks: list[str] | None = None) -> dict:
     """{"model": "provider:model", "forecasts", "seconds", "attempts", "waited_s"}; Fatal / RuntimeError on failure."""
     sleep = sleep or time.sleep
     now = now or time.monotonic
@@ -161,13 +201,16 @@ def forecast(provider: str, model: str, paste: str, words: list[str], event_date
     say = on_attempt or (lambda msg: log.info("%s: %s", provider, msg))
     base, _ = PROVIDERS[provider]
     url = f"{base}/chat/completions"
-    payload = json.dumps({                       # built ONCE: every retry sends exactly this
+    body = {                                     # built ONCE: every retry sends exactly this
         "model": model,
         "messages": [{"role": "system", "content": preface.format(tools=NO_TOOLS)},
                      {"role": "user", "content": paste}],
         "temperature": 0.3,
         "max_tokens": C.CHALLENGER_MAX_TOKENS,
-    })
+    }
+    if fallbacks:
+        body["models"] = [model] + [m for m in fallbacks if m != model][:2]   # OpenRouter: try these in order
+    payload = json.dumps(body)
     label = f"{provider}:{model}"
     start = now()
     attempt, waited = 0, 0.0
@@ -177,11 +220,14 @@ def forecast(provider: str, model: str, paste: str, words: list[str], event_date
         err = None
         try:
             with netlimit.ticket(url):
-                r = requests.post(url, headers=_headers(provider), data=payload, timeout=C.GEMINI_TIMEOUT_S)
+                r = requests.post(url, headers=_headers(provider), data=payload, timeout=C.CHALLENGER_TIMEOUT_S)
+            retry_after = None
             if r.status_code == 200:
                 try:
-                    data = parser.validate(_answer_text(r.json()), words, event_date)
-                    return {"model": label, "forecasts": data["forecasts"], "seconds": round(now() - t0, 1),
+                    js = r.json()
+                    data = parser.validate(_answer_text(js), words, event_date)
+                    used = f"{provider}:{js.get('model')}" if (fallbacks and js.get("model")) else label
+                    return {"model": used, "forecasts": data["forecasts"], "seconds": round(now() - t0, 1),
                             "attempts": attempt, "waited_s": round(waited)}
                 except Exception as exc:  # noqa: BLE001
                     err = f"bad answer ({str(exc)[:120]})"
@@ -190,16 +236,19 @@ def forecast(provider: str, model: str, paste: str, words: list[str], event_date
             elif r.status_code == 404:
                 raise Fatal(f"{label}: model not found (HTTP 404) {_err_msg(r)}".strip())
             elif r.status_code in RETRYABLE:
-                err = f"HTTP {r.status_code} {_err_msg(r)}".strip()
+                info, retry_after = _limit_info(r)
+                err = f"HTTP {r.status_code} {_err_msg(r)}".strip() + (f" [{info}]" if info else "")
             else:
                 raise Fatal(f"{label}: HTTP {r.status_code} {_err_msg(r)}".strip())   # e.g. 400/413 too long
         except requests.Timeout:
-            err = "timeout"
+            err, retry_after = f"no answer within {C.CHALLENGER_TIMEOUT_S:.0f}s", None
         except requests.RequestException as exc:
-            err = type(exc).__name__
+            err, retry_after = type(exc).__name__, None
 
         elapsed = now() - start
         delay = BACKOFF_S[min(attempt - 1, len(BACKOFF_S) - 1)]
+        if retry_after and retry_after > delay:      # the service said how long to wait: obey it
+            delay = int(min(retry_after, 900))
         if elapsed + delay > budget:
             raise RuntimeError(f"{label}: gave up after {attempt} tries in {elapsed / 60:.0f} min (last: {err})")
         say(f"try {attempt}: {label}: {err}; same request again in {delay}s")
@@ -207,7 +256,7 @@ def forecast(provider: str, model: str, paste: str, words: list[str], event_date
         waited += delay
 
 
-def resolve_with_retry(provider: str, wanted: str, *, budget_s: float, sleep=None, now=None, on_attempt=None) -> str:
+def resolve_with_retry(provider: str, wanted: str, *, budget_s: float, sleep=None, now=None, on_attempt=None) -> list[str]:
     """Model-list lookup with the same patience (a busy service can also refuse the list)."""
     sleep = sleep or time.sleep
     now = now or time.monotonic
@@ -216,7 +265,7 @@ def resolve_with_retry(provider: str, wanted: str, *, budget_s: float, sleep=Non
     while True:
         attempt += 1
         try:
-            return resolve(provider, wanted)
+            return resolve_list(provider, wanted)
         except Fatal:
             raise
         except Exception as exc:  # noqa: BLE001

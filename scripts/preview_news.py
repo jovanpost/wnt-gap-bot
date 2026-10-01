@@ -54,15 +54,17 @@ def main(argv: list[str] | None = None, words: list[dict] | None = None) -> int:
     if args.abc_only:
         g, abc = "", abcfeeds.abc_block(words)
     else:
-        g, abc = abcfeeds.news_blocks(words)   # exactly what the Grok file gets
+        g, abc, more = abcfeeds.all_blocks(words)   # exactly what the Grok file gets
     took = time.monotonic() - t0
     print(abc or "(ABC feeds switched off: ABC_FEEDS_ON=false)")
+    if not args.abc_only:
+        print(more or "(other networks switched off: MORE_FEEDS_ON=false)")
     if not args.abc_only:
         print(g or "(Google headlines switched off or empty)")
 
     st = netlimit.stats()
     print("")
-    print(f"SUMMARY: {took:.1f}s total (ABC and Google at the same time), {st['requests']} web requests, "
+    print(f"SUMMARY: {took:.1f}s total (ABC, other networks and Google at the same time), {st['requests']} web requests, "
           f"{st['waited_s']:.1f}s total spacing wait (speed limit: {C.NET_MIN_GAP_S}s apart per site, "
           f"max {C.NET_MAX_PARALLEL} at once)")
     return 0

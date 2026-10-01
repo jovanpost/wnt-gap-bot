@@ -310,11 +310,13 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
                 g = gemini_forecast(paste, word_list, event_date, on_attempt=on_attempt)
             else:
                 t_start = time.monotonic()
-                model = CH.resolve_with_retry(prov, wanted, budget_s=C.CHALLENGER_RETRY_BUDGET_S, on_attempt=on_attempt)
-                if not force and f"{prov}:{model}" in done:
+                models = CH.resolve_with_retry(prov, wanted, budget_s=C.CHALLENGER_RETRY_BUDGET_S, on_attempt=on_attempt)
+                model = models[0]
+                if not force and any(f"{prov}:{m}" in done for m in models):
                     return
                 left = max(C.CHALLENGER_RETRY_BUDGET_S - (time.monotonic() - t_start), 0)
-                g = CH.forecast(prov, model, paste, word_list, event_date, PREFACE, budget_s=left, on_attempt=on_attempt)
+                g = CH.forecast(prov, model, paste, word_list, event_date, PREFACE, budget_s=left, on_attempt=on_attempt,
+                                fallbacks=models[1:] if prov == "openrouter" else None)
             with _report_lock:
                 keep(g["model"], g["forecasts"], g["seconds"])
                 report[g["model"]].update(attempts=g["attempts"], waited_s=g["waited_s"])

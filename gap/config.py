@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.9.0"  # more free challengers: NVIDIA (DeepSeek, Kimi, GLM, Qwen), Cerebras, Mistral, OpenRouter
+VERSION = "wnt-gap-v1.9.1"  # other networks + wires in the Grok file; challengers obey Retry-After, OpenRouter fallbacks, 10-min answers
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -155,6 +155,16 @@ ABC_SKIP_FEEDS = {x.strip().lower() for x in _secret("ABC_SKIP_FEEDS", "").split
 # NET_MIN_GAP_S apart, and at most NET_MAX_PARALLEL run at once. Google and ABC don't wait for each other.
 NET_MIN_GAP_S = float(_num("NET_MIN_GAP_S", 0.25))
 NET_MAX_PARALLEL = int(_num("NET_MAX_PARALLEL", 3))
+# v1.9.1: other networks + wires (NBC, NPR, PBS, Yahoo, The Hill, Axios, AP and Reuters via Google News)
+# and Google News US top stories, fetched ONCE per Grok file. Title hits only. Spec: Jovan + Grok, Oct 1.
+MORE_FEEDS_ON = _flag("MORE_FEEDS_ON", True)
+MORE_FEEDS_N = int(_num("MORE_FEEDS_N", 20))                    # first 20 items per feed
+MORE_FEEDS_TIMEOUT_S = float(_num("MORE_FEEDS_TIMEOUT_S", 8))
+MORE_FEEDS_BUDGET_S = float(_num("MORE_FEEDS_BUDGET_S", 20))
+MORE_FEEDS_MAX_AGE_H = int(_num("MORE_FEEDS_MAX_AGE_H", 36))    # newest item older than this -> feed dropped
+MORE_FEEDS_CACHE_S = int(_num("MORE_FEEDS_CACHE_S", 300))
+MORE_FEEDS_MATCHES_PER_WORD = int(_num("MORE_FEEDS_MATCHES_PER_WORD", 5))
+MORE_FEEDS_SKIP = {x.strip().lower() for x in _secret("MORE_FEEDS_SKIP", "").split(",") if x.strip()}
 # v1.8.0: challenger forecasters (PAPER ONLY, never traded), run right after the Grok file is
 # sent, with the same news. Scored against Grok every Saturday. SHADOW_ON=false turns all off.
 SHADOW_ON = _flag("SHADOW_ON", True)
@@ -175,10 +185,12 @@ OPENROUTER_API_KEY = _secret("OPENROUTER_API_KEY", "").strip()
 GROQ_API_KEY = _secret("GROQ_API_KEY", "").strip()
 CHALLENGERS = [x.strip() for x in _secret(
     "CHALLENGERS",
-    "nvidia:deepseek, nvidia:kimi, nvidia:glm, nvidia:qwen, cerebras:gpt-oss-120b, mistral:mistral-medium, openrouter:free",
+    "nvidia:deepseek, nvidia:kimi, nvidia:glm, nvidia:nvidia/nemotron-3-ultra-550b-a55b, cerebras:gpt-oss-120b, "
+    "mistral:mistral-small, openrouter:free",
 ).split(",") if x.strip()]
 CHALLENGER_MAX_TOKENS = int(_num("CHALLENGER_MAX_TOKENS", 12000))
 CHALLENGER_RETRY_BUDGET_S = float(_num("CHALLENGER_RETRY_BUDGET_S", 1800))   # same 30-minute patience as Gemini
+CHALLENGER_TIMEOUT_S = float(_num("CHALLENGER_TIMEOUT_S", 600))   # one answer may take up to 10 min (big free models are slow)
 BASELINE_ON = _flag("BASELINE_ON", True)
 # v1.7.0: paper quotes are never frozen before Kalshi's real open + this many seconds (or
 # DECISION_LAG_MIN, whichever is later) -- no-fade needs a moment to save the first books.

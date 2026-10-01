@@ -50,6 +50,8 @@ GOOGLE = {
 
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
+    from gap import morefeeds
+    monkeypatch.setattr(morefeeds, "fetch_all", lambda fetcher=None: {})   # no network in these tests
     netlimit.reset()
     abcfeeds._cache.clear()
     monkeypatch.setattr(C, "ABC_FEEDS_ON", True)
@@ -100,7 +102,7 @@ def test_render_shows_empty_feed_and_not_found():
     out = abcfeeds.render([{"word": "SNAP / Food Stamp"}, {"word": "Dubai / Tel Aviv"}], FEEDS, GOT, {})
     assert "- SNAP / Food Stamp: none in ABC feeds" in out
     assert "- Dubai / Tel Aviv: 1 ABC item(s): [US #14] Cockpit stabbing on FlyDubai" in out
-    assert "ABC International: (empty right now)" in out
+    assert "ABC feeds empty right now (dropped): International" in out
     assert "[title] = the word is in the headline" in out
 
 

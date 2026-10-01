@@ -80,7 +80,7 @@ def test_term_matching_rules():
 
 def test_wanted_feeds_health_only_when_needed():
     keys = [f[0] for f in abcfeeds.wanted_feeds([{"word": "Pardon"}, {"word": "Iran / Iranian"}])]
-    assert keys == ["top", "us", "politics", "intl"]
+    assert keys == ["top", "us", "politics", "intl", "world", "gma"]
     keys = [f[0] for f in abcfeeds.wanted_feeds([{"word": "SNAP / Food Stamp"}])]
     assert "health" in keys
     keys = [f[0] for f in abcfeeds.wanted_feeds([{"word": "Cancer"}])]
@@ -205,9 +205,10 @@ def test_google_headlines_go_through_the_limit(monkeypatch):
 
 def test_paste_file_has_both_blocks(monkeypatch):
     monkeypatch.setattr(C, "WORD_HISTORY_NIGHTS", 0)
-    monkeypatch.setattr(abcfeeds, "news_blocks", lambda words: ("\nGOOGLE NEWS HEADLINES (test)", "\nABC NEWS FEEDS (test)"))
+    monkeypatch.setattr(abcfeeds, "all_blocks", lambda words: ("\nGOOGLE NEWS HEADLINES (test)", "\nABC NEWS FEEDS (test)",
+                                                               "\nOTHER NETWORKS AND WIRES (test)"))
     out = prompt.build_paste_file("2026-10-01", "KXWORLDNEWSMENTION-26OCT01", [{"word": "Pardon"}])
-    assert out.index("ABC NEWS FEEDS (test)") < out.index("GOOGLE NEWS HEADLINES (test)")
+    assert out.index("ABC NEWS FEEDS (test)") < out.index("OTHER NETWORKS AND WIRES (test)") < out.index("GOOGLE NEWS HEADLINES (test)")
     assert "read its ABC NEWS FEEDS matches" in out
 
 
@@ -217,7 +218,7 @@ def test_paste_file_survives_news_crash(monkeypatch):
     def boom(words):
         raise RuntimeError("down")
 
-    monkeypatch.setattr(abcfeeds, "news_blocks", boom)
+    monkeypatch.setattr(abcfeeds, "all_blocks", boom)
     out = prompt.build_paste_file("2026-10-01", "KXWORLDNEWSMENTION-26OCT01", [{"word": "Pardon"}])
     assert "1. Pardon" in out and "ABC NEWS FEEDS (" not in out
 

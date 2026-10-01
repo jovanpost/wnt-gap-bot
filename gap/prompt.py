@@ -48,7 +48,8 @@ def __getattr__(name: str):
 
 
 def build_user_message(event_date: str, event_ticker: str, words: list[dict],
-                       history_block: str = "", headlines_block: str = "", abc_block: str = "") -> str:
+                       history_block: str = "", headlines_block: str = "", abc_block: str = "",
+                       more_block: str = "") -> str:
     lines = [
         f"Date: {event_date}",
         f"Event: {event_ticker}",
@@ -61,12 +62,15 @@ def build_user_message(event_date: str, event_ticker: str, words: list[dict],
         lines.append(history_block)
     if abc_block:
         lines.append(abc_block)
+    if more_block:
+        lines.append(more_block)
     if headlines_block:
         lines.append(headlines_block)
     lines += [
         "",
         "First do the MANDATORY RESEARCH PHASE for every word above (each side of a slash word separately, never two",
-        "list words in one query): read its ABC NEWS FEEDS matches and its GOOGLE NEWS HEADLINES above, fetch its",
+        "list words in one query): read its ABC NEWS FEEDS matches, its OTHER NETWORKS AND WIRES headline hits and its",
+        "GOOGLE NEWS HEADLINES above, fetch its",
         "Google News RSS, run its blind web",
         "search, its X search sorted Top, and its from:ABC X search (Top). A same-day US story using the word in a news",
         "sense is a hit, even an interview or a 'would consider'. Only after every word has been searched, write your",
@@ -84,8 +88,8 @@ def build_paste_file(event_date: str, event_ticker: str, words: list[dict]) -> s
         except Exception:
             # Never let a history problem stop tonight's file. Grok works without it.
             log.exception("word history skipped")
-    heads, abc = _news_blocks(words)
-    user = build_user_message(event_date, event_ticker, words, hist, heads, abc)
+    heads, abc, more = _news_blocks(words)
+    user = build_user_message(event_date, event_ticker, words, hist, heads, abc, more)
     return (
         get_system_prompt().rstrip()
         + "\n\n---\n\n"
@@ -94,15 +98,15 @@ def build_paste_file(event_date: str, event_ticker: str, words: list[dict]) -> s
     )
 
 
-def _news_blocks(words: list[dict]) -> tuple[str, str]:
-    """(google_block, abc_block). Fetched together; any failure gives "" for that block only."""
+def _news_blocks(words: list[dict]) -> tuple[str, str, str]:
+    """(google_block, abc_block, other_networks_block). Fetched together; any failure gives "" for that block only."""
     try:
         from . import abcfeeds
-        return abcfeeds.news_blocks(words)
+        return abcfeeds.all_blocks(words)
     except Exception:
         # Never let a news problem stop tonight's file. Grok still searches itself.
         log.exception("news blocks skipped")
-        return "", ""
+        return "", "", ""
 
 
 def build_telegram_caption(event_date: str, event_ticker: str, n: int) -> str:
