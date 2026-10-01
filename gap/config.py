@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.8.1"  # Gemini retries the same request up to 30 min (no news re-fetch), downgrades only after 20 min
+VERSION = "wnt-gap-v1.9.0"  # more free challengers: NVIDIA (DeepSeek, Kimi, GLM, Qwen), Cerebras, Mistral, OpenRouter
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -165,6 +165,20 @@ GEMINI_SEARCH = _flag("GEMINI_SEARCH", False)            # Google Search groundi
 GEMINI_TIMEOUT_S = float(_num("GEMINI_TIMEOUT_S", 300))
 GEMINI_RETRY_BUDGET_S = float(_num("GEMINI_RETRY_BUDGET_S", 1800))      # keep retrying the same request up to 30 min
 GEMINI_DOWNGRADE_AFTER_S = float(_num("GEMINI_DOWNGRADE_AFTER_S", 1200))  # step down a model only after 20 min of failures
+# v1.9.0: more free challengers through OpenAI-compatible APIs (paper only, never traded).
+# Each runs only if its key is in the secrets. CHALLENGERS = "provider:model" list; the model can be
+# an exact id or a word to search for in that provider's model list (newest match wins).
+NVIDIA_API_KEY = _secret("NVIDIA_API_KEY", "").strip()
+CEREBRAS_API_KEY = _secret("CEREBRAS_API_KEY", "").strip()
+MISTRAL_API_KEY = _secret("MISTRAL_API_KEY", "").strip()
+OPENROUTER_API_KEY = _secret("OPENROUTER_API_KEY", "").strip()
+GROQ_API_KEY = _secret("GROQ_API_KEY", "").strip()
+CHALLENGERS = [x.strip() for x in _secret(
+    "CHALLENGERS",
+    "nvidia:deepseek, nvidia:kimi, nvidia:glm, nvidia:qwen, cerebras:gpt-oss-120b, mistral:mistral-medium, openrouter:free",
+).split(",") if x.strip()]
+CHALLENGER_MAX_TOKENS = int(_num("CHALLENGER_MAX_TOKENS", 12000))
+CHALLENGER_RETRY_BUDGET_S = float(_num("CHALLENGER_RETRY_BUDGET_S", 1800))   # same 30-minute patience as Gemini
 BASELINE_ON = _flag("BASELINE_ON", True)
 # v1.7.0: paper quotes are never frozen before Kalshi's real open + this many seconds (or
 # DECISION_LAG_MIN, whichever is later) -- no-fade needs a moment to save the first books.

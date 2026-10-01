@@ -727,14 +727,11 @@ def register_commands() -> None:
             words = _json.loads(words)
         if shadow.is_running():
             return "challengers are still running (Gemini may be retrying, up to 30 min) -- the table comes here when done"
-        done = store.shadow_models_for(date_str)
-        need_gemini = bool(C.GEMINI_API_KEY) and not any(m.startswith("gemini:") for m in done)
-        need_base = C.BASELINE_ON and shadow.BASELINE not in done
-        if need_gemini or need_base:
-            shadow.run_async(date_str, run.get("event_ticker") or "", words, run["prompt_text"],
-                             notify_fn=lambda t: notify.send(t, quiet=True))
-            return "challengers started (paper only) -- the table arrives here in a few minutes"
-        return shadow.stored_summary(date_str, words) or "no challenger numbers stored tonight"
+        shadow.run_async(date_str, run.get("event_ticker") or "", words, run["prompt_text"],
+                         notify_fn=lambda t: notify.send(t, quiet=True))
+        return ("challengers checked (paper only): any missing model is asked now; the table arrives here "
+                "when they finish (up to 30 min if a service is busy)")
+
 
     def _pnl(_args, _msg):
         orders = store.orders_for_date(clock.today_ct())

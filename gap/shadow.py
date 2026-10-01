@@ -290,23 +290,69 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
             log.exception("baseline failed")
             report[BASELINE] = {"ok": False, "error": type(exc).__name__}
 
+    # Gemini and every other challenger run SIDE BY SIDE (different services), each with its own
+    # 30-minute patience. All of them send the same file text; none fetches news.
+    jobs = []
     if C.GEMINI_API_KEY and (force or not any(m.startswith("gemini:") for m in done)):
-        try:
-            g = gemini_forecast(paste, [w["word"] for w in words], event_date, on_attempt=on_attempt)
-            keep(g["model"], g["forecasts"], g["seconds"])
-            report[g["model"]].update(attempts=g["attempts"], waited_s=g["waited_s"])
-        except Exception as exc:  # noqa: BLE001
-            log.warning("gemini failed: %s", exc)
-            report["gemini"] = {"ok": False, "error": str(exc)[:300]}
+        jobs.append(("gemini", None))
     elif not C.GEMINI_API_KEY:
         report["gemini"] = {"ok": False, "error": "GEMINI_API_KEY not set"}
+    from . import challengers as CH
+    for prov, wanted in CH.enabled_specs():
+        jobs.append((prov, wanted))
+    word_list = [w["word"] for w in words]
+
+    def one(job):
+        prov, wanted = job
+        tag = "gemini" if prov == "gemini" else f"{prov}:{wanted}"
+        try:
+            if prov == "gemini":
+                g = gemini_forecast(paste, word_list, event_date, on_attempt=on_attempt)
+            else:
+                t_start = time.monotonic()
+                model = CH.resolve_with_retry(prov, wanted, budget_s=C.CHALLENGER_RETRY_BUDGET_S, on_attempt=on_attempt)
+                if not force and f"{prov}:{model}" in done:
+                    return
+                left = max(C.CHALLENGER_RETRY_BUDGET_S - (time.monotonic() - t_start), 0)
+                g = CH.forecast(prov, model, paste, word_list, event_date, PREFACE, budget_s=left, on_attempt=on_attempt)
+            with _report_lock:
+                keep(g["model"], g["forecasts"], g["seconds"])
+                report[g["model"]].update(attempts=g["attempts"], waited_s=g["waited_s"])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s failed: %s", tag, exc)
+            with _report_lock:
+                report[tag] = {"ok": False, "error": str(exc)[:300]}
+
+    if jobs:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as pool:
+            list(pool.map(one, jobs))
     return report
+
+
+_report_lock = threading.Lock()
+
+
+def short_name(model: str) -> str:
+    """Column name for a stored model id: 'gemini:gemini-3.8-flash' -> 'Gemini',
+    'nvidia:moonshotai/kimi-k3' -> 'kimi', 'cerebras:gpt-oss-120b' -> 'gpt-oss', baseline -> 'base'."""
+    if model == BASELINE:
+        return "base"
+    if model.startswith("gemini:"):
+        return "Gemini"
+    prov, _, mid = model.partition(":")
+    name = mid.split("/")[-1].split(":")[0].lower()
+    if name.startswith("gpt-oss"):
+        return "gpt-oss"
+    head = re.split(r"[-_.]", name)[0]
+    head = re.sub(r"\d+$", "", head) or head
+    return head[:10]
 
 
 def summary_text(event_date: str, words: list[dict], report: dict, grok: dict[str, int] | None = None) -> str:
     """Plain-text table for Telegram / the terminal: word | Grok | each challenger."""
     models = [m for m, r in report.items() if r.get("ok")]
-    head = ["word", "Grok"] + [("Gemini" if m.startswith("gemini:") else "base") for m in models]
+    head = ["word", "Grok"] + [short_name(m) for m in models]
     lines = [f"CHALLENGERS {event_date} (paper only, never traded)"]
     for m, r in report.items():
         if r.get("ok"):
@@ -341,9 +387,19 @@ def run_async(event_date: str, event_ticker: str, words: list[dict], paste: str,
             return
         try:
             rep = run(event_date, event_ticker, words, paste, history_block, save=True, force=force)
-            if notify_fn and rep:
-                grok = {f["word"]: f["probability"] for f in store.grok_forecasts_for_date(event_date)}
-                notify_fn(summary_text(event_date, words, rep, grok))
+            if notify_fn:
+                if any(r.get("ok") for r in rep.values()):
+                    grok = {f["word"]: f["probability"] for f in store.grok_forecasts_for_date(event_date)}
+                    txt = summary_text(event_date, words, rep, grok)
+                    full = stored_summary(event_date, words)      # every model stored tonight, incl. earlier runs
+                    notify_fn(full if full else txt)
+                    fails = [f"- {m}: FAILED ({r.get('error')})" for m, r in rep.items() if not r.get("ok")]
+                    if fails:
+                        notify_fn("Challengers that failed tonight:\n" + "\n".join(fails))
+                else:
+                    notify_fn(stored_summary(event_date, words) or
+                              "Challengers: nothing new tonight.\n" + "\n".join(
+                                  f"- {m}: FAILED ({r.get('error')})" for m, r in rep.items()))
             store.log_activity("shadow", json.dumps({m: {k: v for k, v in r.items() if k != "forecasts"}
                                                      for m, r in rep.items()})[:900])
         except Exception:
@@ -368,6 +424,14 @@ def weekly_block(start: str, end: str) -> list[str]:
     for d in sorted({str(r["event_date"])[:10] for r in rows}):
         for f in store.grok_forecasts_for_date(d):
             grok_by[(d, f.get("market_ticker"))] = f.get("probability")
+
+    # v1.9.0: the plain average of all AI challengers (not the baseline) as one more "model".
+    avg: dict = {}
+    for r in rows:
+        if r["model"] != BASELINE and r.get("market_ticker"):
+            avg.setdefault((str(r["event_date"])[:10], r["market_ticker"]), []).append(r["probability"])
+    rows = list(rows) + [{"event_date": d, "market_ticker": t, "model": "avg-of-AI-challengers",
+                          "probability": round(sum(v) / len(v))} for (d, t), v in avg.items() if len(v) >= 2]
 
     by_model: dict = {}
     for r in rows:

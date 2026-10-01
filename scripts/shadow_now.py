@@ -24,11 +24,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 from _secrets import _prompt_hidden, need_database_url_optional  # noqa: E402
 
 db_url = need_database_url_optional("Supabase DATABASE_URL (hidden; press Enter to skip saving): ")
-if not os.environ.get("GEMINI_API_KEY"):
-    key = _prompt_hidden("Gemini API key")
-    if key:
-        os.environ["GEMINI_API_KEY"] = key
-    del key
+print("Keys: paste each one (hidden), or press Enter to skip that service.")
+for _env, _label in (("GEMINI_API_KEY", "Gemini API key"), ("NVIDIA_API_KEY", "NVIDIA API key"),
+                     ("CEREBRAS_API_KEY", "Cerebras API key"), ("MISTRAL_API_KEY", "Mistral API key"),
+                     ("OPENROUTER_API_KEY", "OpenRouter API key")):
+    if not os.environ.get(_env):
+        _key = _prompt_hidden(_label)
+        if _key:
+            os.environ[_env] = _key
+        del _key
 if not db_url:
     os.environ["WORD_HISTORY_NIGHTS"] = "0"     # history needs the database
 
@@ -66,17 +70,19 @@ def apply_shadow_table() -> None:
 def main() -> int:
     print(f"{C.VERSION} | challengers now | paper only, never trades")
     print("database:", f"connected ({store.engine().url.host})" if db_url else "skipped (nothing will be saved)")
+    from gap import challengers as CH
     print("gemini key:", "set" if C.GEMINI_API_KEY else "NOT set (Gemini will be skipped)")
+    print("other challengers:", ", ".join(f"{p}:{m}" for p, m in CH.enabled_specs()) or "none (no keys)")
     date_str = clock.today_ct()
     event_ticker, words = todays_event()
-    print(f"event {event_ticker}: {len(words)} words. Building the file (news + history), then asking Gemini...")
+    print(f"event {event_ticker}: {len(words)} words. Building the file (news + history), then asking every challenger...")
     if db_url:
         apply_shadow_table()
     paste = prompt.build_paste_file(date_str, event_ticker, words)
-    print("if Google is busy it retries the SAME request for up to "
-          f"{C.GEMINI_RETRY_BUDGET_S / 60:.0f} min (Ctrl-C to stop; nothing is lost)")
+    print("if a service is busy it retries the SAME request for up to "
+          f"{C.GEMINI_RETRY_BUDGET_S / 60:.0f} min; all services run at the same time (Ctrl-C to stop)")
     rep = shadow.run(date_str, event_ticker, words, paste, save=bool(db_url),
-                     on_attempt=lambda msg: print("  gemini", msg, flush=True))
+                     on_attempt=lambda msg: print("  ", msg, flush=True))
     grok = {}
     if db_url:
         grok = {f["word"]: f["probability"] for f in store.grok_forecasts_for_date(date_str)}

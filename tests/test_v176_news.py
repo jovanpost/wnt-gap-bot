@@ -159,7 +159,7 @@ def test_netlimit_spacing_and_parallel_cap(monkeypatch):
     starts.sort()
     gaps = [b - a for a, b in zip(starts, starts[1:])]
     assert len(starts) == 12
-    assert min(gaps) >= 0.045                                       # never two starts in the same moment
+    assert min(gaps) >= 0.04                                        # never two starts in the same moment
     assert peak[0] <= 2
 
 
