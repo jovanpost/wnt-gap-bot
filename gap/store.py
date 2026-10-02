@@ -36,6 +36,7 @@ MIGRATION_FILES = [
     Path(__file__).resolve().parent.parent / "sql" / "009_shadow_forecasts.sql",
     Path(__file__).resolve().parent.parent / "sql" / "010_frozen_packages.sql",
     Path(__file__).resolve().parent.parent / "sql" / "011_llm_runs.sql",
+    Path(__file__).resolve().parent.parent / "sql" / "012_prompt_lab.sql",
 ]
 
 

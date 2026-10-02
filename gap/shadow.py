@@ -513,6 +513,8 @@ def stored_summary(event_date: str, words: list[dict]) -> str | None:
         m["forecasts"][r["word"]] = r["probability"]
     try:                                               # v1.11.0: what each model cost tonight
         for run in store.llm_runs(event_date):
+            if str(run["model"]).startswith("lab:"):       # v1.12.0: prompt-lab replays are not tonight's challengers
+                continue
             target = rep.get(run["model"])
             if target is None:
                 if run.get("ok"):

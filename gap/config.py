@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.11.1"  # the paid Grok search run is off by default (measured $3.17 a run); cheaper defaults if switched on
+VERSION = "wnt-gap-v1.12.0"  # prompt lab: rule-checked prompt variants, replay on frozen nights, leaderboard, champion rule (paper only)
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -211,6 +211,31 @@ XAI_EXPERT_TIMEOUT_S = float(_num("XAI_EXPERT_TIMEOUT_S", 1500))    # a search r
 XAI_EXPERT_MAX_PAID_TRIES = int(_num("XAI_EXPERT_MAX_PAID_TRIES", 1))
 XAI_NIGHTLY_BUDGET_USD = float(_num("XAI_NIGHTLY_BUDGET_USD", 6.0)) # no new search run once tonight's xAI spend reached this
 BASELINE_ON = _flag("BASELINE_ON", True)
+# v1.12.0: prompt lab (gap/promptlab.py). PAPER ONLY. After settlement a writer model proposes small,
+# rule-checked edits to the champion prompt; each one is replayed on tonight's frozen file, the best is
+# tested on the other frozen nights, and a prompt that beats the champion there becomes the champion.
+# Only models WITHOUT search take part (a search model cannot be replayed on a past night).
+LAB_ON = _flag("LAB_ON", True)
+LAB_MODELS = [x.strip().lower() for x in _secret("LAB_MODELS", "xai, gemini").split(",") if x.strip()]  # first with a key = the judge
+LAB_WRITER_MODEL = _secret("LAB_WRITER_MODEL", "auto").strip()      # auto = newest Gemini Pro the key can use, else Flash
+LAB_VARIANTS_PER_NIGHT = int(_num("LAB_VARIANTS_PER_NIGHT", 3))
+LAB_XAI_EFFORT = _secret("LAB_XAI_EFFORT", "low").strip()           # thinking was ~70% of a plain Grok run's cost
+LAB_DAILY_BUDGET_USD = float(_num("LAB_DAILY_BUDGET_USD", 1.50))    # paid lab runs per CT day; the rest wait for tomorrow
+LAB_MAX_NIGHTS = int(_num("LAB_MAX_NIGHTS", 20))                    # replay at most this many recent nights
+LAB_REQUIRE_NEWS = _flag("LAB_REQUIRE_NEWS", True)                  # only nights whose file has the ABC news block
+LAB_MIN_HELDOUT_WORDS = int(_num("LAB_MIN_HELDOUT_WORDS", 40))      # words on OTHER nights before a prompt can win
+LAB_MARGIN = float(_num("LAB_MARGIN", 0.005))                       # must beat the champion's Brier by this much
+LAB_MAX_TESTING = int(_num("LAB_MAX_TESTING", 2))                    # winners under test at one time; later ones are dropped
+LAB_TOP_N = int(_num("LAB_TOP_N", 5))                               # prompts kept on the board besides the champion
+LAB_AFTER_CT = _secret("LAB_AFTER_CT", "18:35")
+LAB_LATEST_CT = _secret("LAB_LATEST_CT", "22:00")                   # go on with whatever is settled by then
+LAB_SHOW_START_CT = _secret("LAB_SHOW_START_CT", "17:30")           # a run that finished before this is a LIVE forecast
+LAB_EDIT_MIN_TEXT = int(_num("LAB_EDIT_MIN_TEXT", 40))
+LAB_EDIT_MAX_TEXT = int(_num("LAB_EDIT_MAX_TEXT", 900))
+LAB_PROMPT_MAX_CHARS = int(_num("LAB_PROMPT_MAX_CHARS", 26000))
+LAB_TIMEOUT_S = float(_num("LAB_TIMEOUT_S", 420))
+LAB_MAX_ATTEMPTS = int(_num("LAB_MAX_ATTEMPTS", 4))                 # paid tries per run before it is marked failed
+LAB_PARALLEL = int(_num("LAB_PARALLEL", 2))
 # v1.10.0: general scorer. A Telegram scorecard once a night after settlement (every forecaster,
 # every prompt version, vs said / not said), plus /gap_score. Strategy-free.
 SCORECARD_ON = _flag("SCORECARD_ON", True)

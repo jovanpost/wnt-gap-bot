@@ -237,6 +237,12 @@ def _start_challengers(date_str: str, event_ticker: str, words: list[dict], past
                          notify_fn=lambda t: notify.send(t, quiet=True), package_id=package_id)
     except Exception:
         log.exception("challengers not started")
+    try:                                   # v1.12.0: the prompt-lab champion forecasts tonight too (paper only)
+        from . import promptlab
+        if promptlab.live_start(date_str):
+            promptlab.tick(lambda t: notify.send(t, quiet=True))
+    except Exception:
+        log.exception("prompt lab not started")
 
 
 def _has_forecasts(run: dict | None) -> bool:
@@ -671,6 +677,11 @@ def poll_once() -> dict:
     # quotes, the pattern behind every bug in this repo's history).
     # v1.5.1: paper fills advance from fills_tick() below, so they no longer depend on
     # someone having the Streamlit page open. Settlement still runs from board.tonight().
+    try:                                   # v1.12.0: prompt lab (paper only). Starts its own background thread and
+        from . import promptlab            # returns at once; runs on weekends too so replays can catch up.
+        promptlab.tick(lambda t: notify.send(t, quiet=True))
+    except Exception:
+        log.exception("prompt lab tick")
     if clock.is_saturday_ct():
         try:
             from . import weekly
@@ -834,6 +845,53 @@ def register_commands() -> None:
         return "\n".join(shadow.cost_lines(start, d, "MODEL COST tonight" if days == 1 else f"MODEL COST last {days} days"))
 
     notify.register("gap_cost", _cost)
+
+    def _lab(args, _msg):
+        """/gap_lab = board and status; /gap_lab night [date]; /gap_lab prompt <id>; /gap_lab champion <id>;
+        /gap_lab writer = which writer model works; /gap_lab start [date] = run the lab on a past settled night;
+        /gap_lab retry = give failed runs another go. Paper only."""
+        from . import promptlab
+        if not promptlab.enabled():
+            return "prompt lab is off (LAB_ON is false, or no Postgres database)"
+        cmd = (args[0].lower() if args else "")
+        if cmd == "night":
+            d = args[1] if len(args) > 1 else clock.today_ct()
+            return promptlab.night_message(d) if promptlab._night(d) else f"no lab record for {d}"
+        if cmd == "prompt":
+            p = promptlab.get_prompt(args[1]) if len(args) > 1 else promptlab.champion()
+            if not p:
+                return "usage: /gap_lab prompt lab-xxxxxxx"
+            notify.send_document(f"{p['prompt_id']}.txt", p["system_prompt"],
+                                 f"{p['prompt_id']} ({p.get('name') or '-'}), status {p['status']}\n"
+                                 f"edit: {p.get('section') or '-'} / {p.get('action') or '-'}\n"
+                                 f"before: {(p.get('unit_before') or '-')[:300]}\n"
+                                 f"after: {(p.get('unit_after') or '-')[:300]}")
+            return f"sent {p['prompt_id']}"
+        if cmd == "champion":
+            if len(args) < 2:
+                return "usage: /gap_lab champion lab-xxxxxxx"
+            return promptlab.set_champion(args[1])
+        if cmd == "writer":                # makes model calls: never on the Telegram thread (it also takes the Grok JSON)
+            import threading as _th
+
+            def _go():
+                try:
+                    notify.send(promptlab.writer_check(), quiet=True)
+                except Exception:
+                    log.exception("writer check")
+            _th.Thread(target=_go, name="lab-writer-check", daemon=True).start()
+            return "checking the writer models now; the answer arrives here in a minute or two"
+        if cmd == "start":
+            out = promptlab.start_night(args[1] if len(args) > 1 else None)
+            promptlab.tick(lambda t: notify.send(t, quiet=True))
+            return out
+        if cmd == "retry":
+            n = promptlab.retry_failed()
+            promptlab.tick(lambda t: notify.send(t, quiet=True))
+            return f"{n} failed lab run(s) set back to waiting"
+        return promptlab.status_text()
+
+    notify.register("gap_lab", _lab)
     notify.register("gap_sendnow", _sendnow)
     def _settle(_args, _msg):
         start, end, week_id = clock.week_mon_fri()

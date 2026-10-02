@@ -1986,6 +1986,7 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     lines.append(" 4E STRATEGY LAB: report-only variants taken at market, grid, growth check   4F BOOK M vs K_HIGH")
     lines.append(f" 4G FILL TIMING (adverse selection)   4H SCALP: buy<=70c / sell 85c / market-sell at {C.SCALP_FALLBACK_HHMM}")
     lines.append(" 4I BOOK L (LIVE, real money): same rule as K, side by side   4J CHALLENGERS: Gemini + no-AI baseline vs Grok")
+    lines.append(" 4K PROMPT LAB: prompt variants on frozen nights, champion rule (paper only)")
 
     _hdr(lines, "1. NIGHT STATUS")
     lines += _nights_status_block(data)
@@ -2025,6 +2026,12 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
         lines += shadow.cost_lines(data["start"], data["end"], "MODEL COST THIS WEEK")
     except Exception as exc:  # never let this section break the dump
         lines.append(f"(challenger section failed: {type(exc).__name__})")
+    _hdr(lines, "4K. PROMPT LAB (paper only): prompt variants replayed on frozen nights, champion rule")
+    try:
+        from . import promptlab
+        lines += promptlab.weekly_lines(data["start"], data["end"])
+    except Exception as exc:  # never let this section break the dump
+        lines.append(f"(prompt lab section failed: {type(exc).__name__})")
     _hdr(lines, "5. FILL-SELECTION CHECK (do fills happen mostly when the market moves against us?)")
     lines += _fill_selection_block(data)
     _hdr(lines, "6. HOW GOOD IS GROK? (every word with a result; market comparisons use valid quotes only)")
