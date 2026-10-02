@@ -58,6 +58,29 @@ _cool: dict[str, tuple[float, int]] = {}      # model key -> (pause until, level
 COOL_S = (300, 900, 3600)
 
 
+_gem_lock = threading.Lock()
+_gem = {"last": 0.0, "day": "", "calls": 0}
+
+
+def _gemini_slot() -> bool:
+    """One Gemini lab forecast may start now? Keeps LAB_GEMINI_MIN_GAP_S between calls and at most
+    LAB_GEMINI_DAILY_CALLS a day (counted in memory, and from today's finished runs after a restart)."""
+    with _gem_lock:
+        today = clock.today_ct()
+        if _gem["day"] != today:
+            done = _q("select count(*) as n from gap_lab_runs where model_key = 'gemini' and finished_at >= :t",
+                      t=clock._at(today, "00:00"))[0]["n"]
+            _gem.update(day=today, calls=int(done))
+        if _gem["calls"] >= C.LAB_GEMINI_DAILY_CALLS:
+            return False
+        wait = C.LAB_GEMINI_MIN_GAP_S - (time.monotonic() - _gem["last"])
+        if wait > 0:
+            time.sleep(wait)
+        _gem["last"] = time.monotonic()
+        _gem["calls"] += 1
+        return True
+
+
 def _cooling(key: str) -> bool:
     until, _lvl = _cool.get(key, (0.0, 0))
     return time.monotonic() < until
@@ -428,30 +451,60 @@ def _rank(name: str) -> tuple:
     return (float(m.group(1)) if m else 0.0, not ("preview" in name or "exp" in name), "lite" not in name)
 
 
+def _flash_models() -> list[str]:
+    """Usable-looking Flash models, newest first, Lite ones last."""
+    names = [n for n in _gemini_models() if "flash" in n]
+    full = sorted([n for n in names if "lite" not in n], key=_rank, reverse=True)
+    lite = sorted([n for n in names if "lite" in n], key=_rank, reverse=True)
+    return full + lite
+
+
 def gemini_lab_model() -> str:
-    """The Flash model the lab forecasts with. Pinned in the database so every prompt is judged by
-    the same model; re-picked only if Google retires it."""
-    if C.GEMINI_MODEL and C.GEMINI_MODEL.lower() != "auto":
-        return C.GEMINI_MODEL.replace("models/", "")
+    """The Flash model the lab FORECASTS with. Pinned in the database so every prompt is judged by the
+    same model; re-picked only if Google retires it. v1.12.1: it is the SECOND newest Flash when there
+    is one, because the free plan counts calls per model per day (20 on Oct 2, 2026) and the newest
+    Flash is already used by the nightly Gemini challenger and by the writer."""
+    if C.LAB_GEMINI_MODEL and C.LAB_GEMINI_MODEL.lower() != "auto":
+        return C.LAB_GEMINI_MODEL.replace("models/", "")
     pinned = store.get_state("lab_gemini_model")
     if pinned:
         return str(pinned)
-    flash = sorted([n for n in _gemini_models() if "flash" in n and "lite" not in n], key=_rank, reverse=True)
+    flash = [n for n in _flash_models() if "lite" not in n]
     if not flash:
         raise Fatal("no Gemini Flash model available to this key")
-    store.set_state("lab_gemini_model", flash[0])
-    return flash[0]
+    pick = flash[1] if len(flash) > 1 else flash[0]
+    store.set_state("lab_gemini_model", pick)
+    return pick
+
+
+def _pro_blocked() -> bool:
+    until = store.get_state("lab_writer_no_pro")
+    return bool(until) and str(until) > _utc().isoformat()
 
 
 def writer_candidates() -> list[str]:
-    """Writer models to try, best first: Gemini Pro (newest), then Flash."""
+    """Writer models to try, best first: the newest Gemini Pro (unless this key was refused it in the
+    last 7 days), then EVERY Flash model newest first. A busy or used-up model falls through to the next."""
     names = _gemini_models()
     pro = sorted([n for n in names if "pro" in n and "flash" not in n], key=_rank, reverse=True)
-    flash = sorted([n for n in names if "flash" in n and "lite" not in n], key=_rank, reverse=True)
+    flash = _flash_models()[:5]
     want = C.LAB_WRITER_MODEL.replace("models/", "")
     if want and want.lower() != "auto":
-        return [want] + [n for n in pro[:1] + flash[:1] if n != want]
-    return pro[:2] + flash[:1]
+        return [want] + [n for n in flash if n != want]
+    return ([] if _pro_blocked() else pro[:1]) + flash
+
+
+def _note_writer_failure(model: str, exc: Exception) -> None:
+    """A Pro model the plan does not include (429 quota 0, 403, 404) is skipped for 7 days."""
+    if "pro" in model and "flash" not in model and getattr(exc, "http", None) in (403, 404, 429):
+        try:
+            store.set_state("lab_writer_no_pro", (_utc() + timedelta(days=7)).isoformat())
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _short_err(model: str, exc: Exception) -> str:
+    return str(exc).replace(f"{model}: ", "", 1)[:110]
 
 
 def _gemini_call(model: str, system: str, user: str, temperature: float, timeout: float) -> tuple[str, dict]:
@@ -522,7 +575,7 @@ def ask(model_key: str, system: str, user: str, names: list[str], d: str) -> dic
         try:
             raw, usage = _gemini_call(model, system, user, 0.2, C.LAB_TIMEOUT_S)
         except Retry as exc:
-            if getattr(exc, "http", None) in (403, 404) and not (C.GEMINI_MODEL and C.GEMINI_MODEL.lower() != "auto"):
+            if getattr(exc, "http", None) in (403, 404) and not (C.LAB_GEMINI_MODEL and C.LAB_GEMINI_MODEL.lower() != "auto"):
                 store.set_state("lab_gemini_model", None)       # retired model: pick again next time
             raise
         try:
@@ -600,6 +653,8 @@ def _run_one(row: dict) -> str:
     est = _reserve(key)
     if est is None:
         return "budget"
+    if key == "gemini" and not _gemini_slot():
+        return "budget"                                     # today's free Gemini calls are used: wait for tomorrow
     try:
         if not _x("""update gap_lab_runs set status = 'running', claimed_at = :t
                      where prompt_id = :p and model_key = :k and event_date = cast(:d as date) and status = 'pending'""",
@@ -631,6 +686,9 @@ def _run_one(row: dict) -> str:
                 return "failed"
             if exc.free:
                 _cool_down(key)                             # a busy service: pause every run for it, not just this one
+                if key == "gemini" and getattr(exc, "http", None) == 429:
+                    with _gem_lock:                         # the free plan's daily count is used up
+                        _gem["calls"] = max(_gem["calls"], C.LAB_GEMINI_DAILY_CALLS)
             delay = 120 if exc.free else min(120 * (2 ** tries), 1800)
             finish("pending", attempts=tries, error=str(exc)[:300], cost_usd=cost or None,
                    not_before=_utc() + timedelta(seconds=delay))
@@ -817,7 +875,8 @@ def write_variants(champ: dict, ni: dict, truth: dict[str, float], key: str) -> 
             return [e for e in edits if isinstance(e, dict)][:C.LAB_VARIANTS_PER_NIGHT], f"gemini:{model}", notes
         except Exception as exc:  # noqa: BLE001  try the next writer model
             last = exc
-            notes.append(f"{model}: {str(exc)[:100]}")
+            _note_writer_failure(model, exc)
+            notes.append(f"{model}: {_short_err(model, exc)}")
     raise Retry("writer failed: " + ("; ".join(notes) or str(last)), free=True)
 
 
@@ -928,7 +987,7 @@ def night_step(d: str, send=None) -> int:
             _set_night(d, stage="new")
             det["writer_tries"] = int(det.get("writer_tries") or 0) + 1
             det["writer_error"] = str(exc)[:400]
-            if det["writer_tries"] >= 3:
+            if det["writer_tries"] >= C.LAB_WRITER_TRIES:
                 _set_night(d, stage="decided", decision="writer_failed", detail=det)
                 say(night_message(d))
                 return 1
@@ -989,9 +1048,8 @@ def night_step(d: str, send=None) -> int:
             for n in lab_nights(d):
                 if n == d:
                     continue
-                for k in model_keys():
-                    enqueue(winner["prompt_id"], k, n, "test")
-                    enqueue(cid, k, n, "fill")
+                enqueue(winner["prompt_id"], key, n, "test")   # the judge model only
+                enqueue(cid, key, n, "fill")
             det["winner"] = winner["prompt_id"]
         decision = "winner_to_test" if winner else ("no_valid_variant" if not cands else (
             "test_queue_full" if det.get("queue_full") else "no_variant_beat_champion"))
@@ -1043,7 +1101,7 @@ def evaluate(send=None) -> int:
                  f"On {c['nights']} other nights, {c['n']} words: Brier {c['brier']:.3f} vs old champion {c['champ']:.3f} "
                  f"({c['diff']:+.3f}); better or equal on {c['wins']} of {c['nights']} nights.\n"
                  f"It forecasts from {nxt.isoformat()}. Live trading is unchanged (manual Grok).\n"
-                 f"/gap_lab prompt {p['prompt_id']} shows the text; /gap_lab champion {cid} puts the old one back.")
+                 f"/gap_lab_prompt {p['prompt_id']} shows the text; /gap_lab_champion {cid} puts the old one back.")
         cid = p["prompt_id"]
     listed = _q("select * from gap_lab_prompts where status = 'listed'")
     if len(listed) > C.LAB_TOP_N:
@@ -1076,23 +1134,36 @@ def set_champion(pid: str) -> str:
 
 
 def writer_check() -> str:
-    """Which writer models this key can really use (one tiny call each). For /gap_lab writer."""
+    """Which writer model this key can really use: tiny calls, best first, stopping at the first that
+    works (the free plan allows few calls a day). For /gap_lab_writer."""
     if not C.GEMINI_API_KEY:
         return "no Gemini key: the lab has no writer (the champion still forecasts every night)"
-    lines = ["WRITER CHECK (one tiny call per model, best first):"]
+    lines = ["WRITER CHECK (tiny calls, best model first, stops at the first that works):"]
     try:
         cands = writer_candidates()
     except Exception as exc:  # noqa: BLE001
         return f"could not list Gemini models: {str(exc)[:160]}"
+    if _pro_blocked():
+        lines.append("- Gemini Pro: skipped (this key was refused it in the last 7 days; the free plan has no Pro)")
     first_ok = None
     for model in cands:
         try:
             _gemini_call(model, "Reply with JSON only.", 'Reply with exactly {"ok": true}', 0.0, 60)
             lines.append(f"- {model}: OK")
-            first_ok = first_ok or model
+            first_ok = model
+            break
         except Exception as exc:  # noqa: BLE001
-            lines.append(f"- {model}: not usable ({str(exc)[:120]})")
-    lines.append(f"The writer tonight will be: {first_ok}" if first_ok else "No writer model works right now.")
+            _note_writer_failure(model, exc)
+            why = _short_err(model, exc)
+            if "429" in why and "pro" in model and "flash" not in model:
+                why += " = not on this plan"
+            elif "503" in why:
+                why += " = Google is busy right now"
+            elif "429" in why:
+                why += " = today's free calls for this model are used"
+            lines.append(f"- {model}: not usable ({why})")
+    lines.append(f"The writer would be: {first_ok}. Tonight it tries the same list in the same order." if first_ok
+                 else "No writer model works right now. Tonight the lab tries again, several times.")
     return "\n".join(lines)
 
 
@@ -1109,7 +1180,7 @@ def start_night(d: str | None = None) -> str:
         return f"{d} cannot be replayed (no stored news file, not fully settled, or void). Usable: {', '.join(nights[-5:])}"
     row = _night(d)
     if row and row.get("stage") in ("decided", "skipped"):
-        return f"{d} was already done ({row.get('decision')}). /gap_lab night {d} shows it."
+        return f"{d} was already done ({row.get('decision')}). /gap_lab_night {d} shows it."
     _night(d, champ["prompt_id"])
     _x("update gap_lab_nights set updated_at = :t where event_date = cast(:d as date)", t=_utc(), d=d)
     return f"lab started on {d}: champion run, writer, screen, test. The result arrives here when it is done."
@@ -1211,7 +1282,7 @@ def night_message(d: str) -> str:
     for n in det.get("writer_notes") or []:
         lines.append(f"  writer model skipped: {n}")
     if row.get("decision") == "writer_failed":
-        lines.append(f"The writer failed 3 times ({det.get('writer_error')}). No variants tonight.")
+        lines.append(f"The writer failed {C.LAB_WRITER_TRIES} times ({det.get('writer_error')}). No variants tonight.")
     if row.get("decision") == "no_writer":
         lines.append("No writer (no Gemini key, or LAB_VARIANTS_PER_NIGHT is 0). The champion still forecast tonight.")
     if det.get("variants"):

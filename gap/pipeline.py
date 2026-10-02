@@ -847,9 +847,9 @@ def register_commands() -> None:
     notify.register("gap_cost", _cost)
 
     def _lab(args, _msg):
-        """/gap_lab = board and status; /gap_lab night [date]; /gap_lab prompt <id>; /gap_lab champion <id>;
-        /gap_lab writer = which writer model works; /gap_lab start [date] = run the lab on a past settled night;
-        /gap_lab retry = give failed runs another go. Paper only."""
+        """/gap_lab = board and status; /gap_lab_night [date]; /gap_lab_prompt <id>; /gap_lab_champion <id>;
+        /gap_lab_writer = which writer model works; /gap_lab_start [date] = run the lab on a past settled night;
+        /gap_lab_retry = give failed runs another go. The old two-word forms (/gap_lab writer) still work. Paper only."""
         from . import promptlab
         if not promptlab.enabled():
             return "prompt lab is off (LAB_ON is false, or no Postgres database)"
@@ -860,7 +860,7 @@ def register_commands() -> None:
         if cmd == "prompt":
             p = promptlab.get_prompt(args[1]) if len(args) > 1 else promptlab.champion()
             if not p:
-                return "usage: /gap_lab prompt lab-xxxxxxx"
+                return "usage: /gap_lab_prompt lab-xxxxxxx"
             notify.send_document(f"{p['prompt_id']}.txt", p["system_prompt"],
                                  f"{p['prompt_id']} ({p.get('name') or '-'}), status {p['status']}\n"
                                  f"edit: {p.get('section') or '-'} / {p.get('action') or '-'}\n"
@@ -869,7 +869,7 @@ def register_commands() -> None:
             return f"sent {p['prompt_id']}"
         if cmd == "champion":
             if len(args) < 2:
-                return "usage: /gap_lab champion lab-xxxxxxx"
+                return "usage: /gap_lab_champion lab-xxxxxxx"
             return promptlab.set_champion(args[1])
         if cmd == "writer":                # makes model calls: never on the Telegram thread (it also takes the Grok JSON)
             import threading as _th
@@ -892,6 +892,8 @@ def register_commands() -> None:
         return promptlab.status_text()
 
     notify.register("gap_lab", _lab)
+    for _sub in ("writer", "start", "night", "prompt", "champion", "retry"):   # v1.12.1: one-word forms, tap-friendly
+        notify.register(f"gap_lab_{_sub}", lambda args, msg, _s=_sub: _lab([_s] + list(args), msg))
     notify.register("gap_sendnow", _sendnow)
     def _settle(_args, _msg):
         start, end, week_id = clock.week_mon_fri()

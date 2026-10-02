@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.12.0"  # prompt lab: rule-checked prompt variants, replay on frozen nights, leaderboard, champion rule (paper only)
+VERSION = "wnt-gap-v1.12.1"  # prompt lab: one-word Telegram commands (/gap_lab_writer ...), Gemini free-plan limits (no Pro, 20 calls a day per model)
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -218,6 +218,10 @@ BASELINE_ON = _flag("BASELINE_ON", True)
 LAB_ON = _flag("LAB_ON", True)
 LAB_MODELS = [x.strip().lower() for x in _secret("LAB_MODELS", "xai, gemini").split(",") if x.strip()]  # first with a key = the judge
 LAB_WRITER_MODEL = _secret("LAB_WRITER_MODEL", "auto").strip()      # auto = newest Gemini Pro the key can use, else Flash
+LAB_WRITER_TRIES = int(_num("LAB_WRITER_TRIES", 4))                  # whole passes over the writer list, minutes apart
+LAB_GEMINI_MODEL = _secret("LAB_GEMINI_MODEL", "auto").strip()      # the lab's Gemini FORECASTER; auto = second newest Flash
+LAB_GEMINI_DAILY_CALLS = int(_num("LAB_GEMINI_DAILY_CALLS", 15))    # free plan: 20 calls a day per model (Oct 2, 2026)
+LAB_GEMINI_MIN_GAP_S = float(_num("LAB_GEMINI_MIN_GAP_S", 13))      # free plan: 5 calls a minute
 LAB_VARIANTS_PER_NIGHT = int(_num("LAB_VARIANTS_PER_NIGHT", 3))
 LAB_XAI_EFFORT = _secret("LAB_XAI_EFFORT", "low").strip()           # thinking was ~70% of a plain Grok run's cost
 LAB_DAILY_BUDGET_USD = float(_num("LAB_DAILY_BUDGET_USD", 1.50))    # paid lab runs per CT day; the rest wait for tomorrow

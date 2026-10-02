@@ -57,12 +57,12 @@ class Net:
         self.pro_status = 200
         self.flash_status = 200
         self.bad_json = False
+        self.models = ["gemini-3.5-pro", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+        self.status_by_model: dict[str, int] = {}
 
     def get(self, url, headers, timeout):
-        return R(200, {"models": [
-            {"name": "models/gemini-3.5-pro", "supportedGenerationMethods": ["generateContent"]},
-            {"name": "models/gemini-3.5-flash", "supportedGenerationMethods": ["generateContent"]},
-            {"name": "models/gemini-3.5-flash-lite", "supportedGenerationMethods": ["generateContent"]}]})
+        return R(200, {"models": [{"name": f"models/{m}", "supportedGenerationMethods": ["generateContent"]}
+                                  for m in self.models]})
 
     def _forecast(self, system: str, user: str) -> str:
         d = re.search(r"Date: (\d{4}-\d{2}-\d{2})", user).group(1)
@@ -95,6 +95,8 @@ class Net:
         is_check = system.startswith("Reply with JSON only")
         is_writer = system.startswith("You improve a forecasting prompt") or is_check
         status = (self.pro_status if "-pro" in url else self.flash_status) if is_writer else 200
+        model = url.split("/models/")[1].split(":")[0]
+        status = self.status_by_model.get(model, status)
         if status != 200:
             return R(status, {"error": {"status": "RESOURCE_EXHAUSTED"}})
         txt = ('{"ok": true}' if is_check else json.dumps({"variants": self.variants})) if is_writer \
@@ -160,6 +162,11 @@ def lab(monkeypatch):
     monkeypatch.setattr(C, "LAB_MARGIN", 0.005)
     monkeypatch.setattr(C, "LAB_REQUIRE_NEWS", True)
     monkeypatch.setattr(C, "LAB_PARALLEL", 1)
+    monkeypatch.setattr(C, "LAB_GEMINI_MODEL", "auto")
+    monkeypatch.setattr(C, "LAB_GEMINI_MIN_GAP_S", 0.0)
+    monkeypatch.setattr(C, "LAB_GEMINI_DAILY_CALLS", 500)
+    monkeypatch.setattr(C, "LAB_WRITER_TRIES", 3)
+    PL._gem.update(last=0.0, day="", calls=0)
     monkeypatch.setattr(C, "NET_MIN_GAP_S", 0.0)
     netlimit.reset()
     PL._cool.clear()
@@ -440,7 +447,8 @@ def test_writer_falls_back_from_pro_to_flash_and_gives_up_after_three(lab, monke
     run_all(sent)
     night = PL._night(N3)
     assert night["writer_model"] == "gemini:gemini-3.5-flash"
-    assert "writer model skipped: gemini-3.5-pro: gemini-3.5-pro: HTTP 429" in "\n".join(sent)
+    assert "writer model skipped: gemini-3.5-pro: HTTP 429" in "\n".join(sent)
+    assert PL._pro_blocked() and PL.writer_candidates() == ["gemini-3.5-flash", "gemini-3.5-flash-lite"]   # Pro is not asked again for 7 days
 
     PL._x("delete from gap_lab_nights")
     PL._x("delete from gap_lab_prompts where status <> 'champion'")
@@ -512,7 +520,8 @@ def test_rehearsal_on_a_past_night_and_writer_check(lab, monkeypatch):
     lab.variants = edits(GOOD)
     lab.pro_status = 429
     out = PL.writer_check()
-    assert "gemini-3.5-pro: not usable" in out and "gemini-3.5-flash: OK" in out and "will be: gemini-3.5-flash" in out
+    assert "gemini-3.5-pro: not usable (HTTP 429 RESOURCE_EXHAUSTED = not on this plan)" in out
+    assert "gemini-3.5-flash: OK" in out and "would be: gemini-3.5-flash" in out and "flash-lite" not in out   # stops at the first OK
     assert "cannot be replayed" in PL.start_night(N3)                   # tonight is not settled
     assert PL.start_night() .startswith(f"lab started on {N2}")         # newest settled night
     sent: list = []
@@ -625,3 +634,77 @@ def test_review_slow_command_leaves_the_telegram_thread_free(lab, monkeypatch):
             break
         time.sleep(0.02)
     assert sent == ["WRITER CHECK done"]
+
+
+# ---------------------------------------------------------------- v1.12.1: Gemini free plan, one-word commands
+
+def test_v1121_writer_walks_down_every_flash_model(lab, monkeypatch):
+    """Oct 2: Pro is not on the free plan (429), a retired Pro gives 404, the newest Flash was busy (503)."""
+    lab.models = ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-3.8-flash", "gemini-3.7-flash",
+                  "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+    assert PL.writer_candidates() == ["gemini-3.1-pro-preview", "gemini-3.8-flash", "gemini-3.7-flash",
+                                      "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+    lab.status_by_model = {"gemini-3.1-pro-preview": 429, "gemini-3.8-flash": 503}
+    out = PL.writer_check()
+    assert "gemini-3.8-flash: not usable (HTTP 503 RESOURCE_EXHAUSTED = Google is busy right now)" in out
+    assert "gemini-3.7-flash: OK" in out and "would be: gemini-3.7-flash" in out and "gemini-3.6-flash" not in out
+    assert "Gemini Pro: skipped" in PL.writer_check()                    # remembered: no wasted call next time
+
+    lab.variants = edits(MILD)
+    PL.live_start(N3)
+    set_clock(monkeypatch, "18:40")
+    settle_tonight()
+    sent: list = []
+    run_all(sent)
+    assert PL._night(N3)["writer_model"] == "gemini:gemini-3.7-flash"
+    assert "writer model skipped: gemini-3.8-flash: HTTP 503" in "\n".join(sent)
+
+
+def test_v1121_lab_forecaster_uses_its_own_flash_and_respects_the_daily_count(lab, monkeypatch):
+    lab.models = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite"]
+    assert PL.gemini_lab_model() == "gemini-3.7-flash"                   # the newest Flash is left to the challenger and the writer
+    assert store.get_state("lab_gemini_model") == "gemini-3.7-flash"
+    monkeypatch.setattr(C, "LAB_MODELS", ["gemini"])
+    monkeypatch.setattr(C, "LAB_GEMINI_DAILY_CALLS", 2)
+    champ = PL.bootstrap()
+    for d in (N1, N2, N3):
+        PL.enqueue(champ["prompt_id"], "gemini", d, "fill")
+    assert PL.process_queue() == {"done": 2, "budget": 1}                # the third waits for tomorrow
+    assert PL.process_queue() == {"budget": 1}
+    PL._gem.update(day="")                                               # after a restart the count comes from the database
+    assert PL.process_queue() == {"budget": 1}
+    monkeypatch.setattr(C, "LAB_GEMINI_DAILY_CALLS", 10)
+    assert PL.process_queue() == {"done": 1}
+    assert all("gemini-3.7-flash" in u for u, _b in lab.posts)
+
+
+def test_v1121_winner_is_tested_on_the_judge_model_only(lab, monkeypatch):
+    lab.variants = edits(GOOD)
+    PL.live_start(N3)
+    set_clock(monkeypatch, "18:40")
+    settle_tonight()
+    run_all([])
+    keys = {r["model_key"] for r in PL._q("select model_key from gap_lab_runs where purpose = 'test'")}
+    assert keys == {"xai"}
+    assert PL.champion()["name"] == "running-story-length"               # the champion rule still works
+
+
+def test_v1121_one_word_commands(lab, monkeypatch):
+    handlers, sent = {}, []
+    monkeypatch.setattr(notify, "register", lambda name, fn: handlers.__setitem__(name, fn))
+    monkeypatch.setattr(notify, "on_json", lambda fn: None)
+    monkeypatch.setattr(notify, "send", lambda t, quiet=False, reply_to=None: sent.append(t))
+    pipeline.register_commands()
+    for name in ("gap_lab", "gap_lab_writer", "gap_lab_start", "gap_lab_night", "gap_lab_prompt", "gap_lab_champion", "gap_lab_retry"):
+        assert name in handlers
+    assert "arrives here" in handlers["gap_lab_writer"]([], {})
+    assert "arrives here" in handlers["gap_lab"](["writer"], {})         # the old two-word form still works
+    assert "usage: /gap_lab_champion" in handlers["gap_lab_champion"]([], {})
+    assert "no lab prompt" in handlers["gap_lab_champion"](["lab-nope"], {})
+    assert "no lab record" in handlers["gap_lab_night"](["2026-01-05"], {})
+    assert handlers["gap_lab_retry"]([], {}).startswith("0 failed")
+    for _ in range(100):
+        if len(sent) >= 2:
+            break
+        time.sleep(0.02)
+    assert all("WRITER CHECK" in t for t in sent)
