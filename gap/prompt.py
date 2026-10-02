@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import time
 
-from . import config as C, history, notify
+from . import config as C, history, notify, store
 
 log = logging.getLogger("gap.prompt")
 
@@ -122,3 +122,29 @@ def build_telegram_caption(event_date: str, event_ticker: str, n: int) -> str:
         f"3. Paste the file. Do not add prices.\n"
         f"4. Reply to this message with the JSON only."
     )
+
+
+SEP = "\n\n---\n\n"
+
+
+def split_paste(paste: str) -> tuple[str, str]:
+    """(system prompt, user message) from a built Grok file. v1.10.0: the user message is the frozen
+    nightly package (date, words, word history, ABC, other networks, Google News)."""
+    if SEP in paste:
+        sys_part, user = paste.split(SEP, 1)
+        return sys_part, user
+    return "", paste
+
+
+def freeze(event_date: str, event_ticker: str, words: list[dict], paste: str, kind: str = "grok_file"):
+    """Store tonight's package once (and the system prompt by version). Returns the package row or None.
+    Never raises: freezing must never stop the Grok file."""
+    try:
+        sys_part, user = split_paste(paste)
+        version = C.PROMPT_VERSION
+        if sys_part:
+            store.save_prompt_version(version, sys_part)
+        return store.freeze_package(event_date, event_ticker, kind, version, words, user)
+    except Exception:
+        log.exception("package freeze failed")
+        return None

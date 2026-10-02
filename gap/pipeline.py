@@ -224,7 +224,8 @@ def detect_event(client: KalshiClient | None = None) -> dict:
     return {"ok": True, "reason": "detected", "run": store.get_run_for_date(date_str), "n": len(words), "how": how}
 
 
-def _start_challengers(date_str: str, event_ticker: str, words: list[dict], paste: str) -> None:
+def _start_challengers(date_str: str, event_ticker: str, words: list[dict], paste: str,
+                       package_id: int | None = None) -> None:
     """v1.8.0: paper-only challenger forecasts (Gemini + no-AI baseline) in a background thread,
     with the same news as the Grok file. Never touches orders; any failure is only logged.
     Runs once per night (a resend does not re-ask models that already answered)."""
@@ -233,7 +234,7 @@ def _start_challengers(date_str: str, event_ticker: str, words: list[dict], past
     try:
         from . import shadow
         shadow.run_async(date_str, event_ticker, words, paste,
-                         notify_fn=lambda t: notify.send(t, quiet=True))
+                         notify_fn=lambda t: notify.send(t, quiet=True), package_id=package_id)
     except Exception:
         log.exception("challengers not started")
 
@@ -320,7 +321,8 @@ def dispatch_prompt(force: bool = False, client: KalshiClient | None = None) -> 
 
     msg_id = notify.send_document(f"gap-{date_str}.txt", paste, caption)
     store.update_run(run["id"], telegram_msg_id=msg_id, status="awaiting_json")
-    _start_challengers(date_str, event["event_ticker"], words, paste)
+    pkg = prompt.freeze(date_str, event["event_ticker"], words, paste)   # v1.10.0: frozen once per night
+    _start_challengers(date_str, event["event_ticker"], words, paste, (pkg or {}).get("id"))
     store.log_activity(
         "prompt_sent",
         f"{event['event_ticker']} n={len(words)} msg={msg_id} force={force} "
@@ -696,6 +698,11 @@ def poll_once() -> dict:
         live.tick()  # Book L: real money, own table, own lifecycle -- see gap/live.py
     except Exception:
         log.exception("live_tick")
+    try:
+        from . import scoring  # v1.10.0: nightly scorecard after settlement (read-only scoring)
+        scoring.scorecard_if_due(lambda t: notify.send(t, quiet=True))
+    except Exception:
+        log.exception("scorecard")
     if not clock.in_poll_window() and store.get_run_for_date(clock.today_ct()):
         expire_if_needed()
         return {"ok": True, "reason": "outside_window"}
@@ -796,6 +803,22 @@ def register_commands() -> None:
     notify.register("gap_prep", _prep)
     notify.register("gap_resend", _resend)
     notify.register("gap_shadow", _shadow)
+
+    def _score(args, _msg):
+        """/gap_score = tonight word by word; /gap_score 7 = the last 7 days."""
+        from datetime import date as _date, timedelta as _td
+        from . import scoring
+        d = clock.today_ct()
+        try:
+            days = int(args[0]) if args else 1
+        except ValueError:
+            days = 1
+        days = max(1, min(days, 120))
+        start = (_date.fromisoformat(d) - _td(days=days - 1)).isoformat()
+        title = "SCORE tonight" if days == 1 else f"SCORE last {days} days"
+        return "\n".join(scoring.report_lines(start, d, title, fetch=True, per_word=(days == 1)))
+
+    notify.register("gap_score", _score)
     notify.register("gap_sendnow", _sendnow)
     def _settle(_args, _msg):
         start, end, week_id = clock.week_mon_fri()

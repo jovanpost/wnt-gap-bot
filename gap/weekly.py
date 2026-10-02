@@ -2016,6 +2016,10 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
     _hdr(lines, "4J. CHALLENGERS (paper only): Gemini and the no-AI baseline vs Grok, Brier on the same words")
     try:
         from . import shadow
+        from . import scoring
+        lines += scoring.report_lines(data["start"], data["end"], "ALL FORECASTERS THIS WEEK (general scorer)",
+                                      fetch=False)
+        lines.append("")
         lines += shadow.weekly_block(data["start"], data["end"])
     except Exception as exc:  # never let this section break the dump
         lines.append(f"(challenger section failed: {type(exc).__name__})")

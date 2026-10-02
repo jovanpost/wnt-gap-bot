@@ -34,6 +34,7 @@ MIGRATION_FILES = [
     Path(__file__).resolve().parent.parent / "sql" / "007_v1510.sql",
     Path(__file__).resolve().parent.parent / "sql" / "008_book_l.sql",
     Path(__file__).resolve().parent.parent / "sql" / "009_shadow_forecasts.sql",
+    Path(__file__).resolve().parent.parent / "sql" / "010_frozen_packages.sql",
 ]
 
 
@@ -1054,14 +1055,17 @@ def insert_shadow_forecasts(rows: list[dict]) -> int:
             res = conn.execute(text(
                 """
                 insert into gap_shadow_forecasts
-                  (event_date, event_ticker, market_ticker, word, model, probability, reasoning, raw, seconds)
-                values (:event_date, :event_ticker, :market_ticker, :word, :model, :probability, :reasoning, :raw, :seconds)
+                  (event_date, event_ticker, market_ticker, word, model, probability, reasoning, raw, seconds,
+                   prompt_version, package_id)
+                values (:event_date, :event_ticker, :market_ticker, :word, :model, :probability, :reasoning, :raw,
+                        :seconds, :prompt_version, :package_id)
                 on conflict (event_date, model, word) do nothing
                 """), {
                     "event_date": r["event_date"], "event_ticker": r.get("event_ticker"),
                     "market_ticker": r.get("market_ticker"), "word": r["word"], "model": r["model"],
                     "probability": int(r["probability"]), "reasoning": r.get("reasoning"),
                     "raw": r.get("raw"), "seconds": r.get("seconds"),
+                    "prompt_version": r.get("prompt_version"), "package_id": r.get("package_id"),
                 })
             n += res.rowcount or 0
     return n
@@ -1100,3 +1104,57 @@ def official_results(tickers: list[str]) -> dict[str, str]:
             text("select market_ticker, result from gap_results where market_ticker in :t").bindparams(
                 bindparam("t", expanding=True)), {"t": tickers}).all()
     return {r[0]: r[1] for r in rows}
+
+
+# ---------- v1.10.0: frozen nightly packages (prompt lab, Phase A) ----------
+
+def save_prompt_version(version: str, text_: str) -> None:
+    """Keep every system prompt ever used, by version, so old prompts can be replayed later."""
+    with engine().begin() as conn:
+        conn.execute(text(
+            "insert into gap_prompt_versions (prompt_version, system_prompt) values (:v, :t) "
+            "on conflict (prompt_version) do nothing"), {"v": version, "t": text_})
+
+
+def freeze_package(event_date: str, event_ticker: str | None, kind: str, prompt_version: str,
+                   words: list[dict], user_message: str) -> dict | None:
+    """Store tonight's input ONCE per (night, kind). A second call returns the first package
+    unchanged -- the stored package is never edited (the database refuses updates too)."""
+    import hashlib
+    sha = hashlib.sha1(user_message.encode("utf-8")).hexdigest()[:12]
+    with engine().begin() as conn:
+        conn.execute(text(
+            """insert into gap_news_packages (event_date, event_ticker, kind, prompt_version, words, user_message, sha)
+               values (cast(:d as date), :t, :k, :v, :w, :u, :s)
+               on conflict (event_date, kind) do nothing"""),
+            {"d": event_date, "t": event_ticker, "k": kind, "v": prompt_version,
+             "w": json.dumps(words, default=str), "u": user_message, "s": sha})
+    return get_package(event_date, kind)
+
+
+def get_package(event_date: str, kind: str = "grok_file") -> dict | None:
+    with engine().connect() as conn:
+        row = conn.execute(text(
+            "select * from gap_news_packages where event_date = cast(:d as date) and kind = :k"),
+            {"d": event_date, "k": kind}).mappings().first()
+    return dict(row) if row else None
+
+
+def packages_between(start: str, end: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(text(
+            "select * from gap_news_packages where event_date between cast(:a as date) and cast(:b as date) "
+            "order by event_date, kind"), {"a": start, "b": end}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def grok_forecasts_between(start: str, end: str) -> list[dict]:
+    """Grok's forecasts from the LATEST run of each night in the range."""
+    with engine().connect() as conn:
+        rows = conn.execute(text(
+            """select f.* from gap_forecasts f
+               join (select event_date, max(id) as id from gap_runs
+                     where event_date between cast(:a as date) and cast(:b as date) group by event_date) r
+                 on r.id = f.run_id
+               order by f.event_date, f.id"""), {"a": start, "b": end}).mappings().all()
+    return [dict(r) for r in rows]

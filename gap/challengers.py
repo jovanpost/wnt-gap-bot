@@ -110,7 +110,17 @@ def list_models(provider: str, timeout: float = 30) -> list[str]:
         raise RuntimeError(f"{provider} model list: HTTP {r.status_code}")
     data = r.json()
     rows = data.get("data") if isinstance(data, dict) else data
-    return [str(m.get("id")) for m in (rows or []) if isinstance(m, dict) and m.get("id")]
+    out = []
+    for m in rows or []:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        ctx = m.get("context_length")
+        # v1.9.4: a model that cannot read our whole file answers empty ("length"). When the service
+        # says how much a model can read, skip the ones under MIN_CONTEXT_TOKENS.
+        if isinstance(ctx, (int, float)) and ctx < C.CHALLENGER_MIN_CONTEXT:
+            continue
+        out.append(str(m["id"]))
+    return out
 
 
 def pick_models(provider: str, wanted: str, ids: list[str], n: int = 3) -> list[str]:
@@ -178,14 +188,35 @@ def _limit_info(r) -> tuple[str, float | None]:
     return ("; ".join(keep), ra)
 
 
-def _zero_allowance(r) -> bool:
-    """True when the service says this key's limit itself is 0 (e.g. Mistral without a plan:
-    x-ratelimit-limit-req-minute=0). Retrying cannot help then."""
+def _hdrs(r) -> dict:
     try:
-        h = {k.lower(): str(v).strip() for k, v in (r.headers or {}).items()}
+        return {k.lower(): str(v).strip() for k, v in (r.headers or {}).items()}
     except Exception:  # noqa: BLE001
-        return False
-    return any(k.startswith("x-ratelimit-limit") and v == "0" for k, v in h.items())
+        return {}
+
+
+def _zero_allowance(r) -> bool:
+    """True only when a TOKEN limit is 0 (the key really may not use the model).
+    v1.9.4: Mistral sends x-ratelimit-limit-req-minute=0 to mean "no per-minute request limit"
+    (it limits per second instead) -- v1.9.2 wrongly read that as blocked."""
+    return any(k.startswith("x-ratelimit-limit") and "token" in k and v == "0" for k, v in _hdrs(r).items())
+
+
+def _token_limit(r) -> int | None:
+    """The per-minute token limit the service reports, if it reports one."""
+    for k, v in _hdrs(r).items():
+        if k.startswith("x-ratelimit-limit") and "token" in k and ("minute" in k or k.endswith("tokens")):
+            try:
+                return int(float(v))
+            except ValueError:
+                continue
+    return None
+
+
+def est_tokens(payload: str, max_tokens: int) -> int:
+    """Rough size of one request as a rate limiter counts it: the text (about 4 characters a token)
+    plus the room reserved for the answer."""
+    return len(payload) // 4 + max_tokens
 
 
 def _err_msg(r) -> str:
@@ -221,6 +252,7 @@ def forecast(provider: str, model: str, paste: str, words: list[str], event_date
     if fallbacks:
         body["models"] = [model] + [m for m in fallbacks if m != model][:2]   # OpenRouter: try these in order
     payload = json.dumps(body)
+    need = est_tokens(payload, C.CHALLENGER_MAX_TOKENS)
     label = f"{provider}:{model}"
     start = now()
     attempt, waited = 0, 0.0
@@ -246,8 +278,10 @@ def forecast(provider: str, model: str, paste: str, words: list[str], event_date
             elif r.status_code == 404:
                 raise Fatal(f"{label}: model not found (HTTP 404) {_err_msg(r)}".strip())
             elif r.status_code == 429 and _zero_allowance(r):
-                raise Fatal(f"{label}: this account is allowed 0 requests a minute -- the free plan is not "
-                            "switched on for this key (waiting will not help)")
+                raise Fatal(f"{label}: this key is allowed 0 tokens a minute on this model (waiting will not help)")
+            elif r.status_code == 429 and (_token_limit(r) or 10**12) < need:
+                raise Fatal(f"{label}: one request is about {need:,} tokens but this model allows "
+                            f"{_token_limit(r):,} a minute -- it can never fit (pick a model with a bigger limit)")
             elif r.status_code in RETRYABLE:
                 info, retry_after = _limit_info(r)
                 err = f"HTTP {r.status_code} {_err_msg(r)}".strip() + (f" [{info}]" if info else "")

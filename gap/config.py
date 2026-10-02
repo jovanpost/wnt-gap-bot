@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.9.3"  # a parsed night can never go back to waiting/expired: read-only /gap_resend, safe re-paste
+VERSION = "wnt-gap-v1.10.0"  # prompt lab phase A: frozen nightly packages, prompt-tagged forecasts, general scorer + nightly scorecard
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -186,12 +186,18 @@ GROQ_API_KEY = _secret("GROQ_API_KEY", "").strip()
 CHALLENGERS = [x.strip() for x in _secret(
     "CHALLENGERS",
     "nvidia:deepseek, nvidia:kimi, nvidia:glm, nvidia:nvidia/nemotron-3-ultra-550b-a55b, cerebras:gpt-oss-120b, "
-    "mistral:mistral-small, openrouter:free",
+    "mistral:mistral-large, openrouter:free",
 ).split(",") if x.strip()]
 CHALLENGER_MAX_TOKENS = int(_num("CHALLENGER_MAX_TOKENS", 12000))
 CHALLENGER_RETRY_BUDGET_S = float(_num("CHALLENGER_RETRY_BUDGET_S", 1800))   # same 30-minute patience as Gemini
 CHALLENGER_TIMEOUT_S = float(_num("CHALLENGER_TIMEOUT_S", 600))   # one answer may take up to 10 min (big free models are slow)
+CHALLENGER_MIN_CONTEXT = int(_num("CHALLENGER_MIN_CONTEXT", 64000))   # skip models that cannot read our whole file
 BASELINE_ON = _flag("BASELINE_ON", True)
+# v1.10.0: general scorer. A Telegram scorecard once a night after settlement (every forecaster,
+# every prompt version, vs said / not said), plus /gap_score. Strategy-free.
+SCORECARD_ON = _flag("SCORECARD_ON", True)
+SCORECARD_AFTER_CT = _secret("SCORECARD_AFTER_CT", "18:30")    # start checking for results
+SCORECARD_LATEST_CT = _secret("SCORECARD_LATEST_CT", "22:00")  # send with whatever is settled by then
 # v1.7.0: paper quotes are never frozen before Kalshi's real open + this many seconds (or
 # DECISION_LAG_MIN, whichever is later) -- no-fade needs a moment to save the first books.
 PAPER_MIN_AFTER_OPEN_S = int(_num("PAPER_MIN_AFTER_OPEN_S", 120))

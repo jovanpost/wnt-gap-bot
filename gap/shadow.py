@@ -262,7 +262,7 @@ def baseline_forecast(words: list[dict], news: dict, history_block: str) -> list
 # ---------------------------------------------------------------- run + store
 
 def run(event_date: str, event_ticker: str, words: list[dict], paste: str, history_block: str = "",
-        save: bool = True, force: bool = False, on_attempt=None) -> dict:
+        save: bool = True, force: bool = False, on_attempt=None, package_id: int | None = None) -> dict:
     """Run every challenger once for the night. Returns {model: {"ok", "n"|"error", "forecasts"}}.
     With save=False nothing is written (used by the Mac test script without a database)."""
     report: dict = {}
@@ -278,6 +278,7 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
             "word": r["word"], "model": model, "probability": r["probability"],
             "reasoning": str(r.get("reasoning") or "")[:2000],
             "raw": json.dumps(r, default=str)[:8000] if raw is None else raw, "seconds": seconds,
+            "prompt_version": C.PROMPT_VERSION, "package_id": package_id,
         } for r in rows]
         n = store.insert_shadow_forecasts(stored) if save else len(stored)
         report[model] = {"ok": True, "n": n, "forecasts": {r["word"]: r["probability"] for r in rows}, "seconds": seconds}
@@ -320,10 +321,15 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
             with _report_lock:
                 keep(g["model"], g["forecasts"], g["seconds"])
                 report[g["model"]].update(attempts=g["attempts"], waited_s=g["waited_s"])
+            if on_attempt:
+                on_attempt(f"done: {g['model']}, {len(g['forecasts'])} words in {g['seconds']}s "
+                           f"({g['attempts']} tr{'y' if g['attempts'] == 1 else 'ies'}) -- saved")
         except Exception as exc:  # noqa: BLE001
             log.warning("%s failed: %s", tag, exc)
             with _report_lock:
                 report[tag] = {"ok": False, "error": str(exc)[:300]}
+            if on_attempt:
+                on_attempt(f"stopped: {tag}: {str(exc)[:200]}")
 
     if jobs:
         from concurrent.futures import ThreadPoolExecutor
@@ -379,7 +385,7 @@ def is_running() -> bool:
 
 
 def run_async(event_date: str, event_ticker: str, words: list[dict], paste: str, history_block: str = "",
-              notify_fn=None, force: bool = False) -> bool:
+              notify_fn=None, force: bool = False, package_id: int | None = None) -> bool:
     """Start run() in a background thread so it never delays the bot. One at a time."""
     if not C.SHADOW_ON:
         return False
@@ -388,7 +394,8 @@ def run_async(event_date: str, event_ticker: str, words: list[dict], paste: str,
         if not _running.acquire(blocking=False):
             return
         try:
-            rep = run(event_date, event_ticker, words, paste, history_block, save=True, force=force)
+            rep = run(event_date, event_ticker, words, paste, history_block, save=True, force=force,
+                      package_id=package_id)
             if notify_fn:
                 if any(r.get("ok") for r in rep.values()):
                     grok = {f["word"]: f["probability"] for f in store.grok_forecasts_for_date(event_date)}

@@ -192,7 +192,7 @@ def test_slow_answer_message_and_timeout_setting(monkeypatch):
 
 
 def test_default_lineup():
-    assert "mistral:mistral-small" in C.CHALLENGERS
+    assert "mistral:mistral-large" in C.CHALLENGERS
     assert "nvidia:nvidia/nemotron-3-ultra-550b-a55b" in C.CHALLENGERS
     assert not any(c.startswith("nvidia:qwen") for c in C.CHALLENGERS)   # NVIDIA lists no Qwen today
 
@@ -214,12 +214,81 @@ def test_feed_bytes_keep_apostrophes(monkeypatch):
     assert err is None and items[0]["title"] == "Trump says he’d consider pardoning"
 
 
-def test_zero_allowance_fails_at_once(monkeypatch):
+def test_req_minute_zero_is_not_blocked(monkeypatch):
+    """v1.9.4: Mistral's x-ratelimit-limit-req-minute=0 means 'no per-minute request limit' -> retry, not stop."""
+    monkeypatch.setattr(C, "MISTRAL_API_KEY", "k")
+    answers = [R(429, js={"message": "Rate limit exceeded"},
+                 headers={"x-ratelimit-limit-req-minute": "0", "x-ratelimit-remaining-req-minute": "0"}), _ok()]
+    monkeypatch.setattr(CH.requests, "post", lambda url, **kw: answers.pop(0))
+    slept = []
+    out = CH.forecast("mistral", "mistral-large-2512", "file", WORDS, "2026-10-01", shadow.PREFACE, sleep=slept.append)
+    assert slept == [30] and out["attempts"] == 2
+
+
+def test_zero_token_allowance_fails_at_once(monkeypatch):
     monkeypatch.setattr(C, "MISTRAL_API_KEY", "k")
     monkeypatch.setattr(CH.requests, "post", lambda url, **kw: R(
-        429, js={"message": "Rate limit exceeded"},
-        headers={"x-ratelimit-limit-req-minute": "0", "x-ratelimit-remaining-req-minute": "0"}))
+        429, js={"message": "Rate limit exceeded"}, headers={"x-ratelimit-limit-tokens-minute": "0"}))
     slept = []
-    with pytest.raises(CH.Fatal, match="0 requests a minute"):
-        CH.forecast("mistral", "mistral-small-2603", "file", WORDS, "2026-10-01", shadow.PREFACE, sleep=slept.append)
+    with pytest.raises(CH.Fatal, match="0 tokens a minute"):
+        CH.forecast("mistral", "mistral-large-2512", "file", WORDS, "2026-10-01", shadow.PREFACE, sleep=slept.append)
     assert slept == []
+
+
+def test_request_bigger_than_token_limit_fails_at_once(monkeypatch):
+    """Oct 1: Mistral Small allows 20,000 tokens a minute; our file + answer room is bigger."""
+    monkeypatch.setattr(C, "MISTRAL_API_KEY", "k")
+    monkeypatch.setattr(CH.requests, "post", lambda url, **kw: R(
+        429, js={"message": "Rate limit exceeded"}, headers={"x-ratelimit-limit-tokens-minute": "20000"}))
+    slept = []
+    big_file = "x" * 60000                      # ~15k tokens + 12k answer room > 20k
+    with pytest.raises(CH.Fatal, match="can never fit"):
+        CH.forecast("mistral", "mistral-small-2603", big_file, WORDS, "2026-10-01", shadow.PREFACE, sleep=slept.append)
+    assert slept == []
+
+
+def test_openrouter_skips_small_context_models(monkeypatch):
+    monkeypatch.setattr(C, "OPENROUTER_API_KEY", "k")
+    monkeypatch.setattr(CH.requests, "get", lambda url, **kw: R(200, js={"data": [
+        {"id": "google/gemma-4-31b-it:free", "context_length": 8192},
+        {"id": "meta-llama/llama-4-maverick:free", "context_length": 256000},
+        {"id": "some/model-without-info:free"}]}))
+    ids = CH.list_models("openrouter")
+    assert "google/gemma-4-31b-it:free" not in ids
+    assert set(ids) == {"meta-llama/llama-4-maverick:free", "some/model-without-info:free"}
+
+
+def test_done_and_stopped_lines(monkeypatch):
+    from gap import abcfeeds, store
+    monkeypatch.setattr(C, "SHADOW_ON", True)
+    monkeypatch.setattr(C, "BASELINE_ON", False)
+    monkeypatch.setattr(C, "GEMINI_API_KEY", "")
+    monkeypatch.setattr(C, "NVIDIA_API_KEY", "n")
+    monkeypatch.setattr(C, "MISTRAL_API_KEY", "m")
+    monkeypatch.setattr(C, "CHALLENGERS", ["nvidia:deepseek", "mistral:mistral-large"])
+    monkeypatch.setattr(store, "shadow_models_for", lambda d: set())
+    monkeypatch.setattr(store, "insert_shadow_forecasts", lambda rows: len(rows))
+
+    def get(url, **kw):
+        if "nvidia" in url:
+            return R(200, js={"data": [{"id": "deepseek-ai/deepseek-v4.1-flash"}]})
+        return R(200, js={"data": [{"id": "mistral-large-2512"}]})
+
+    def post(url, data=None, **kw):
+        if "mistral" in url:
+            return R(401, js={"message": "Unauthorized"})
+        return _ok()
+    monkeypatch.setattr(CH.requests, "get", get)
+    monkeypatch.setattr(CH.requests, "post", post)
+    msgs = []
+    words = [{"word": w, "market_ticker": f"T{i}"} for i, w in enumerate(WORDS)]
+    shadow.run("2026-10-01", "EVT", words, "file", save=False, on_attempt=msgs.append)
+    assert any(m.startswith("done: nvidia:deepseek-ai/deepseek-v4.1-flash, 2 words") for m in msgs)
+    assert any(m.startswith("stopped: mistral:mistral-large") and "key refused" in m for m in msgs)
+
+
+def test_missing_key_service_is_simply_skipped(monkeypatch):
+    monkeypatch.setattr(C, "CEREBRAS_API_KEY", "")
+    monkeypatch.setattr(C, "NVIDIA_API_KEY", "n")
+    monkeypatch.setattr(C, "CHALLENGERS", ["cerebras:gpt-oss-120b", "nvidia:deepseek"])
+    assert CH.enabled_specs() == [("nvidia", "deepseek")]

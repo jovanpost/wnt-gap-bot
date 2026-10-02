@@ -136,15 +136,25 @@ def test_fetch_feed_uses_cache(monkeypatch):
 # ---------- speed limit ----------
 
 def test_netlimit_spacing_and_parallel_cap(monkeypatch):
+    """The limiter BOOKS start times at least NET_MIN_GAP_S apart (checked on the booked times, which
+    are exact) and never runs more than NET_MAX_PARALLEL at once. Wall-clock 'when the thread woke up'
+    is not used: the computer can wake a thread a few milliseconds late, which made this test flaky."""
     monkeypatch.setattr(C, "NET_MIN_GAP_S", 0.05)
     monkeypatch.setattr(C, "NET_MAX_PARALLEL", 2)
-    starts, live, peak = [], [0], [0]
+    booked, live, peak = [], [0], [0]
     lock = threading.Lock()
+    real_reserve = netlimit.reserve
+
+    def spy(host, now=None):
+        wait = real_reserve(host, now)
+        with lock:
+            booked.append(time.monotonic() + wait)
+        return wait
+    monkeypatch.setattr(netlimit, "reserve", spy)
 
     def worker():
         with netlimit.ticket("https://news.google.com/rss/search?q=x"):
             with lock:
-                starts.append(time.monotonic())
                 live[0] += 1
                 peak[0] = max(peak[0], live[0])
             time.sleep(0.02)
@@ -156,10 +166,10 @@ def test_netlimit_spacing_and_parallel_cap(monkeypatch):
         t.start()
     for t in ts:
         t.join()
-    starts.sort()
-    gaps = [b - a for a, b in zip(starts, starts[1:])]
-    assert len(starts) == 12
-    assert min(gaps) >= 0.04                                        # never two starts in the same moment
+    booked.sort()
+    gaps = [b - a for a, b in zip(booked, booked[1:])]
+    assert len(booked) == 12
+    assert min(gaps) >= 0.045                                       # never two starts in the same moment
     assert peak[0] <= 2
 
 

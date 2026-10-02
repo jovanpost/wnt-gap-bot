@@ -58,6 +58,15 @@ def todays_event() -> tuple[str, list[dict]]:
     return event["event_ticker"], words
 
 
+def apply_sql(name: str) -> None:
+    """Apply one migration file (all statements are 'if not exists' / safe to repeat)."""
+    path = os.path.join(HERE, "..", "sql", name)
+    with open(path, encoding="utf-8") as fh:
+        for stmt in store._split_statements(fh.read()):
+            with store.engine().begin() as conn:
+                conn.execute(store.text(stmt))
+
+
 def apply_shadow_table() -> None:
     """Create gap_shadow_forecasts (with Row-Level Security) if missing. Only this one migration."""
     path = os.path.join(HERE, "..", "sql", "009_shadow_forecasts.sql")
@@ -78,11 +87,13 @@ def main() -> int:
     print(f"event {event_ticker}: {len(words)} words. Building the file (news + history), then asking every challenger...")
     if db_url:
         apply_shadow_table()
+        apply_sql("010_frozen_packages.sql")
     paste = prompt.build_paste_file(date_str, event_ticker, words)
+    pkg = prompt.freeze(date_str, event_ticker, words, paste, kind="manual") if db_url else None
     print("if a service is busy it retries the SAME request for up to "
           f"{C.GEMINI_RETRY_BUDGET_S / 60:.0f} min; all services run at the same time (Ctrl-C to stop)")
     rep = shadow.run(date_str, event_ticker, words, paste, save=bool(db_url),
-                     on_attempt=lambda msg: print("  ", msg, flush=True))
+                     on_attempt=lambda msg: print("  ", msg, flush=True), package_id=(pkg or {}).get("id"))
     grok = {}
     if db_url:
         grok = {f["word"]: f["probability"] for f in store.grok_forecasts_for_date(date_str)}
