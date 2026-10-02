@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.11.0"  # Grok through the xAI API: plain + search-enabled paper challengers, usage and cost per run
+VERSION = "wnt-gap-v1.11.1"  # the paid Grok search run is off by default (measured $3.17 a run); cheaper defaults if switched on
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -194,18 +194,21 @@ CHALLENGER_TIMEOUT_S = float(_num("CHALLENGER_TIMEOUT_S", 600))   # one answer m
 CHALLENGER_MIN_CONTEXT = int(_num("CHALLENGER_MIN_CONTEXT", 64000))   # skip models that cannot read our whole file
 # v1.11.0: Grok through xAI's API, two paper challengers (gap/xai.py). The live Book L still waits
 # for the manual Grok paste. "plain" = no tools, like the other challengers. "expert" = the replica of
-# the manual Grok Expert step: the file as one user message + xAI web_search and x_search + high reasoning.
+# the manual Grok Expert step: the file as one user message + xAI web_search and x_search.
+# v1.11.1: the search run is OFF unless XAI_EXPERT_ON is set to true. Measured 2026-10-02 on one night:
+# 6 rounds + low effort = 61 searches, 1.33M input tokens, $3.17 (everything a search brings back is
+# billed as input, re-read every round, and at double rate once the request passes 200K tokens).
 XAI_API_KEY = _secret("XAI_API_KEY", "").strip()
 XAI_MODEL = _secret("XAI_MODEL", "grok-4.7").strip()
 XAI_PLAIN_ON = _flag("XAI_PLAIN_ON", True)
-XAI_EXPERT_ON = _flag("XAI_EXPERT_ON", True)
+XAI_EXPERT_ON = _flag("XAI_EXPERT_ON", False)                       # costs real money per run: opt in only
 XAI_EFFORT = _secret("XAI_EFFORT", "high").strip()                  # low / medium / high / xhigh
-XAI_EXPERT_EFFORT = _secret("XAI_EXPERT_EFFORT", "high").strip()
-XAI_EXPERT_MAX_TURNS = int(_num("XAI_EXPERT_MAX_TURNS", 40))        # cap on search rounds (each round may run several searches)
+XAI_EXPERT_EFFORT = _secret("XAI_EXPERT_EFFORT", "low").strip()
+XAI_EXPERT_MAX_TURNS = int(_num("XAI_EXPERT_MAX_TURNS", 6))         # cap on search rounds (each round may run ~10 searches)
 XAI_X_SEARCH_DAYS = int(_num("XAI_X_SEARCH_DAYS", 3))               # X search looks back this many days
 XAI_TIMEOUT_S = float(_num("XAI_TIMEOUT_S", 600))
 XAI_EXPERT_TIMEOUT_S = float(_num("XAI_EXPERT_TIMEOUT_S", 1500))    # a search run is never re-sent after a timeout
-XAI_EXPERT_MAX_PAID_TRIES = int(_num("XAI_EXPERT_MAX_PAID_TRIES", 2))
+XAI_EXPERT_MAX_PAID_TRIES = int(_num("XAI_EXPERT_MAX_PAID_TRIES", 1))
 XAI_NIGHTLY_BUDGET_USD = float(_num("XAI_NIGHTLY_BUDGET_USD", 6.0)) # no new search run once tonight's xAI spend reached this
 BASELINE_ON = _flag("BASELINE_ON", True)
 # v1.10.0: general scorer. A Telegram scorecard once a night after settlement (every forecaster,

@@ -1,7 +1,7 @@
 """Try Grok through the xAI API on a night whose Grok file is already stored. Writes NOTHING.
 
     ~/.venvs/wnt-gap/bin/python scripts/xai_now.py                    plain Grok (no tools) on the latest stored night
-    ~/.venvs/wnt-gap/bin/python scripts/xai_now.py --expert           also the search-enabled run (costs more)
+    ~/.venvs/wnt-gap/bin/python scripts/xai_now.py --expert           also the search-enabled run (about $3 a run; asks first)
     ~/.venvs/wnt-gap/bin/python scripts/xai_now.py --date 2026-10-01  pick the night
 
 It asks (hidden input) for the Supabase DATABASE_URL and the xAI API key, sends that night's stored
@@ -30,6 +30,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--date")
 ap.add_argument("--expert", action="store_true")
 ap.add_argument("--only-expert", action="store_true")
+ap.add_argument("--yes", action="store_true", help="skip the 'this costs money' question for the search run")
 ARGS = ap.parse_args()
 
 need_database_url("Supabase DATABASE_URL (hidden): ")
@@ -52,6 +53,22 @@ def pick_run():
     return (past or runs or [None])[-1]
 
 
+SEARCH_COST_NOTE = ("The search run costs real money: about $3 for one run at 6 rounds + low effort "
+                    "(measured 2026-10-02: 61 searches, 1.33M input tokens). More rounds or higher effort cost more.")
+
+
+def confirm_search(ask=input) -> bool:
+    """A paid search run never starts by accident: the person types yes first (or passes --yes)."""
+    print(SEARCH_COST_NOTE)
+    print(f"settings now: {C.XAI_EXPERT_MAX_TURNS} rounds, effort {C.XAI_EXPERT_EFFORT}, model {C.XAI_MODEL}")
+    if ARGS.yes:
+        return True
+    try:
+        return ask("Type yes to run it, anything else to skip: ").strip().lower() == "yes"
+    except EOFError:
+        return False
+
+
 def main() -> int:
     print(f"{C.VERSION} | Grok API test | writes nothing")
     if not C.XAI_API_KEY:
@@ -72,6 +89,10 @@ def main() -> int:
     if "expert" in modes and past:
         print("NOTE: the search run on a past night can read about the broadcast itself. Its numbers are a "
               "works/cost check, not a fair forecast.")
+
+    if "expert" in modes and not confirm_search():
+        print("search run skipped - nothing was sent, nothing was spent")
+        modes = [m for m in modes if m != "expert"]
 
     got: dict = {}
     for mode in modes:
