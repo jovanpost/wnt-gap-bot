@@ -27,7 +27,7 @@ db_url = need_database_url_optional("Supabase DATABASE_URL (hidden; press Enter 
 print("Keys: paste each one (hidden), or press Enter to skip that service.")
 for _env, _label in (("GEMINI_API_KEY", "Gemini API key"), ("NVIDIA_API_KEY", "NVIDIA API key"),
                      ("CEREBRAS_API_KEY", "Cerebras API key"), ("MISTRAL_API_KEY", "Mistral API key"),
-                     ("OPENROUTER_API_KEY", "OpenRouter API key")):
+                     ("OPENROUTER_API_KEY", "OpenRouter API key"), ("XAI_API_KEY", "xAI (Grok) API key")):
     if not os.environ.get(_env):
         _key = _prompt_hidden(_label)
         if _key:
@@ -82,12 +82,15 @@ def main() -> int:
     from gap import challengers as CH
     print("gemini key:", "set" if C.GEMINI_API_KEY else "NOT set (Gemini will be skipped)")
     print("other challengers:", ", ".join(f"{p}:{m}" for p, m in CH.enabled_specs()) or "none (no keys)")
+    from gap import xai
+    print("grok via xAI API:", ", ".join(xai.label(m) for m in xai.enabled_modes()) or "off (no key)")
     date_str = clock.today_ct()
     event_ticker, words = todays_event()
     print(f"event {event_ticker}: {len(words)} words. Building the file (news + history), then asking every challenger...")
     if db_url:
         apply_shadow_table()
         apply_sql("010_frozen_packages.sql")
+        apply_sql("011_llm_runs.sql")
     paste = prompt.build_paste_file(date_str, event_ticker, words)
     pkg = prompt.freeze(date_str, event_ticker, words, paste, kind="manual") if db_url else None
     print("if a service is busy it retries the SAME request for up to "

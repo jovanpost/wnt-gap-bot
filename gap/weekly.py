@@ -2021,6 +2021,8 @@ def render_txt(data: dict, week_id: str, audit: dict | None = None) -> str:
                                       fetch=False)
         lines.append("")
         lines += shadow.weekly_block(data["start"], data["end"])
+        lines.append("")
+        lines += shadow.cost_lines(data["start"], data["end"], "MODEL COST THIS WEEK")
     except Exception as exc:  # never let this section break the dump
         lines.append(f"(challenger section failed: {type(exc).__name__})")
     _hdr(lines, "5. FILL-SELECTION CHECK (do fills happen mostly when the market moves against us?)")

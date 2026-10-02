@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.10.0"  # prompt lab phase A: frozen nightly packages, prompt-tagged forecasts, general scorer + nightly scorecard
+VERSION = "wnt-gap-v1.11.0"  # Grok through the xAI API: plain + search-enabled paper challengers, usage and cost per run
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -192,6 +192,21 @@ CHALLENGER_MAX_TOKENS = int(_num("CHALLENGER_MAX_TOKENS", 12000))
 CHALLENGER_RETRY_BUDGET_S = float(_num("CHALLENGER_RETRY_BUDGET_S", 1800))   # same 30-minute patience as Gemini
 CHALLENGER_TIMEOUT_S = float(_num("CHALLENGER_TIMEOUT_S", 600))   # one answer may take up to 10 min (big free models are slow)
 CHALLENGER_MIN_CONTEXT = int(_num("CHALLENGER_MIN_CONTEXT", 64000))   # skip models that cannot read our whole file
+# v1.11.0: Grok through xAI's API, two paper challengers (gap/xai.py). The live Book L still waits
+# for the manual Grok paste. "plain" = no tools, like the other challengers. "expert" = the replica of
+# the manual Grok Expert step: the file as one user message + xAI web_search and x_search + high reasoning.
+XAI_API_KEY = _secret("XAI_API_KEY", "").strip()
+XAI_MODEL = _secret("XAI_MODEL", "grok-4.7").strip()
+XAI_PLAIN_ON = _flag("XAI_PLAIN_ON", True)
+XAI_EXPERT_ON = _flag("XAI_EXPERT_ON", True)
+XAI_EFFORT = _secret("XAI_EFFORT", "high").strip()                  # low / medium / high / xhigh
+XAI_EXPERT_EFFORT = _secret("XAI_EXPERT_EFFORT", "high").strip()
+XAI_EXPERT_MAX_TURNS = int(_num("XAI_EXPERT_MAX_TURNS", 40))        # cap on search rounds (each round may run several searches)
+XAI_X_SEARCH_DAYS = int(_num("XAI_X_SEARCH_DAYS", 3))               # X search looks back this many days
+XAI_TIMEOUT_S = float(_num("XAI_TIMEOUT_S", 600))
+XAI_EXPERT_TIMEOUT_S = float(_num("XAI_EXPERT_TIMEOUT_S", 1500))    # a search run is never re-sent after a timeout
+XAI_EXPERT_MAX_PAID_TRIES = int(_num("XAI_EXPERT_MAX_PAID_TRIES", 2))
+XAI_NIGHTLY_BUDGET_USD = float(_num("XAI_NIGHTLY_BUDGET_USD", 6.0)) # no new search run once tonight's xAI spend reached this
 BASELINE_ON = _flag("BASELINE_ON", True)
 # v1.10.0: general scorer. A Telegram scorecard once a night after settlement (every forecaster,
 # every prompt version, vs said / not said), plus /gap_score. Strategy-free.

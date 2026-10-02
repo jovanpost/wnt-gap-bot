@@ -819,6 +819,21 @@ def register_commands() -> None:
         return "\n".join(scoring.report_lines(start, d, title, fetch=True, per_word=(days == 1)))
 
     notify.register("gap_score", _score)
+
+    def _cost(args, _msg):
+        """/gap_cost = tonight's model cost; /gap_cost 7 = the last 7 days."""
+        from datetime import date as _date, timedelta as _td
+        from . import shadow
+        d = clock.today_ct()
+        try:
+            days = int(args[0]) if args else 1
+        except ValueError:
+            days = 1
+        days = max(1, min(days, 120))
+        start = (_date.fromisoformat(d) - _td(days=days - 1)).isoformat()
+        return "\n".join(shadow.cost_lines(start, d, "MODEL COST tonight" if days == 1 else f"MODEL COST last {days} days"))
+
+    notify.register("gap_cost", _cost)
     notify.register("gap_sendnow", _sendnow)
     def _settle(_args, _msg):
         start, end, week_id = clock.week_mon_fri()

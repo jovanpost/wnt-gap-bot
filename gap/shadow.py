@@ -298,10 +298,21 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
         jobs.append(("gemini", None))
     elif not C.GEMINI_API_KEY:
         report["gemini"] = {"ok": False, "error": "GEMINI_API_KEY not set"}
-    from . import challengers as CH
+    from . import challengers as CH, xai
     for prov, wanted in CH.enabled_specs():
         jobs.append((prov, wanted))
+    for mode in xai.enabled_modes():                      # v1.11.0: Grok through the API, plain + search
+        if force or xai.label(mode) not in done:
+            jobs.append(("xai", mode))
     word_list = [w["word"] for w in words]
+
+    def usage_row(model, usage, ok, seconds=None, attempts=None, detail=None):
+        if save and usage:
+            try:
+                store.record_llm_run(event_date, model, usage, ok=ok, seconds=seconds, attempts=attempts,
+                                     prompt_version=C.PROMPT_VERSION, package_id=package_id, detail=detail)
+            except Exception:  # noqa: BLE001  cost bookkeeping must never lose a forecast
+                log.exception("usage row not saved")
 
     def one(job):
         prov, wanted = job
@@ -309,6 +320,14 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
         try:
             if prov == "gemini":
                 g = gemini_forecast(paste, word_list, event_date, on_attempt=on_attempt)
+            elif prov == "xai":
+                tag = xai.label(wanted)
+                if wanted == "expert" and save:
+                    spent = store.llm_spend(event_date, "xai:")
+                    if spent >= C.XAI_NIGHTLY_BUDGET_USD:
+                        raise RuntimeError(f"not started: tonight's xAI spend is already ${spent:.2f} "
+                                           f"(limit ${C.XAI_NIGHTLY_BUDGET_USD:.2f}, XAI_NIGHTLY_BUDGET_USD)")
+                g = xai.forecast(wanted, paste, word_list, event_date, PREFACE, on_attempt=on_attempt)
             else:
                 t_start = time.monotonic()
                 models = CH.resolve_with_retry(prov, wanted, budget_s=C.CHALLENGER_RETRY_BUDGET_S, on_attempt=on_attempt)
@@ -320,20 +339,26 @@ def run(event_date: str, event_ticker: str, words: list[dict], paste: str, histo
                                 fallbacks=models[1:] if prov == "openrouter" else None)
             with _report_lock:
                 keep(g["model"], g["forecasts"], g["seconds"])
-                report[g["model"]].update(attempts=g["attempts"], waited_s=g["waited_s"])
+                report[g["model"]].update(attempts=g["attempts"], waited_s=g["waited_s"], usage=g.get("usage"))
+            usage_row(g["model"], g.get("usage"), True, g["seconds"], g["attempts"])
             if on_attempt:
+                cost = xai.cost_line(g.get("usage"))
                 on_attempt(f"done: {g['model']}, {len(g['forecasts'])} words in {g['seconds']}s "
-                           f"({g['attempts']} tr{'y' if g['attempts'] == 1 else 'ies'}) -- saved")
+                           f"({g['attempts']} tr{'y' if g['attempts'] == 1 else 'ies'})"
+                           + (f" | {cost}" if cost else "") + " -- saved")
         except Exception as exc:  # noqa: BLE001
             log.warning("%s failed: %s", tag, exc)
+            paid = getattr(exc, "usage", None)            # a failed xAI run may still have cost money
+            usage_row(tag, paid, False, detail=str(exc)[:300])
             with _report_lock:
-                report[tag] = {"ok": False, "error": str(exc)[:300]}
+                report[tag] = {"ok": False, "error": str(exc)[:300], "usage": paid}
             if on_attempt:
-                on_attempt(f"stopped: {tag}: {str(exc)[:200]}")
+                on_attempt(f"stopped: {tag}: {str(exc)[:200]}"
+                           + (f" | spent {xai.cost_line(paid)}" if paid and xai.cost_line(paid) else ""))
 
     if jobs:
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(jobs), 12)) as pool:
             list(pool.map(one, jobs))
     return report
 
@@ -348,6 +373,8 @@ def short_name(model: str) -> str:
         return "base"
     if model.startswith("gemini:"):
         return "Gemini"
+    if model.startswith("xai:"):
+        return "grokWeb" if model.endswith("+search") else "grokAPI"
     prov, _, mid = model.partition(":")
     name = mid.split("/")[-1].split(":")[0].lower()
     if name.startswith("gpt-oss"):
@@ -367,9 +394,11 @@ def summary_text(event_date: str, words: list[dict], report: dict, grok: dict[st
             extra = f", {r['seconds']}s" if r.get("seconds") else ""
             if r.get("attempts", 1) > 1:
                 extra += f", {r['attempts']} tries, waited {r['waited_s'] // 60:.0f} min {r['waited_s'] % 60:.0f}s"
-            lines.append(f"- {m}: {r['n']} words{extra}")
+            cost = _cost(r.get("usage"))
+            lines.append(f"- {m}: {r['n']} words{extra}" + (f" | {cost}" if cost else ""))
         else:
-            lines.append(f"- {m}: FAILED ({r.get('error')})")
+            cost = _cost(r.get("usage"))
+            lines.append(f"- {m}: FAILED ({r.get('error')})" + (f" | spent {cost}" if cost else ""))
     lines.append("")
     lines.append(" | ".join(head))
     for w in words:
@@ -378,6 +407,11 @@ def summary_text(event_date: str, words: list[dict], report: dict, grok: dict[st
         cells += [str(report[m]["forecasts"].get(word, "-")) for m in models]
         lines.append(" | ".join(cells))
     return "\n".join(lines)
+
+
+def _cost(usage) -> str:
+    from . import xai
+    return xai.cost_line(usage)
 
 
 def is_running() -> bool:
@@ -477,5 +511,37 @@ def stored_summary(event_date: str, words: list[dict]) -> str | None:
         m = rep.setdefault(r["model"], {"ok": True, "n": 0, "forecasts": {}, "seconds": r.get("seconds")})
         m["n"] += 1
         m["forecasts"][r["word"]] = r["probability"]
+    try:                                               # v1.11.0: what each model cost tonight
+        for run in store.llm_runs(event_date):
+            target = rep.get(run["model"])
+            if target is None:
+                if run.get("ok"):
+                    continue
+                target = rep.setdefault(run["model"], {"ok": False, "error": (run.get("detail") or "failed")[:120]})
+            u = target.setdefault("usage", {})
+            for k in ("input_tokens", "output_tokens", "reasoning_tokens", "tool_calls"):
+                u[k] = (u.get(k) or 0) + int(run.get(k) or 0)
+            if run.get("cost_usd") is not None:
+                u["cost_usd"] = (u.get("cost_usd") or 0.0) + float(run["cost_usd"])
+    except Exception:  # noqa: BLE001
+        log.exception("cost lines skipped")
     grok = {f["word"]: f["probability"] for f in store.grok_forecasts_for_date(event_date)}
     return summary_text(event_date, words, rep, grok)
+
+
+def cost_lines(start: str, end: str, title: str = "MODEL COST") -> list[str]:
+    """What the paid models cost in a date range (free models show $0.00 and their token counts if known)."""
+    rows = store.llm_costs(start, end)
+    if not rows:
+        return [f"{title}: no model usage recorded for {start}" + ("" if start == end else f" .. {end}")]
+    total = sum(float(r["cost_usd"] or 0) for r in rows)
+    lines = [f"{title} ({start}" + ("" if start == end else f" .. {end}") + f"): ${total:.2f} in total",
+             "model | runs (ok) | cost | per ok run | tokens in / out | tool calls | avg seconds"]
+    for r in rows:
+        ok = int(r["ok_runs"] or 0)
+        cost = float(r["cost_usd"] or 0)
+        per = f"${cost / ok:.2f}" if ok else "-"
+        secs = f"{float(r['avg_seconds']):.0f}" if r.get("avg_seconds") is not None else "-"
+        lines.append(f"{r['model']} | {r['runs']} ({ok}) | ${cost:.2f} | {per} | "
+                     f"{int(r['input_tokens']):,} / {int(r['output_tokens']):,} | {int(r['tool_calls'])} | {secs}")
+    return lines

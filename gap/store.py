@@ -35,6 +35,7 @@ MIGRATION_FILES = [
     Path(__file__).resolve().parent.parent / "sql" / "008_book_l.sql",
     Path(__file__).resolve().parent.parent / "sql" / "009_shadow_forecasts.sql",
     Path(__file__).resolve().parent.parent / "sql" / "010_frozen_packages.sql",
+    Path(__file__).resolve().parent.parent / "sql" / "011_llm_runs.sql",
 ]
 
 
@@ -1157,4 +1158,49 @@ def grok_forecasts_between(start: str, end: str) -> list[dict]:
                      where event_date between cast(:a as date) and cast(:b as date) group by event_date) r
                  on r.id = f.run_id
                order by f.event_date, f.id"""), {"a": start, "b": end}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+# ---------- v1.11.0: model usage and cost ----------
+
+def record_llm_run(event_date: str, model: str, usage: dict | None, ok: bool = True, seconds=None,
+                   attempts: int | None = None, prompt_version: str | None = None,
+                   package_id: int | None = None, detail: str | None = None) -> None:
+    u = usage or {}
+    with engine().begin() as conn:
+        conn.execute(text(
+            """insert into gap_llm_runs (event_date, model, prompt_version, package_id, ok, seconds, attempts,
+                   input_tokens, output_tokens, reasoning_tokens, cached_tokens, tool_calls, cost_usd, detail)
+               values (cast(:d as date), :m, :pv, :pk, :ok, :s, :a, :i, :o, :r, :c, :t, :cost, :detail)"""),
+            {"d": event_date, "m": model, "pv": prompt_version, "pk": package_id, "ok": ok, "s": seconds, "a": attempts,
+             "i": u.get("input_tokens"), "o": u.get("output_tokens"), "r": u.get("reasoning_tokens"),
+             "c": u.get("cached_tokens"), "t": u.get("tool_calls"), "cost": u.get("cost_usd"),
+             "detail": (detail or json.dumps({k: v for k, v in u.items() if k in ("x_posts", "citations")}))[:1000]})
+
+
+def llm_spend(event_date: str, model_prefix: str = "") -> float:
+    """Dollars recorded for that night (every run, also failed ones) for models starting with the prefix."""
+    with engine().connect() as conn:
+        v = conn.execute(text(
+            "select coalesce(sum(cost_usd), 0) from gap_llm_runs where event_date = cast(:d as date) and model like :p"),
+            {"d": event_date, "p": model_prefix + "%"}).scalar()
+    return float(v or 0)
+
+
+def llm_costs(start: str, end: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(text(
+            """select model, count(*) as runs, sum(case when ok then 1 else 0 end) as ok_runs,
+                      coalesce(sum(cost_usd), 0) as cost_usd, coalesce(sum(input_tokens), 0) as input_tokens,
+                      coalesce(sum(output_tokens), 0) as output_tokens, coalesce(sum(tool_calls), 0) as tool_calls,
+                      avg(seconds) as avg_seconds
+               from gap_llm_runs where event_date between cast(:a as date) and cast(:b as date)
+               group by model order by cost_usd desc, model"""), {"a": start, "b": end}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def llm_runs(event_date: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(text(
+            "select * from gap_llm_runs where event_date = cast(:d as date) order by id"), {"d": event_date}).mappings().all()
     return [dict(r) for r in rows]
