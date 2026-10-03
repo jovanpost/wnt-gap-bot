@@ -850,7 +850,8 @@ def register_commands() -> None:
         """/gap_lab = board and status; /gap_lab_night [date]; /gap_lab_prompt <id>; /gap_lab_champion <id>;
         /gap_lab_writer = which writer model works; /gap_lab_start [date] = run the lab on a past settled night;
         /gap_lab_models = every model on the champion prompt; /gap_lab_forecast [date] = one night word by word;
-        /gap_lab_retry = give failed runs another go. The old two-word forms (/gap_lab writer) still work. Paper only."""
+        /gap_lab_retry = give failed runs another go; /gap_lab_redo [date] = start a finished night again (every
+        model, new variants; done runs are kept). The old two-word forms (/gap_lab writer) still work. Paper only."""
         from . import promptlab
         if not promptlab.enabled():
             return "prompt lab is off (LAB_ON is false, or no Postgres database)"
@@ -884,6 +885,10 @@ def register_commands() -> None:
             return "checking the writer models now; the answer arrives here in a minute or two"
         if cmd == "start":
             out = promptlab.start_night(args[1] if len(args) > 1 else None)
+            promptlab.tick(lambda t: notify.send(t, quiet=True))
+            return out
+        if cmd == "redo":                  # v1.15.1: a finished night again, e.g. after a release that adds models
+            out = promptlab.redo_night(args[1] if len(args) > 1 else None)
             promptlab.tick(lambda t: notify.send(t, quiet=True))
             return out
         if cmd == "models":
@@ -921,7 +926,7 @@ def register_commands() -> None:
         return f"asking {prov} for its model list; it arrives here in a few seconds"
 
     notify.register("gap_models", _models)
-    for _sub in ("writer", "start", "night", "prompt", "champion", "retry", "models", "forecast"):   # v1.12.1: one-word forms, tap-friendly
+    for _sub in ("writer", "start", "night", "prompt", "champion", "retry", "models", "forecast", "redo"):   # v1.12.1: one-word forms, tap-friendly
         notify.register(f"gap_lab_{_sub}", lambda args, msg, _s=_sub: _lab([_s] + list(args), msg))
     notify.register("gap_sendnow", _sendnow)
     def _settle(_args, _msg):

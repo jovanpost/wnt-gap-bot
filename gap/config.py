@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.15.0"  # PREVIOUS BROADCASTS block (ABC segment list from YouTube); ABC homepage + video page; lab on every model; fallbacks
+VERSION = "wnt-gap-v1.15.1"  # /gap_lab_redo (a finished lab night again, on every model); status says who is waiting
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -248,6 +248,7 @@ LAB_REQUIRE_NEWS = _flag("LAB_REQUIRE_NEWS", True)                  # only night
 LAB_MIN_HELDOUT_WORDS = int(_num("LAB_MIN_HELDOUT_WORDS", 40))      # words on OTHER nights before a prompt can win
 LAB_MARGIN = float(_num("LAB_MARGIN", 0.005))                       # must beat the champion's Brier by this much
 LAB_MAX_TESTING = int(_num("LAB_MAX_TESTING", 2))                    # winners under test at one time; later ones are dropped
+LAB_REDO_MAX_PER_NIGHT = int(_num("LAB_REDO_MAX_PER_NIGHT", 3))        # v1.15.1: /gap_lab_redo restarts of one night
 LAB_TOP_N = int(_num("LAB_TOP_N", 5))                               # prompts kept on the board besides the champion
 LAB_AFTER_CT = _secret("LAB_AFTER_CT", "18:35")
 LAB_LATEST_CT = _secret("LAB_LATEST_CT", "22:00")                   # go on with whatever is settled by then

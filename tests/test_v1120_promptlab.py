@@ -11,7 +11,7 @@ import os
 import pathlib
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -231,6 +231,11 @@ def run_all(sent: list) -> None:
             break
 
 
+def before_the_show(monkeypatch) -> None:
+    """The lab stamps runs with the real clock. These tests must not depend on the day they are run."""
+    monkeypatch.setattr(PL, "_utc", lambda: clock.now_ct().astimezone(timezone.utc))
+
+
 def status_of(name: str) -> str | None:
     rows = PL._q("select status from gap_lab_prompts where name = :n", n=name)
     return rows[0]["status"] if rows else None
@@ -321,6 +326,7 @@ def test_new_tables_have_row_level_security(lab):
 
 
 def test_champion_forecasts_live_before_the_show(lab, monkeypatch):
+    before_the_show(monkeypatch)
     assert PL.live_start(N3) == 2                                     # xai + gemini
     PL.process_queue()
     champ = PL.champion()
@@ -762,6 +768,7 @@ def test_v1130_every_model_with_a_key_is_a_lab_model(lab, monkeypatch):
 
 
 def test_v1130_champion_runs_on_every_model_when_the_file_goes_out(lab, monkeypatch):
+    before_the_show(monkeypatch)
     monkeypatch.setattr(C, "LAB_MODELS", ALL)
     assert PL.live_start(N3) == 5
     assert PL.process_queue() == {"done": 5}                            # one lane per model, one run each
@@ -1043,3 +1050,74 @@ def test_v1142_file_now_script_is_read_only():
     for bad in ("insert_", "freeze(", "update_run", "record_llm_run", "set_state", "notify.send", "print(db_url", "DATABASE_URL)"):
         assert bad not in src                                           # it builds, saves a text file, asks Grok; nothing else
     assert "need_database_url_optional" in src and "_prompt_hidden" in src and src.index("_secrets") < src.index("from gap import")
+
+
+# ---------------------------------------------------------------- v1.15.1: start a finished night again
+
+def test_v1151_redo_restarts_a_finished_night_on_every_model(lab, monkeypatch):
+    """Oct 2: the night ran on the old release (Grok + Gemini only). After the push nothing could start it again."""
+    monkeypatch.setattr(C, "LAB_REDO_MAX_PER_NIGHT", 2)
+    lab.variants = edits(LEAKY)                                          # first round: the only variant is thrown away
+    PL.live_start(N3)
+    set_clock(monkeypatch, "18:40")
+    settle_tonight()
+    run_all([])
+    assert PL._night(N3)["stage"] == "decided" and PL._night(N3)["decision"] == "no_valid_variant"
+    champ = PL.champion()["prompt_id"]
+    xai_posts = len([1 for url, _b in lab.posts if "api.x.ai" in url])
+    assert {r["model_key"] for r in PL._q("select model_key from gap_lab_runs where event_date = :d", d=N3)} == {"xai", "gemini"}
+
+    monkeypatch.setattr(C, "LAB_MODELS", ALL)                            # the new release: every model with a key
+    assert "already done" in PL.start_night(N3)                          # the old command cannot do it
+    assert "no lab record" in PL.redo_night("2026-01-05")
+    lab.variants = edits(GOOD)
+    out = PL.redo_night()                                                # default = the newest lab night
+    assert "lab restarted on " + N3 in out and "restart 1 of 2" in out
+    assert "still running" in PL.redo_night(N3)                          # a second tap while it runs does nothing
+    sent: list = []
+    run_all(sent)
+    row = PL._night(N3)
+    assert row["stage"] == "decided" and row["decision"] == "winner_to_test"
+    done = {r["model_key"] for r in PL._q("""select model_key from gap_lab_runs where prompt_id = :p and event_date = :d
+                                             and status = 'done'""", p=champ, d=N3)}
+    assert done == set(KEYS)                                             # the champion ran on every model tonight
+    good = PL._q("select prompt_id from gap_lab_prompts where name = 'running-story-length'")[0]["prompt_id"]
+    got = {r["model_key"] for r in PL._q("select model_key from gap_lab_runs where prompt_id = :p and event_date = :d and status = 'done'", p=good, d=N3)}
+    assert got == set(KEYS)                                              # so did the new variant
+    ch = PL._q("select attempts from gap_lab_runs where prompt_id = :p and model_key = 'xai' and event_date = :d", p=champ, d=N3)[0]
+    assert ch["attempts"] <= 1                                           # the paid champion run was kept, not bought again
+    det = PL._detail(row)
+    assert det["redo"] == 1 and det["earlier"][0]["decision"] == "no_valid_variant"
+    assert any("running-story-length" in t for t in sent)
+    assert len([1 for url, _b in lab.posts if "api.x.ai" in url]) > xai_posts
+
+    assert "restart 2 of 2" in PL.redo_night(N3)
+    run_all([])
+    assert "That is the limit" in PL.redo_night(N3)                      # a cap per night
+
+
+def test_v1151_no_other_night_is_said_plainly_and_status_names_who_waits(lab, monkeypatch):
+    with store.engine().begin() as conn:                                 # tonight is the only night with a stored file
+        conn.execute(store.text("delete from gap_news_packages where event_date <> cast(:d as date)"), {"d": N3})
+    lab.variants = edits(GOOD)
+    PL.live_start(N3)
+    set_clock(monkeypatch, "18:40")
+    settle_tonight()
+    sent: list = []
+    run_all(sent)
+    msg = "\n".join(sent)
+    assert "no other night to test it on yet" in msg and "now tested on the other nights" not in msg
+    assert PL._q("select count(*) as n from gap_lab_runs where purpose = 'test'")[0]["n"] == 0
+    good = PL._q("select prompt_id from gap_lab_prompts where name = 'running-story-length'")[0]["prompt_id"]
+    PL.enqueue(good, "gemini", N1, "fill")
+    assert "(waiting: gemini 1)" in PL.status_text() and "/gap_lab_redo" in PL.status_text()
+
+
+def test_v1151_redo_command_is_registered(lab, monkeypatch):
+    handlers = {}
+    monkeypatch.setattr(notify, "register", lambda name, fn: handlers.__setitem__(name, fn))
+    monkeypatch.setattr(notify, "on_json", lambda fn: None)
+    monkeypatch.setattr(PL, "tick", lambda send=None: "started")
+    pipeline.register_commands()
+    assert "no lab night yet" in handlers["gap_lab_redo"]([], {})
+    assert "no lab record for 2026-01-05" in handlers["gap_lab"](["redo", "2026-01-05"], {})

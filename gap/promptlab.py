@@ -1228,12 +1228,12 @@ def night_step(d: str, send=None) -> int:
             st = "testing" if winner is v else "screened_out"
             _x("update gap_lab_prompts set status = :s where prompt_id = :p and status = 'candidate'", s=st, p=v["prompt_id"])
         if winner:
-            for n in lab_nights(d):
-                if n == d:
-                    continue
+            others = [n for n in lab_nights(d) if n != d]
+            for n in others:
                 enqueue(winner["prompt_id"], key, n, "test")   # the judge model only
                 enqueue(cid, key, n, "fill")
             det["winner"] = winner["prompt_id"]
+            det["test_nights"] = len(others)                # v1.15.1: 0 = nothing to test on yet
         decision = "winner_to_test" if winner else ("no_valid_variant" if not cands else (
             "test_queue_full" if det.get("queue_full") else "no_variant_beat_champion"))
         _set_night(d, stage="decided", decision=decision, detail=det)
@@ -1373,6 +1373,45 @@ def start_night(d: str | None = None) -> str:
     return f"lab started on {d}: champion run, writer, screen, test. The result arrives here when it is done."
 
 
+def redo_night(d: str | None = None) -> str:
+    """Start a FINISHED lab night again (for /gap_lab_redo [date]; default = the newest lab night).
+    Every model with a key forecasts the champion and the board prompts on that night's frozen file,
+    then the writer writes a fresh set of variants and they are screened. Runs that are already done
+    are kept, so nothing is paid twice. Paper only; the daily budget still applies."""
+    champ = bootstrap()
+    if not champ or not primary_key():
+        return "the lab cannot start: no champion or no model key"
+    if not d:
+        rows = _q("select event_date from gap_lab_nights order by event_date desc limit 1")
+        if not rows:
+            return "no lab night yet. /gap_lab_start runs the lab on a past settled night."
+        d = _d(rows[0]["event_date"])
+    row = _night(d)
+    if not row:
+        return f"no lab record for {d}. /gap_lab_start {d} runs the lab on a past settled night."
+    if row.get("stage") not in ("decided", "skipped"):
+        return f"{d} is still running (stage {row.get('stage')}). Its result arrives when it is done."
+    if d not in lab_nights(d):
+        return f"{d} cannot be replayed (no stored news file, not fully settled, or void)."
+    old = _detail(row)
+    n = int(old.get("redo") or 0) + 1
+    if n > C.LAB_REDO_MAX_PER_NIGHT:
+        return f"{d} was already restarted {C.LAB_REDO_MAX_PER_NIGHT} times. That is the limit for one night."
+    earlier = list(old.get("earlier") or []) + [
+        {"decision": row.get("decision"), "writer": row.get("writer_model"),
+         "variants": [{"name": v.get("name"), "prompt_id": v.get("prompt_id"), "screen": v.get("screen")}
+                      for v in old.get("variants") or []]}]
+    cid = champ["prompt_id"]
+    _x("""update gap_lab_runs set status = 'pending', attempts = 0, not_before = null, error = null
+          where event_date = cast(:d as date) and status = 'failed' and prompt_id in
+            (select prompt_id from gap_lab_prompts where status in ('champion', 'testing', 'listed'))""", d=d)
+    _x("update gap_lab_nights set champion_id = :c where event_date = cast(:d as date)", c=cid, d=d)
+    _set_night(d, stage="new", decision=None, writer_model=None, detail={"redo": n, "earlier": earlier[-5:]})
+    return (f"lab restarted on {d} (restart {n} of {C.LAB_REDO_MAX_PER_NIGHT}): every model forecasts the champion and the "
+            f"board prompts on that night's file, then the writer writes {C.LAB_VARIANTS_PER_NIGHT} new variants. "
+            f"Runs already done are kept. Grok's result arrives here first; the free models follow one run at a time.")
+
+
 def retry_failed() -> int:
     """Give failed runs of prompts still in play another go (from /gap_lab retry)."""
     return _x("""update gap_lab_runs set status = 'pending', attempts = 0, not_before = null, error = null
@@ -1484,7 +1523,10 @@ def night_message(d: str) -> str:
             else:
                 res = f"Brier tonight {v['screen']:.3f}"
                 if det.get("winner") == v.get("prompt_id"):
-                    res += "  <- best, now tested on the other nights"
+                    if det.get("test_nights") == 0:
+                        res += "  <- best tonight; no other night to test it on yet, it waits on the board"
+                    else:
+                        res += "  <- best, now tested on the other nights"
             lines.append(f"{v.get('name') or '-'} ({v.get('prompt_id') or '-'}) | {edit} | {res}")
         for v in det["variants"]:
             if v.get("ok") and v.get("why"):
@@ -1678,18 +1720,21 @@ def status_text() -> str:
     counts = {r["status"]: r["n"] for r in q}
     today = clock.today_ct()
     row = _night(today)
+    wait = _q("select model_key, count(*) as n from gap_lab_runs where status = 'pending' group by model_key order by model_key")
+    waiting = ", ".join(f"{short(r['model_key'])} {r['n']}" for r in wait)
     lines = [f"champion: {champ['prompt_id'] if champ else '-'} ({(champ or {}).get('name') or '-'}) since "
              f"{_d(champ['champion_from']) if champ and champ.get('champion_from') else '-'}",
              "models: " + (", ".join(short(k) + (" (judge)" if i == 0 else "") for i, k in enumerate(model_keys()))
                            or "none with a key") + f"  |  writer: {C.LAB_WRITER_MODEL}",
              f"tonight ({today}): {row.get('stage') or 'not started'}" + (f" / {row.get('decision')}" if row.get("decision") else ""),
              f"queue: {counts.get('pending', 0)} waiting, {counts.get('running', 0)} running, {counts.get('done', 0)} done, "
-             f"{counts.get('failed', 0)} failed",
+             f"{counts.get('failed', 0)} failed" + (f"  (waiting: {waiting})" if waiting else ""),
              f"lab spend today: ${spent_today():.2f} of ${C.LAB_DAILY_BUDGET_USD:.2f}", ""]
     lines += leaderboard_lines()
     start = (date.fromisoformat(today) - timedelta(days=27)).isoformat()
     lines += [""] + live_lines(start, today)
-    lines += ["", "/gap_lab_models = every model on the champion prompt   /gap_lab_forecast = tonight word by word"]
+    lines += ["", "/gap_lab_models = every model on the champion prompt   /gap_lab_forecast = tonight word by word",
+              "/gap_lab_redo = start the newest lab night again (every model, new variants)"]
     return "\n".join(lines)
 
 
