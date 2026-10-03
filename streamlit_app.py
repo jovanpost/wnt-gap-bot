@@ -1038,7 +1038,7 @@ with tab_scalp:
                 ("Completed round trips", f"{cum['done']} / {lab.SCALP_MIN_FILLED}", None),
                 ("Hit rate (sold at target)", "n/a" if cum["hit_rate"] is None else f"{cum['hit_rate']:.0f}%",
                  None if cum["break_even_px"] is None else f"break-even {cum['break_even_px']:.1f}c"),
-                ("Margin (points)", "n/a" if cum["margin"] is None else f"{cum['margin']:+.1f}", None),
+                ("Margin (¢ a contract, all trips)", "n/a" if cum["margin"] is None else f"{cum['margin']:+.1f}", None),
                 ("Net after fees", f"${cum['net']:+.2f}", None),
                 ("Per-word fill %", "n/a" if cum["words_fully_filled_pct"] is None else f"{cum['words_fully_filled_pct']:.0f}%",
                  "backtest ref. 62-70%"),
@@ -1048,21 +1048,21 @@ with tab_scalp:
             show_df(md, pd.DataFrame([{
                 "week": r["week"], "words": r["words"], "batches": r["batches"], "done": r["done"], "resting": r["resting"],
                 "scalp_hit": r["scalp_hit"], "fallback": r["fallback_sold"], "hit %": r["hit_rate"],
-                "avg buy ¢": r["avg_buy_px"], "avg sell ¢": r["avg_sell_px"], "break-even ¢": r["break_even_px"],
+                "avg buy ¢": r["avg_buy_px"], "avg exit ¢": r["avg_sell_px"], "break-even ¢": r["break_even_px"],
                 "margin": r["margin"], "net $": r["net"], "ROI %": r["roi"]} for r in wk_rows]),
                 column_config={"hit %": st.column_config.NumberColumn(format="%.0f"), "avg buy ¢": st.column_config.NumberColumn(format="%.1f"),
-                              "avg sell ¢": st.column_config.NumberColumn(format="%.1f"), "break-even ¢": st.column_config.NumberColumn(format="%.1f"),
+                              "avg exit ¢": st.column_config.NumberColumn(format="%.1f"), "break-even ¢": st.column_config.NumberColumn(format="%.1f"),
                               "margin": st.column_config.NumberColumn(format="%+.1f"), "net $": st.column_config.NumberColumn(format="$%+.2f"),
-                              "ROI %": st.column_config.NumberColumn(format="%+.0f")})
+                              "ROI %": st.column_config.NumberColumn(format="%+.1f")})
 
             show_h(md, "Budget-cap sweep (report only — real executed batches, whole batches only)")
             show_cap(md, "What a smaller or larger per-word cap would have kept from the actual batch history. "
                         "Unlike K_HIGH's sweep, this uses real executed prices, not a single decision-time snapshot.")
             show_df(md, pd.DataFrame([{"cap $": r["size"], "words": r["words"], "batches": r["batches"], "hit %": r["hit_rate"],
-                                       "avg buy ¢": r["avg_buy_px"], "avg sell ¢": r["avg_sell_px"], "margin": r["margin"],
+                                       "avg buy ¢": r["avg_buy_px"], "avg exit ¢": r["avg_sell_px"], "margin": r["margin"],
                                        "net $": r["net"], "ROI %": r["roi"]} for r in PANEL["scalp_sweep"]]),
                      column_config={"hit %": st.column_config.NumberColumn(format="%.0f"), "avg buy ¢": st.column_config.NumberColumn(format="%.1f"),
-                                   "avg sell ¢": st.column_config.NumberColumn(format="%.1f"), "margin": st.column_config.NumberColumn(format="%+.1f"),
+                                   "avg exit ¢": st.column_config.NumberColumn(format="%.1f"), "margin": st.column_config.NumberColumn(format="%+.1f"),
                                    "net $": st.column_config.NumberColumn(format="$%+.2f"), "ROI %": st.column_config.NumberColumn(format="%+.0f")})
 
             show_h(md, "Per-word fill % (the liquidity signal)")

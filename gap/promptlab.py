@@ -243,6 +243,14 @@ def _bare(tok: str) -> str:
 
 
 _SEG = re.compile("[.!?:;|()\\[\\]\"\u201c\u201d\u2014\u2013\u2022]| - ")
+# v1.16.1: the outlet at the end of a headline line ("... \u2014 WKRC Local 12 (Oct 02 ...)") is not a story name.
+_OUTLET = re.compile("\\s[\u2014\u2013]\\s[^\u2014\u2013]{1,60}$")
+# Ordinary words that outlets and section labels write with a capital. Never a story's name.
+_ORDINARY = frozenset("""local national federal state states city county regional north south east west northern southern
+eastern western central morning evening night today tonight daily weekly news live update updates breaking video videos
+watch report reports world health business finance money sports weather politics science technology tech travel
+entertainment opinion analysis exclusive police court judge jury mayor governor senator president official officials
+times post tribune journal herald gazette press public media network channel radio magazine review independent""".split())
 
 
 def night_names(parent: str, night_text: str) -> set[str]:
@@ -257,6 +265,7 @@ def night_names(parent: str, night_text: str) -> set[str]:
     lower = {_bare(m.group(0)).lower() for m in _TOKEN.finditer(night_text or "") if m.group(0)[0].islower()}
     names: set[str] = set()
     for line in (night_text or "").split("\n"):
+        line = _OUTLET.sub("", line)                        # drop the outlet name at the end of a headline
         toks = [m.group(0) for m in _TOKEN.finditer(line)]
         longs = [t for t in toks[1:] if len(t) >= 4]
         if longs and sum(1 for t in longs if t[0].isupper()) / len(longs) >= 0.6:
@@ -264,7 +273,7 @@ def night_names(parent: str, night_text: str) -> set[str]:
         for seg in _SEG.split(line):
             seg_toks = [_bare(m.group(0)) for m in _TOKEN.finditer(seg)]
             names |= {t.lower() for t in seg_toks[1:] if t[0].isupper()}
-    return {t for t in names - lower - vocab if len(t) >= 4}
+    return {t for t in names - lower - vocab - _ORDINARY if len(t) >= 4}
 
 
 def night_terms(words: list[dict]) -> list[str]:

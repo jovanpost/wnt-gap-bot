@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.16.0"  # runs in one place only: worker lease, RUN_WORKERS, worker.py for the server
+VERSION = "wnt-gap-v1.16.1"  # SCALP status counts every round trip; replay_2x2 script; lab name check ignores outlet names
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt

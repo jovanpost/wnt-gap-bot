@@ -1267,17 +1267,18 @@ def _scalp_block(data) -> list[str]:
     for r in lab.scalp_by_week(batches):
         lines.append(f"{r['week']}: words {r['words']} | batches {r['batches']} (done {r['done']}, resting {r['resting']}) | "
                      f"scalp_hit {r['scalp_hit']} / fallback {r['fallback_sold']} | hit% {_fx(r['hit_rate'], 0)} | "
-                     f"avg buy {_fx(r['avg_buy_px'], 1)}c avg sell {_fx(r['avg_sell_px'], 1)}c break-even {_fx(r['break_even_px'], 1)}c "
-                     f"margin {_fx(r['margin'], 1)} | net ${r['net']:+.2f} ROI {_fx(r['roi'], 0)}%")
+                     f"avg buy {_fx(r['avg_buy_px'], 1)}c avg exit {_fx(r['avg_sell_px'], 1)}c (hits {_fx(r.get('avg_hit_px'), 1)}c) "
+                     f"break-even {_fx(r['break_even_px'], 1)}c margin {_fx(r['margin'], 1)}c/contract | net ${r['net']:+.2f} ROI {_fx(r['roi'], 1)}%")
     cum = lab.scalp_stats(batches)
     lines.append("")
     lines.append("STATUS: " + lab.scalp_status(cum))
+    lines.append("(v1.16.1: avg exit, break-even and margin count EVERY completed round trip, fallback sells and both fees included.)")
     lines.append("")
     lines.append(f"per-word fill%: {_fx(cum['words_fully_filled_pct'], 0)}% of words reached the full ${C.SCALP_BUDGET_DOLLARS:.0f} target "
                  f"(backtest reference: 62-70%). Track this every week, not just net $ -- a low fill% means the edge is real but the book is thin.")
     lines.append("")
     lines.append("BUDGET-CAP SWEEP (report only, real executed batches, whole batches only -- what a smaller/larger per-word cap would have kept):")
-    lines.append(f"{'cap$':>6}{'words':>7}{'batches':>8}{'hit%':>6}{'avg buy':>8}{'avg sell':>9}{'margin':>8}{'net$':>9}{'ROI%':>6}")
+    lines.append(f"{'cap$':>6}{'words':>7}{'batches':>8}{'hit%':>6}{'avg buy':>8}{'avg exit':>9}{'margin':>8}{'net$':>9}{'ROI%':>6}")
     for r in lab.scalp_budget_sweep(batches):
         lines.append(f"{r['size']:>6}{r['words']:>7}{r['batches']:>8}{_fx(r['hit_rate'], 0):>6}{_fx(r['avg_buy_px'], 1):>8}"
                      f"{_fx(r['avg_sell_px'], 1):>9}{_fx(r['margin'], 1):>8}{r['net']:>+9.2f}{_fx(r['roi'], 0):>6}")

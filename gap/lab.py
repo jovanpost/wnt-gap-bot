@@ -765,14 +765,29 @@ SCALP_PASS_MARGIN = 5.0
 
 
 def scalp_stats(batches: list[dict]) -> dict:
+    """v1.16.1: every number is over ALL completed round trips (scalp_hit AND fallback_sold) and every fee.
+    Before, the margin compared the average price of the WINNING sells with a break-even that left the
+    sell fee out, so a book that broke even overall could read "PASSING". Prices are contract-weighted."""
     done = [b for b in batches if b["status"] in ("scalp_hit", "fallback_sold")]
     hits = [b for b in done if b["status"] == "scalp_hit"]
-    spent = sum(int(b["buy_cost_cents"] or 0) + int(b["buy_fee_cents"] or 0) for b in done)
+    contracts = sum(float(b["buy_contracts"] or 0) for b in done)
+    buy_cost = sum(int(b["buy_cost_cents"] or 0) for b in done)
+    buy_fee = sum(int(b["buy_fee_cents"] or 0) for b in done)
+    sell_fee = sum(int(b.get("sell_fee_cents") or 0) for b in done)
+    proceeds = sum(int(b.get("sell_proceeds_cents") or 0) for b in done)
+    spent = buy_cost + buy_fee
     net = sum(int(b["net_cents"] or 0) for b in done)
-    px_buy = (sum(b["buy_price_cents"] for b in done) / len(done)) if done else None
-    px_sell = (sum(b["sell_price_cents"] for b in hits) / len(hits)) if hits else None
-    be = (px_buy + (sum(int(b["buy_fee_cents"] or 0) for b in done) / sum(float(b["buy_contracts"]) for b in done) if done else 0)) if px_buy else None
+    px_buy = (buy_cost / contracts) if contracts else None
+    px_exit = (proceeds / contracts) if contracts else None            # hits and fallback sells together
+    hit_contracts = sum(float(b.get("sell_contracts") or b["buy_contracts"] or 0) for b in hits)
+    px_hit = (sum(int(b.get("sell_proceeds_cents") or 0) for b in hits) / hit_contracts) if hit_contracts else None
+    be = ((buy_cost + buy_fee + sell_fee) / contracts) if contracts else None   # exit price that makes $0
+    margin = (net / contracts) if contracts else None                  # cents kept per contract, after every fee
     hit_rate = (100.0 * len(hits) / len(done)) if done else None
+    by_word: dict = {}
+    for b in done:
+        by_word.setdefault(b["market_ticker"], [0, b.get("word") or b["market_ticker"]])[0] += int(b["net_cents"] or 0)
+    best = max(by_word.values(), key=lambda v: v[0]) if by_word else None
     words = {(b["market_ticker"]) for b in batches}
     words_full = {b["market_ticker"] for b in batches
                   if sum(float(x["buy_cost_cents"]) for x in batches if x["market_ticker"] == b["market_ticker"]) / 100.0 >= C.SCALP_BUDGET_DOLLARS - 0.5}
@@ -780,24 +795,32 @@ def scalp_stats(batches: list[dict]) -> dict:
         "words": len(words), "words_fully_filled_pct": (100.0 * len(words_full) / len(words)) if words else None,
         "batches": len(batches), "done": len(done), "resting": sum(1 for b in batches if b["status"] == "resting_sell"),
         "scalp_hit": len(hits), "fallback_sold": len(done) - len(hits), "hit_rate": hit_rate,
-        "avg_buy_px": px_buy, "avg_sell_px": px_sell, "break_even_px": be,
-        "margin": (px_sell - be) if (px_sell is not None and be is not None) else None,
+        "avg_buy_px": px_buy, "avg_sell_px": px_exit, "avg_hit_px": px_hit, "break_even_px": be,
+        "margin": margin,
         "spent": spent / 100.0, "net": net / 100.0, "roi": (100.0 * net / spent) if spent else None,
+        "best_word": best[1] if best else None, "best_word_net": (best[0] / 100.0) if best else None,
+        "net_ex_best": ((net - best[0]) / 100.0) if best else None, "done_words": len(by_word),
     }
 
 
 def scalp_status(cum: dict) -> str:
+    """PASSING needs: 30 round trips, at least +5 cents kept per contract over ALL of them after every fee,
+    and still above zero without the single best word (one lucky word is not an edge)."""
     if cum["done"] < SCALP_MIN_FILLED:
-        tag = f"TOO EARLY (fewer than {SCALP_MIN_FILLED} completed round trips: {cum['done']})"
-    elif cum["margin"] is None:
-        tag = "UNCLEAR"
-    elif cum["margin"] >= SCALP_PASS_MARGIN:
-        tag = f"PASSING (avg sell {cum['avg_sell_px']:.1f}c vs break-even {cum['break_even_px']:.1f}c, margin {cum['margin']:+.1f})"
-    elif cum["margin"] < 0:
-        tag = f"FAILING (margin {cum['margin']:+.1f})"
-    else:
-        tag = f"UNCLEAR (margin {cum['margin']:+.1f}, under +{SCALP_PASS_MARGIN:.0f})"
-    return tag
+        return f"TOO EARLY (fewer than {SCALP_MIN_FILLED} completed round trips: {cum['done']})"
+    if cum["margin"] is None:
+        return "UNCLEAR"
+    detail = (f"all {cum['done']} round trips: avg exit {cum['avg_sell_px']:.1f}c vs break-even {cum['break_even_px']:.1f}c, "
+              f"margin {cum['margin']:+.1f}c a contract, net ${cum['net']:+.2f}")
+    if cum["margin"] < 0:
+        return f"FAILING ({detail})"
+    carried = (cum.get("net_ex_best") is not None and cum.get("done_words", 0) > 1 and cum["net_ex_best"] <= 0)
+    if carried:
+        return (f"UNCLEAR ({detail}; one word carries it: without {cum['best_word']} "
+                f"(${cum['best_word_net']:+.2f}) the net is ${cum['net_ex_best']:+.2f})")
+    if cum["margin"] >= SCALP_PASS_MARGIN:
+        return f"PASSING ({detail})"
+    return f"UNCLEAR ({detail}; needs +{SCALP_PASS_MARGIN:.0f}c)"
 
 
 def _iso_week(d: str) -> str:
