@@ -8,7 +8,7 @@ from typing import Callable
 
 import requests
 
-from . import config as C
+from . import config as C, lease
 
 log = logging.getLogger("gap.notify")
 
@@ -148,7 +148,7 @@ def _dispatch_command(raw: str, msg: dict) -> str | None:
         except Exception as exc:
             log.exception("handler /%s", cmd)
             return f"error: {exc}"
-    return None
+    return f"unknown command /{cmd}, send /help"
 
 
 def _flush_pending() -> None:
@@ -224,6 +224,9 @@ def _listen() -> None:
     # that deleted inbound Grok JSON on every Streamlit reboot.
 
     while True:
+        if not lease.running():      # another place holds the worker lease: it answers the commands
+            time.sleep(5)
+            continue
         try:
             long_poll = 1 if _pending else 50
             resp = requests.get(

@@ -46,7 +46,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-from . import clock, config as C, notify, store, strategy
+from . import clock, config as C, lease, notify, store, strategy
 from .fees import fee_cents, hold_pnl_cents
 from .fills import _show_cancel_utc  # same 5:29 CT deadline every paper book now uses
 from .kalshi import KalshiClient, KalshiError, market_result, resolve_real_open
@@ -209,6 +209,11 @@ def _fire_l_orders(client: KalshiClient, run: dict, date_str: str, take: list[di
     """Actually place tonight's L orders. Concurrent (small thread pool, same idea
     as nofade's _fast_send ThreadPoolExecutor) so a multi-word night doesn't lose
     time sending them one at a time right at the open."""
+    if not lease.may_trade():
+        # Checked BEFORE any row is claimed or the armed flag is written, so the place that does
+        # hold the worker lease still finds the night untouched and sends the orders itself.
+        log.warning("L orders NOT sent for %s: %s", date_str, lease.describe())
+        return {"ok": False, "reason": "no_lease"}
     placed_at = _now()
     deadline = _show_cancel_utc(date_str) or (placed_at + timedelta(minutes=60))
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from . import config as C, fills, pricing, store
+from . import config as C, fills, lease, pricing, store
 from .kalshi import KalshiClient, market_result
 
 log = logging.getLogger("gap.board")
@@ -164,16 +164,20 @@ def summarize(rows: list[dict]) -> list[dict]:
 def tonight(date_str: str) -> dict[str, Any]:
     orders = store.orders_for_date(date_str)
     run = store.get_run_for_date(date_str)
-    try:
-        fills.apply_to_orders(orders, event_ticker=(run or {}).get("event_ticker"))
-    except Exception:
-        log.exception("apply fills")
-    try:
-        from . import settle
-        settle.apply_official(date_str)
-        orders = store.orders_for_date(date_str)
-    except Exception:
-        log.exception("apply official")
+    if lease.running():
+        # Writes (paper fills, paper settlement) happen only where the workers run. A dashboard-only
+        # page reads what the worker wrote: runtime.paper_settle_tick() does the same settlement
+        # from the poll loop every few minutes.
+        try:
+            fills.apply_to_orders(orders, event_ticker=(run or {}).get("event_ticker"))
+        except Exception:
+            log.exception("apply fills")
+        try:
+            from . import settle
+            settle.apply_official(date_str)
+            orders = store.orders_for_date(date_str)
+        except Exception:
+            log.exception("apply official")
     rows = enrich_orders(orders)
     return {
         "date": date_str,

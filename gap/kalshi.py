@@ -23,7 +23,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from . import config as C
+from . import config as C, lease
 
 log = logging.getLogger("gap.kalshi")
 
@@ -316,6 +316,7 @@ class KalshiClient:
     ) -> dict:
         """Buy NO at no_price_cents (== sell YES at 100-no_price_cents). Same
         v1/v2 branching as nofade's client, selected by C.ORDER_API."""
+        lease.require("send a real order")   # only the place that holds the worker lease may send
         if C.ORDER_API == "v1":
             body = {
                 "ticker": ticker,

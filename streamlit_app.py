@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import logging
-import threading
-import time
 
 import pandas as pd
 import streamlit as st
 
-from gap import backtest, board, clock, config as C, lab, live, notify, pipeline, store, weekly
+from gap import backtest, board, clock, config as C, lab, live, runtime, store, weekly
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,40 +134,9 @@ def copy_box(slot, md, key, filename):
 
 @st.cache_resource
 def boot():
-    store.init_db()
-    pipeline.register_commands()
-    notify.start_listener()
-
-    def _poll_loop():
-        while True:
-            try:
-                pipeline.poll_once()
-            except Exception:
-                logging.getLogger("gap.poll").exception("poll_once")
-            # Config says "poll ... every 60s" (see config.summary()); this was
-            # actually sleeping 5s, i.e. firing 12x more often than intended --
-            # every tick does a DB read (book_waiting_if_due) and, during the
-            # detection window, a Kalshi call too. 30s keeps responsiveness
-            # (fills/timers still checked twice a minute) while cutting that
-            # load 6x.
-            time.sleep(30)
-
-    def _l_fast_watch_loop():
-        # Book L's real-money fast path, its own dedicated thread separate from
-        # _poll_loop above -- same two-thread shape as wnt-nofade-bot's
-        # runner/collector split. Mostly a no-op DB read; only starts hitting
-        # Kalshi once tonight's real open_time is close (see live.fast_arm_watch_tick).
-        while True:
-            try:
-                live.fast_arm_watch_tick()
-            except Exception:
-                logging.getLogger("gap.l_fast").exception("fast_arm_watch_tick")
-            time.sleep(1)
-
-    t = threading.Thread(target=_poll_loop, name="gap-poll", daemon=True)
-    t.start()
-    t2 = threading.Thread(target=_l_fast_watch_loop, name="gap-l-fast-watch", daemon=True)
-    t2.start()
+    """Once per app process. The loops start only if RUN_WORKERS is on AND this place holds the
+    worker lease (gap/runtime.py, where the two loops now live); otherwise this page is a dashboard."""
+    runtime.start_workers(where="streamlit")
     return {"started_at": clock.now_ct().isoformat()}
 
 
@@ -202,6 +169,9 @@ if st.query_params.get("weekly") == "true":
 services = boot()
 
 st.title("📐 WNT Gap Bot")
+_lvl, _txt = runtime.banner()
+if _lvl != "ok":
+    {"info": st.info, "warning": st.warning, "error": st.error}[_lvl](_txt)
 st.caption(
     f"{C.VERSION} · {len(C.VARIANTS)} paper books ({', '.join(v['id'] for v in C.VARIANTS)}), hold-to-settlement only · "
     "no live marks — P&L shows once Kalshi publishes an official result · "
