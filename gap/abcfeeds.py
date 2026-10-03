@@ -49,6 +49,10 @@ FEEDS = (
     ("world", "World", "worldnewsheadlines", "ABC_SECTION_N", "always"),
     ("gma", "GMA", "gmaheadlines", "ABC_SECTION_N", "always"),
     ("health", "Health", "healthheadlines", "ABC_SECTION_N", "health_words"),
+    # v1.14.0: ABC's homepage and video page, read from the HTML (gap/abcfront.py). The RSS feeds lag the
+    # homepage: on Oct 2 the Romo and Amazon stories were on abcnews.com but in none of the feeds above.
+    ("front", "Front Page", "page:home", "ABC_FRONT_N", "front_page"),
+    ("video", "Video", "page:video", "ABC_VIDEO_N", "front_page"),
 )
 
 # Health feed only when tonight's list has a word like these (each side of a slash word checked).
@@ -75,6 +79,8 @@ def wanted_feeds(words: list[dict]) -> list[tuple]:
         if key in C.ABC_SKIP_FEEDS:
             continue
         if when == "health_words" and not health:
+            continue
+        if when == "front_page" and not C.ABC_FRONT_ON:
             continue
         out.append((key, label, name, int(getattr(C, n_attr))))
     return out
@@ -126,13 +132,21 @@ def parse_feed(xml_text: str, limit: int, now: datetime | None = None) -> list[d
 
 
 def fetch_feed(name: str, limit: int, deadline: float | None = None) -> tuple[list[dict], str | None]:
-    """(items, error). Uses the 5-minute cache and the shared per-site speed limit."""
+    """(items, error). Uses the 5-minute cache and the shared per-site speed limit.
+    v1.14.0: a name like "page:home" is ABC's homepage or video page, read from its HTML."""
     url = feed_url(name)
     now = time.time()
     with _cache_lock:
         hit = _cache.get(url)
         if hit and now - hit[0] < C.ABC_CACHE_S:
             return hit[1][:], None
+    if name.startswith("page:"):
+        from . import abcfront
+        items, err = abcfront.fetch_page(name[5:], limit, deadline)
+        if not err and items:
+            with _cache_lock:
+                _cache[url] = (time.time(), items)
+        return items[:], err
     try:
         with netlimit.ticket(url, deadline):
             r = requests.get(url, timeout=C.ABC_TIMEOUT_S, headers={"User-Agent": UA}, allow_redirects=True)
@@ -175,6 +189,15 @@ def _where(pats: list[re.Pattern], title: str, summary: str) -> str | None:
     return None
 
 
+_STORY_ID = re.compile(r"(?:id=|-|/)(\d{7,})(?:\D|$)")
+
+
+def _story_key(link: str) -> str:
+    """ABC's own story number from an address, else the address itself."""
+    m = _STORY_ID.search(link or "")
+    return m.group(1) if m else (link or "")
+
+
 def _norm(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
 
@@ -210,10 +233,10 @@ def word_matches(word: str, feeds: dict[str, list[dict]], labels: dict[str, str]
             where = _where(pats, it["title"], it["summary"])
             if not where:
                 continue
-            k = _norm(it["title"])
-            if k in seen or (it["link"] and it["link"] in seen):
+            k, lk = _norm(it["title"]), _story_key(it["link"])
+            if k in seen or (lk and lk in seen):
                 continue
-            seen.update({k, it["link"]} - {""})
+            seen.update({k, lk} - {""})
             out.append((f"{labels[key]} #{it['rank']}", it["title"], where))
     for term in terms:
         for it in (google_abc or {}).get(term, []):
@@ -268,11 +291,17 @@ def render(words: list[dict], feeds: list[tuple], got: dict, errors: dict,
     lines = [
         "",
         f"ABC NEWS FEEDS (ABC's own RSS, fetched by the bot at {now}; numbered in ABC's order, last {C.ABC_MAX_AGE_H}h;",
-        "plus Google News items whose source is ABC News).",
+        "plus Google News items whose source is ABC News" + (
+            "; plus ABC's homepage and video page as they are right now)." if C.ABC_FRONT_ON else ")."),
         "A word in these items means ABC has ALREADY WRITTEN that story today: treat it as a strong candidate for tonight.",
         "[title] = the word is in the headline. [summary only] = the word is only in the summary or article text,",
         "so check that story is really about it. A word NOT found here is NOT dead: the feeds are short and change",
         "during the day, and Google News and your own searches still count.",
+    ] + ([
+        "[Front Page #n] = the headline is on abcnews.com's homepage right now, n-th from the top (the RSS feeds lag it).",
+        "[Video #n] = on ABC's video page: ABC has already cut video for that story.",
+        "A story can carry a word that is not in its headline (a jobs report carries 'unemployment'): read the lists below too.",
+    ] if C.ABC_FRONT_ON else []) + [
         "",
         "ABC MATCHES PER WORD:",
     ]

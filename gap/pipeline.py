@@ -849,6 +849,7 @@ def register_commands() -> None:
     def _lab(args, _msg):
         """/gap_lab = board and status; /gap_lab_night [date]; /gap_lab_prompt <id>; /gap_lab_champion <id>;
         /gap_lab_writer = which writer model works; /gap_lab_start [date] = run the lab on a past settled night;
+        /gap_lab_models = every model on the champion prompt; /gap_lab_forecast [date] = one night word by word;
         /gap_lab_retry = give failed runs another go. The old two-word forms (/gap_lab writer) still work. Paper only."""
         from . import promptlab
         if not promptlab.enabled():
@@ -885,6 +886,10 @@ def register_commands() -> None:
             out = promptlab.start_night(args[1] if len(args) > 1 else None)
             promptlab.tick(lambda t: notify.send(t, quiet=True))
             return out
+        if cmd == "models":
+            return "\n".join(promptlab.model_board_lines())
+        if cmd == "forecast":
+            return promptlab.forecast_text(args[1] if len(args) > 1 else None)
         if cmd == "retry":
             n = promptlab.retry_failed()
             promptlab.tick(lambda t: notify.send(t, quiet=True))
@@ -892,7 +897,31 @@ def register_commands() -> None:
         return promptlab.status_text()
 
     notify.register("gap_lab", _lab)
-    for _sub in ("writer", "start", "night", "prompt", "champion", "retry"):   # v1.12.1: one-word forms, tap-friendly
+
+    def _models(args, _msg):
+        """/gap_models <service> [word] = the model ids that service offers to this key (to fix a 'no model matching')."""
+        from . import challengers as CH
+        if not args or args[0].lower() not in CH.PROVIDERS:
+            return "usage: /gap_models <service> [word]   services: " + ", ".join(sorted(CH.PROVIDERS))
+        prov = args[0].lower()
+        if not CH.key_for(prov):
+            return f"{prov}: no API key in the secrets"
+        import threading as _th
+
+        def _go():
+            try:
+                ids = sorted(CH.list_models(prov))
+                word = args[1].lower() if len(args) > 1 else ""
+                show = [i for i in ids if word in i.lower()]
+                notify.send(f"{prov}: {len(show)} of {len(ids)} model ids" + (f" containing '{word}'" if word else "")
+                            + ":\n" + "\n".join(show[:120]), quiet=True)
+            except Exception as exc:
+                notify.send(f"{prov}: could not list models ({type(exc).__name__}: {str(exc)[:120]})", quiet=True)
+        _th.Thread(target=_go, name="gap-models", daemon=True).start()
+        return f"asking {prov} for its model list; it arrives here in a few seconds"
+
+    notify.register("gap_models", _models)
+    for _sub in ("writer", "start", "night", "prompt", "champion", "retry", "models", "forecast"):   # v1.12.1: one-word forms, tap-friendly
         notify.register(f"gap_lab_{_sub}", lambda args, msg, _s=_sub: _lab([_s] + list(args), msg))
     notify.register("gap_sendnow", _sendnow)
     def _settle(_args, _msg):

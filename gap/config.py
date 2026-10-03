@@ -49,7 +49,7 @@ LIVE_TRADING = _flag("LIVE_TRADING", False)
 DRY_RUN = _flag("DRY_RUN", True)
 USE_DEMO = _flag("USE_DEMO", False)
 
-VERSION = "wnt-gap-v1.12.1"  # prompt lab: one-word Telegram commands (/gap_lab_writer ...), Gemini free-plan limits (no Pro, 20 calls a day per model)
+VERSION = "wnt-gap-v1.15.0"  # PREVIOUS BROADCASTS block (ABC segment list from YouTube); ABC homepage + video page; lab on every model; fallbacks
 # ---------------------------------------------------------------------------
 # The system prompt lives in a plain text file you edit on GitHub:
 #     prompts/system_prompt.txt
@@ -151,6 +151,19 @@ ABC_BUDGET_S = float(_num("ABC_BUDGET_S", 20))           # total time for all AB
 ABC_CACHE_S = int(_num("ABC_CACHE_S", 300))              # /gap_resend within 5 min reuses the feeds
 ABC_MATCHES_PER_WORD = int(_num("ABC_MATCHES_PER_WORD", 4))
 ABC_SKIP_FEEDS = {x.strip().lower() for x in _secret("ABC_SKIP_FEEDS", "").split(",") if x.strip()}
+# v1.14.0: ABC's homepage and video page read from the HTML (one plain GET each, no browser).
+ABC_FRONT_ON = _flag("ABC_FRONT_ON", True)
+ABC_FRONT_N = int(_num("ABC_FRONT_N", 45))               # headlines kept from the homepage, top first
+ABC_VIDEO_N = int(_num("ABC_VIDEO_N", 25))               # headlines kept from the video page
+ABC_FRONT_TIMEOUT_S = float(_num("ABC_FRONT_TIMEOUT_S", 12))
+# v1.15.0: PREVIOUS BROADCASTS block. ABC's own segment list of the last shows, read from the YouTube
+# descriptions of the full broadcasts through YouTube's official Data API (free key). No key = no block.
+YOUTUBE_API_KEY = _secret("YOUTUBE_API_KEY", "").strip()
+BROADCASTS_ON = _flag("BROADCASTS_ON", True)
+BROADCASTS_N = int(_num("BROADCASTS_N", 2))                       # how many past shows
+BROADCASTS_CHANNEL_ID = _secret("BROADCASTS_CHANNEL_ID", "UCBi2mrWuNuyYy4gbM6fU18Q").strip()   # ABC News; if it finds nothing, the name search is used
+BROADCASTS_TIMEOUT_S = float(_num("BROADCASTS_TIMEOUT_S", 10))
+BROADCASTS_CACHE_S = int(_num("BROADCASTS_CACHE_S", 21600))       # past shows do not change: reuse for 6 hours
 # v1.7.6: shared speed limit for every outside news fetch, per website: requests start at least
 # NET_MIN_GAP_S apart, and at most NET_MAX_PARALLEL run at once. Google and ABC don't wait for each other.
 NET_MIN_GAP_S = float(_num("NET_MIN_GAP_S", 0.25))
@@ -186,11 +199,13 @@ GROQ_API_KEY = _secret("GROQ_API_KEY", "").strip()
 CHALLENGERS = [x.strip() for x in _secret(
     "CHALLENGERS",
     "nvidia:deepseek, nvidia:kimi, nvidia:glm, nvidia:nvidia/nemotron-3-ultra-550b-a55b, cerebras:gpt-oss-120b, "
-    "mistral:mistral-large, openrouter:free",
+    "mistral:mistral-medium, openrouter:free",
 ).split(",") if x.strip()]
 CHALLENGER_MAX_TOKENS = int(_num("CHALLENGER_MAX_TOKENS", 12000))
+CHALLENGER_MAX_TOKENS_CAP = int(_num("CHALLENGER_MAX_TOKENS_CAP", 48000))   # v1.14.2: a cut-off answer is retried with double the room, up to this
 CHALLENGER_RETRY_BUDGET_S = float(_num("CHALLENGER_RETRY_BUDGET_S", 1800))   # same 30-minute patience as Gemini
 CHALLENGER_TIMEOUT_S = float(_num("CHALLENGER_TIMEOUT_S", 600))   # one answer may take up to 10 min (big free models are slow)
+CHALLENGER_STREAM_MAX_S = float(_num("CHALLENGER_STREAM_MAX_S", 900))   # v1.13.1: longest a streamed answer may run
 CHALLENGER_MIN_CONTEXT = int(_num("CHALLENGER_MIN_CONTEXT", 64000))   # skip models that cannot read our whole file
 # v1.11.0: Grok through xAI's API, two paper challengers (gap/xai.py). The live Book L still waits
 # for the manual Grok paste. "plain" = no tools, like the other challengers. "expert" = the replica of
@@ -216,9 +231,12 @@ BASELINE_ON = _flag("BASELINE_ON", True)
 # tested on the other frozen nights, and a prompt that beats the champion there becomes the champion.
 # Only models WITHOUT search take part (a search model cannot be replayed on a past night).
 LAB_ON = _flag("LAB_ON", True)
-LAB_MODELS = [x.strip().lower() for x in _secret("LAB_MODELS", "xai, gemini").split(",") if x.strip()]  # first with a key = the judge
+# v1.13.0: "all" = every service in CHALLENGERS that has a key. The first model with a key is the judge.
+LAB_MODELS = [x.strip().lower() for x in _secret("LAB_MODELS", "xai, gemini, all").split(",") if x.strip()]
 LAB_WRITER_MODEL = _secret("LAB_WRITER_MODEL", "auto").strip()      # auto = newest Gemini Pro the key can use, else Flash
 LAB_WRITER_TRIES = int(_num("LAB_WRITER_TRIES", 4))                  # whole passes over the writer list, minutes apart
+LAB_WRITER_GROK_FALLBACK = _flag("LAB_WRITER_GROK_FALLBACK", True)   # every Gemini model failed: Grok writes the edits
+LAB_WRITER_XAI_EFFORT = _secret("LAB_WRITER_XAI_EFFORT", "medium").strip()
 LAB_GEMINI_MODEL = _secret("LAB_GEMINI_MODEL", "auto").strip()      # the lab's Gemini FORECASTER; auto = second newest Flash
 LAB_GEMINI_DAILY_CALLS = int(_num("LAB_GEMINI_DAILY_CALLS", 15))    # free plan: 20 calls a day per model (Oct 2, 2026)
 LAB_GEMINI_MIN_GAP_S = float(_num("LAB_GEMINI_MIN_GAP_S", 13))      # free plan: 5 calls a minute
@@ -239,7 +257,12 @@ LAB_EDIT_MAX_TEXT = int(_num("LAB_EDIT_MAX_TEXT", 900))
 LAB_PROMPT_MAX_CHARS = int(_num("LAB_PROMPT_MAX_CHARS", 26000))
 LAB_TIMEOUT_S = float(_num("LAB_TIMEOUT_S", 420))
 LAB_MAX_ATTEMPTS = int(_num("LAB_MAX_ATTEMPTS", 4))                 # paid tries per run before it is marked failed
-LAB_PARALLEL = int(_num("LAB_PARALLEL", 2))
+LAB_LANES = int(_num("LAB_LANES", 10))                               # models working side by side (one run at a time each)
+LAB_JUDGE_ROWS_PER_PASS = int(_num("LAB_JUDGE_ROWS_PER_PASS", 6))
+LAB_OTHER_ROWS_PER_PASS = int(_num("LAB_OTHER_ROWS_PER_PASS", 1))
+LAB_FREE_DAILY_CALLS = int(_num("LAB_FREE_DAILY_CALLS", 30))        # per free model per day (OpenRouter's free plan allows 50)
+LAB_FREE_MIN_GAP_S = float(_num("LAB_FREE_MIN_GAP_S", 3))
+LAB_FREE_TIMEOUT_S = float(_num("LAB_FREE_TIMEOUT_S", 600))         # big free models can take minutes
 # v1.10.0: general scorer. A Telegram scorecard once a night after settlement (every forecaster,
 # every prompt version, vs said / not said), plus /gap_score. Strategy-free.
 SCORECARD_ON = _flag("SCORECARD_ON", True)

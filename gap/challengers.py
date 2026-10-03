@@ -149,8 +149,65 @@ def resolve_list(provider: str, wanted: str) -> list[str]:
     ids = list_models(provider)
     got = pick_models(provider, wanted, ids, 3 if provider == "openrouter" else 1)
     if not got:
-        raise Fatal(f"{provider}: no model matching {wanted!r} ({len(ids)} models listed)")
+        raise Fatal(f"{provider}: no model matching {wanted!r} ({len(ids)} models listed; "
+                    f"closest: {', '.join(closest(wanted, ids)) or 'none'}). /gap_models {provider} lists them all.")
     return got
+
+
+def cut_off(js: dict) -> bool:
+    """The service stopped the answer because it ran out of allowed tokens (finish_reason "length")."""
+    try:
+        return ((js.get("choices") or [{}])[0].get("finish_reason") or "") == "length"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def closest(wanted: str, ids: list[str], n: int = 8) -> list[str]:
+    """Listed ids that share at least one word with `wanted` (most shared words first), to show in an error."""
+    words = [w for w in re.split(r"[\s\-_/]+", wanted.lower()) if w and w != "free"]
+    scored = [(sum(1 for w in words if w in i.lower()), i) for i in ids if not any(b in i.lower() for b in NEVER_PICK)]
+    scored = [(k, i) for k, i in scored if k > 0]
+    return [i for _k, i in sorted(scored, key=lambda t: (-t[0], t[1]))[:n]]
+
+
+def stream_chat(url: str, headers: dict, body: dict, timeout: float, max_s: float | None = None):
+    """Ask for the answer piece by piece (stream=true) and put the pieces back together as a normal
+    chat answer. Used after a gateway timeout (HTTP 504): some hosts cut a silent connection after about
+    5 minutes, and a stream is never silent. Returns (status code, answer dict or None, response)."""
+    payload = json.dumps(dict(body, stream=True))
+    with netlimit.ticket(url):
+        r = requests.post(url, headers=headers, data=payload, timeout=timeout, stream=True)
+        if r.status_code != 200:
+            return r.status_code, None, r
+        parts, usage, model, finish = [], None, None, None
+        t0 = time.monotonic()
+        for raw in r.iter_lines():
+            if max_s and time.monotonic() - t0 > max_s:
+                raise requests.Timeout("the stream ran too long")
+            if not raw:
+                continue
+            line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            model = chunk.get("model") or model
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            for ch in chunk.get("choices") or []:
+                piece = (ch.get("delta") or {}).get("content")
+                if piece:
+                    parts.append(piece)
+                finish = ch.get("finish_reason") or finish
+    return 200, {"model": model, "usage": usage or {},
+                 "choices": [{"message": {"content": "".join(parts)}, "finish_reason": finish}]}, r
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
@@ -242,51 +299,70 @@ def forecast(provider: str, model: str, paste: str, words: list[str], event_date
     say = on_attempt or (lambda msg: log.info("%s: %s", provider, msg))
     base, _ = PROVIDERS[provider]
     url = f"{base}/chat/completions"
-    body = {                                     # built ONCE: every retry sends exactly this
+    body = {                                     # the same request on every retry (v1.13.1: see the two fallbacks below)
         "model": model,
         "messages": [{"role": "system", "content": preface.format(tools=NO_TOOLS)},
                      {"role": "user", "content": paste}],
         "temperature": 0.3,
         "max_tokens": C.CHALLENGER_MAX_TOKENS,
     }
+    order = [model] + [m for m in (fallbacks or []) if m != model][:2]
     if fallbacks:
-        body["models"] = [model] + [m for m in fallbacks if m != model][:2]   # OpenRouter: try these in order
-    payload = json.dumps(body)
-    need = est_tokens(payload, C.CHALLENGER_MAX_TOKENS)
+        body["models"] = list(order)                 # OpenRouter: try these in order
+    need = est_tokens(json.dumps(body), C.CHALLENGER_MAX_TOKENS)
     label = f"{provider}:{model}"
     start = now()
     attempt, waited = 0, 0.0
+    stream = False                                   # v1.13.1: switched on after a gateway timeout (HTTP 504)
     while True:
         attempt += 1
         t0 = now()
         err = None
         try:
-            with netlimit.ticket(url):
-                r = requests.post(url, headers=_headers(provider), data=payload, timeout=C.CHALLENGER_TIMEOUT_S)
+            if stream:
+                status, js_s, r = stream_chat(url, _headers(provider), body, C.CHALLENGER_TIMEOUT_S,
+                                              C.CHALLENGER_STREAM_MAX_S)
+            else:
+                with netlimit.ticket(url):
+                    r = requests.post(url, headers=_headers(provider), data=json.dumps(body), timeout=C.CHALLENGER_TIMEOUT_S)
+                status, js_s = r.status_code, None
             retry_after = None
-            if r.status_code == 200:
+            if status == 200:
+                js = None
                 try:
-                    js = r.json()
+                    js = js_s if stream else r.json()
                     data = parser.validate(_answer_text(js), words, event_date)
                     used = f"{provider}:{js.get('model')}" if (fallbacks and js.get("model")) else label
                     return {"model": used, "forecasts": data["forecasts"], "seconds": round(now() - t0, 1),
                             "attempts": attempt, "waited_s": round(waited)}
                 except Exception as exc:  # noqa: BLE001
                     err = f"bad answer ({str(exc)[:120]})"
-            elif r.status_code in (401, 403):
-                raise Fatal(f"{label}: key refused (HTTP {r.status_code}) {_err_msg(r)}".strip())
-            elif r.status_code == 404:
+                    if cut_off(js if isinstance(js, dict) else {}) and body["max_tokens"] < C.CHALLENGER_MAX_TOKENS_CAP:
+                        # v1.14.2: the answer was cut ("length"): a thinking model used the room up. Give it more.
+                        body["max_tokens"] = min(body["max_tokens"] * 2, C.CHALLENGER_MAX_TOKENS_CAP)
+                        err += f"; cut off, next try allows {body['max_tokens']:,} tokens"
+                    elif len(order) > 1:             # v1.13.1: a model that answers rubbish: the next one leads
+                        order = order[1:] + order[:1]
+                        body["model"], body["models"] = order[0], list(order)
+                        label = f"{provider}:{order[0]}"
+                        err += f"; next try starts with {order[0]}"
+            elif status in (401, 403):
+                raise Fatal(f"{label}: key refused (HTTP {status}) {_err_msg(r)}".strip())
+            elif status == 404:
                 raise Fatal(f"{label}: model not found (HTTP 404) {_err_msg(r)}".strip())
-            elif r.status_code == 429 and _zero_allowance(r):
+            elif status == 429 and _zero_allowance(r):
                 raise Fatal(f"{label}: this key is allowed 0 tokens a minute on this model (waiting will not help)")
-            elif r.status_code == 429 and (_token_limit(r) or 10**12) < need:
+            elif status == 429 and (_token_limit(r) or 10**12) < need:
                 raise Fatal(f"{label}: one request is about {need:,} tokens but this model allows "
                             f"{_token_limit(r):,} a minute -- it can never fit (pick a model with a bigger limit)")
-            elif r.status_code in RETRYABLE:
+            elif status in RETRYABLE:
                 info, retry_after = _limit_info(r)
-                err = f"HTTP {r.status_code} {_err_msg(r)}".strip() + (f" [{info}]" if info else "")
+                err = f"HTTP {status} {_err_msg(r)}".strip() + (f" [{info}]" if info else "")
+                if status in (504, 524) and not stream:
+                    stream = True                    # the host gave up waiting: next time ask piece by piece
+                    err += "; next try streams the answer"
             else:
-                raise Fatal(f"{label}: HTTP {r.status_code} {_err_msg(r)}".strip())   # e.g. 400/413 too long
+                raise Fatal(f"{label}: HTTP {status} {_err_msg(r)}".strip())   # e.g. 400/413 too long
         except requests.Timeout:
             err, retry_after = f"no answer within {C.CHALLENGER_TIMEOUT_S:.0f}s", None
         except requests.RequestException as exc:

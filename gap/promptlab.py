@@ -20,6 +20,11 @@ The loop, once per night after Kalshi settles:
      better or equal on at least half of those nights. The best LAB_TOP_N others stay on the board
      and are replayed on each new night, so their evidence keeps growing.
 
+v1.13.0: EVERY model with an API key takes part (Grok, Gemini, and each service in CHALLENGERS: DeepSeek,
+Kimi, GLM, Nemotron, Mistral, OpenRouter ...). When tonight's file goes out the champion prompt runs on
+all of them; at night every new variant is tried on all of them; every forecast is kept. One model (the
+first in LAB_MODELS that has a key) is the JUDGE that decides which prompt becomes champion; the board
+shows every model so the judge can be changed with data.
 Only models without search take part: a search model cannot be replayed on a past night.
 Money guard: paid lab runs stop at LAB_DAILY_BUDGET_USD per CT day; the rest wait for tomorrow.
 """
@@ -58,27 +63,41 @@ _cool: dict[str, tuple[float, int]] = {}      # model key -> (pause until, level
 COOL_S = (300, 900, 3600)
 
 
-_gem_lock = threading.Lock()
 _gem = {"last": 0.0, "day": "", "calls": 0}
+_slots: dict[str, dict] = {"gemini": _gem}
+_slot_locks: dict[str, threading.Lock] = {}
+_gem_lock = threading.Lock()
+
+
+def _slot(key: str) -> bool:
+    """One lab forecast on a FREE model may start now? Keeps a gap between calls and a daily count per
+    model (in memory, and from today's finished runs after a restart). Free plans are small: Gemini allows
+    20 calls a day per model, OpenRouter 50. Grok is paid and is limited by dollars instead."""
+    if key == "xai":
+        return True
+    cap, gap = ((C.LAB_GEMINI_DAILY_CALLS, C.LAB_GEMINI_MIN_GAP_S) if key == "gemini"
+                else (C.LAB_FREE_DAILY_CALLS, C.LAB_FREE_MIN_GAP_S))
+    with _gem_lock:
+        st = _slots.setdefault(key, {"last": 0.0, "day": "", "calls": 0})
+        lock = _slot_locks.setdefault(key, threading.Lock())
+    with lock:
+        today = clock.today_ct()
+        if st["day"] != today:
+            done = _q("select count(*) as n from gap_lab_runs where model_key = :k and finished_at >= :t",
+                      k=key, t=clock._at(today, "00:00"))[0]["n"]
+            st.update(day=today, calls=int(done))
+        if st["calls"] >= cap:
+            return False
+        wait = gap - (time.monotonic() - st["last"])
+        if wait > 0:
+            time.sleep(wait)
+        st["last"] = time.monotonic()
+        st["calls"] += 1
+        return True
 
 
 def _gemini_slot() -> bool:
-    """One Gemini lab forecast may start now? Keeps LAB_GEMINI_MIN_GAP_S between calls and at most
-    LAB_GEMINI_DAILY_CALLS a day (counted in memory, and from today's finished runs after a restart)."""
-    with _gem_lock:
-        today = clock.today_ct()
-        if _gem["day"] != today:
-            done = _q("select count(*) as n from gap_lab_runs where model_key = 'gemini' and finished_at >= :t",
-                      t=clock._at(today, "00:00"))[0]["n"]
-            _gem.update(day=today, calls=int(done))
-        if _gem["calls"] >= C.LAB_GEMINI_DAILY_CALLS:
-            return False
-        wait = C.LAB_GEMINI_MIN_GAP_S - (time.monotonic() - _gem["last"])
-        if wait > 0:
-            time.sleep(wait)
-        _gem["last"] = time.monotonic()
-        _gem["calls"] += 1
-        return True
+    return _slot("gemini")
 
 
 def _cooling(key: str) -> bool:
@@ -129,9 +148,37 @@ def enabled() -> bool:
 
 
 def model_keys() -> list[str]:
-    """Lab forecasters that have a key, in LAB_MODELS order. The first one is the judge."""
-    have = {"xai": bool(C.XAI_API_KEY), "gemini": bool(C.GEMINI_API_KEY)}
-    return [k for k in C.LAB_MODELS if have.get(k)]
+    """Lab forecasters that have a key, in LAB_MODELS order. The first one is the judge.
+    "xai" and "gemini" are themselves; "all" stands for every service listed in CHALLENGERS that has a
+    key (the key is then "provider:model word", e.g. "nvidia:deepseek"); one such spec may also be listed."""
+    from . import challengers as CH
+    out: list[str] = []
+    for k in C.LAB_MODELS:
+        if k == "xai":
+            got = ["xai"] if C.XAI_API_KEY else []
+        elif k == "gemini":
+            got = ["gemini"] if C.GEMINI_API_KEY else []
+        elif k in ("all", "challengers"):
+            got = [f"{prov}:{m}" for prov, m in CH.enabled_specs()]
+        elif ":" in k and k.split(":", 1)[0] in CH.PROVIDERS and CH.key_for(k.split(":", 1)[0]):
+            got = [k]
+        else:
+            got = []
+        out += [g for g in got if g not in out]
+    return out
+
+
+def short(key: str) -> str:
+    """Column name for a lab model key: xai -> grok, nvidia:deepseek -> deepseek, mistral:mistral-medium -> mistral."""
+    if key == "xai":
+        return "grok"
+    if key == "gemini":
+        return "gemini"
+    prov, _, m = key.partition(":")
+    if prov in ("openrouter", "mistral", "cerebras", "groq"):
+        return prov
+    head = re.split(r"[-_.:\d]", m.split("/")[-1])[0]
+    return (head or prov)[:10]
 
 
 def primary_key() -> str | None:
@@ -489,6 +536,8 @@ def writer_candidates() -> list[str]:
     pro = sorted([n for n in names if "pro" in n and "flash" not in n], key=_rank, reverse=True)
     flash = _flash_models()[:5]
     want = C.LAB_WRITER_MODEL.replace("models/", "")
+    if want.lower() in ("xai", "grok"):
+        return []                                           # LAB_WRITER_MODEL = "grok": Grok writes, Gemini is not asked
     if want and want.lower() != "auto":
         return [want] + [n for n in flash if n != want]
     return ([] if _pro_blocked() else pro[:1]) + flash
@@ -584,7 +633,86 @@ def ask(model_key: str, system: str, user: str, names: list[str], d: str) -> dic
             raise Retry(f"gemini: bad answer ({str(exc)[:120]})", usage=usage) from exc
         return {"model": f"gemini:{model}", "forecasts": data["forecasts"], "usage": usage,
                 "seconds": round(time.monotonic() - t0, 1)}
+    if ":" in model_key:
+        return _ask_provider(model_key, system, user, names, d, t0)
     raise Fatal(f"unknown lab model {model_key!r}")
+
+
+_stream_keys: set[str] = set()
+_more_tokens: dict[str, int] = {}             # model key -> max_tokens after an answer was cut off ("length")
+
+
+def _stream(url: str, headers: dict, body: dict, timeout: float):
+    from . import challengers as CH
+    return CH.stream_chat(url, headers, body, timeout, C.CHALLENGER_STREAM_MAX_S)
+
+
+def _provider_model(key: str) -> tuple[str, str]:
+    """(provider, exact model id) for a key like "nvidia:deepseek". The model id is pinned in the database
+    so every prompt is tried on the same model; it is looked up again only if the service retires it."""
+    from . import challengers as CH
+    prov, _, wanted = key.partition(":")
+    pinned = store.get_state(f"lab_model:{key}")
+    if pinned:
+        return prov, str(pinned)
+    try:
+        models = CH.resolve_list(prov, wanted)
+    except CH.Fatal as exc:
+        raise Fatal(str(exc)[:200]) from exc
+    except Exception as exc:  # noqa: BLE001  a busy model list: try later
+        raise Retry(f"{key}: model list: {type(exc).__name__}", free=True) from exc
+    store.set_state(f"lab_model:{key}", models[0])
+    return prov, models[0]
+
+
+def _ask_provider(key: str, system: str, user: str, names: list[str], d: str, t0: float) -> dict:
+    """One forecast from an OpenAI-style service (NVIDIA, Mistral, OpenRouter ...): the lab prompt as
+    the system message, the frozen file as the user message, no tools."""
+    from . import challengers as CH
+    prov, model = _provider_model(key)
+    base, _env = CH.PROVIDERS[prov]
+    body = {"model": model, "temperature": 0.2, "max_tokens": _more_tokens.get(key, C.CHALLENGER_MAX_TOKENS),
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    js = None
+    try:
+        if key in _stream_keys:                             # this host cut a silent answer before: ask piece by piece
+            status, js, r = _stream(f"{base}/chat/completions", CH._headers(prov), body, C.LAB_FREE_TIMEOUT_S)
+        else:
+            r = _post(f"{base}/chat/completions", CH._headers(prov), json.dumps(body), C.LAB_FREE_TIMEOUT_S)
+            status = r.status_code
+    except requests.Timeout as exc:
+        raise Retry(f"{key}: no answer in {C.LAB_FREE_TIMEOUT_S:.0f}s") from exc     # counts as a try: slow models must not loop
+    except requests.RequestException as exc:
+        raise Retry(f"{key}: {type(exc).__name__}", free=True) from exc
+    if status != 200:
+        msg = f"{key}: HTTP {status} {CH._err_msg(r)}".strip()[:200]
+        if status in (401, 403):
+            raise Fatal(msg)
+        if status == 404:
+            store.set_state(f"lab_model:{key}", None)       # retired model: look it up again next time
+        if status in (504, 524):
+            _stream_keys.add(key)                           # a gateway timeout: stream the answer from now on
+        if status == 404 or status in CH.RETRYABLE:
+            exc = Retry(msg, free=True)
+            exc.http = status
+            raise exc
+        raise Fatal(msg)
+    if js is None:
+        try:
+            js = r.json()
+        except Exception:  # noqa: BLE001
+            js = {}
+    u = js.get("usage") or {}
+    usage = {"input_tokens": int(u.get("prompt_tokens") or 0), "output_tokens": int(u.get("completion_tokens") or 0),
+             "cost_usd": None}
+    try:
+        data = parser.validate(CH._answer_text(js), names, d)
+    except Exception as exc:  # noqa: BLE001
+        if CH.cut_off(js) and body["max_tokens"] < C.CHALLENGER_MAX_TOKENS_CAP:
+            _more_tokens[key] = min(body["max_tokens"] * 2, C.CHALLENGER_MAX_TOKENS_CAP)   # cut off: more room next time
+        raise Retry(f"{key}: bad answer ({str(exc)[:120]})", usage=usage) from exc
+    return {"model": f"{prov}:{model}", "forecasts": data["forecasts"], "usage": usage,
+            "seconds": round(time.monotonic() - t0, 1)}
 
 
 # ------------------------------------------------------------------ the run queue
@@ -653,8 +781,8 @@ def _run_one(row: dict) -> str:
     est = _reserve(key)
     if est is None:
         return "budget"
-    if key == "gemini" and not _gemini_slot():
-        return "budget"                                     # today's free Gemini calls are used: wait for tomorrow
+    if not _slot(key):
+        return "budget"                                     # today's free calls for this model are used: wait for tomorrow
     try:
         if not _x("""update gap_lab_runs set status = 'running', claimed_at = :t
                      where prompt_id = :p and model_key = :k and event_date = cast(:d as date) and status = 'pending'""",
@@ -687,8 +815,7 @@ def _run_one(row: dict) -> str:
             if exc.free:
                 _cool_down(key)                             # a busy service: pause every run for it, not just this one
                 if key == "gemini" and getattr(exc, "http", None) == 429:
-                    with _gem_lock:                         # the free plan's daily count is used up
-                        _gem["calls"] = max(_gem["calls"], C.LAB_GEMINI_DAILY_CALLS)
+                    _gem["calls"] = max(_gem["calls"], C.LAB_GEMINI_DAILY_CALLS)   # the free plan's daily count is used up
             delay = 120 if exc.free else min(120 * (2 ** tries), 1800)
             finish("pending", attempts=tries, error=str(exc)[:300], cost_usd=cost or None,
                    not_before=_utc() + timedelta(seconds=delay))
@@ -727,8 +854,11 @@ def _run_one(row: dict) -> str:
         _release(est)
 
 
-def process_queue(limit: int = 40) -> dict:
-    """Run pending lab runs, most urgent first, a few at a time. Paid runs stop at the daily budget."""
+def process_queue(limit: int = 400) -> dict:
+    """Run pending lab runs. Every model has its own lane: lanes run side by side, each lane does its
+    own runs one after another, most urgent first. The judge model does up to LAB_JUDGE_ROWS_PER_PASS
+    runs in one pass and every other model LAB_OTHER_ROWS_PER_PASS, so one slow free model cannot hold
+    the night's result back for long. Paid runs stop at the daily budget; free ones at their daily count."""
     _x("""update gap_lab_runs set attempts = attempts + 1, error = 'stopped mid-run (restart); counted as a try',
               status = case when attempts + 1 >= :cap then 'failed' else 'pending' end
           where status = 'running' and claimed_at < :t""", t=_utc() - timedelta(minutes=30), cap=C.LAB_MAX_ATTEMPTS)
@@ -742,9 +872,27 @@ def process_queue(limit: int = 40) -> dict:
     out: dict = {}
     if not rows:
         return out
-    with ThreadPoolExecutor(max_workers=max(1, min(C.LAB_PARALLEL, len(rows)))) as pool:
-        for res in pool.map(_safe_run, rows):
-            out[res] = out.get(res, 0) + 1
+    judge = keys[0]
+    lanes: dict[str, list[dict]] = {}
+    for r in rows:
+        cap = C.LAB_JUDGE_ROWS_PER_PASS if r["model_key"] == judge else C.LAB_OTHER_ROWS_PER_PASS
+        lane = lanes.setdefault(r["model_key"], [])
+        if len(lane) < cap:
+            lane.append(r)
+
+    def run_lane(lane_rows: list[dict]) -> list[str]:
+        got = []
+        for r in lane_rows:
+            res = _safe_run(r)
+            got.append(res)
+            if res in ("budget", "skip"):                   # out of budget, or the service is pausing: stop this lane
+                break
+        return got
+
+    with ThreadPoolExecutor(max_workers=max(1, min(C.LAB_LANES, len(lanes)))) as pool:
+        for got in pool.map(run_lane, list(lanes.values())):
+            for res in got:
+                out[res] = out.get(res, 0) + 1
     return out
 
 
@@ -859,12 +1007,18 @@ def writer_material(champ: dict, ni: dict, truth: dict[str, float], key: str) ->
 
 
 def write_variants(champ: dict, ni: dict, truth: dict[str, float], key: str) -> tuple[list[dict], str, list[str]]:
-    """Ask the writer for edits. Returns (raw edits, writer model, notes about models that were skipped)."""
+    """Ask the writer for edits. Returns (raw edits, writer model, notes about models that were skipped).
+    Order: Gemini Pro (if the plan has it), every Gemini Flash, then Grok as the last resort."""
     system = WRITER_SYSTEM.format(n=C.LAB_VARIANTS_PER_NIGHT, lo=C.LAB_EDIT_MIN_TEXT, hi=C.LAB_EDIT_MAX_TEXT)
     material = writer_material(champ, ni, truth, key)
     notes: list[str] = []
     last: Exception | None = None
-    for model in writer_candidates():
+    try:
+        cands = writer_candidates()
+    except Exception as exc:  # noqa: BLE001  Google will not even list its models: go on to the fallback
+        cands = []
+        notes.append(f"gemini model list: {str(exc)[:80]}")
+    for model in cands:
         try:
             raw, usage = _gemini_call(model, system, material, 0.7, C.LAB_TIMEOUT_S)
             _record(ni["date"], f"writer:gemini:{model}", champ["prompt_id"], usage, True, package_id=ni["package_id"])
@@ -877,7 +1031,36 @@ def write_variants(champ: dict, ni: dict, truth: dict[str, float], key: str) -> 
             last = exc
             _note_writer_failure(model, exc)
             notes.append(f"{model}: {_short_err(model, exc)}")
+    if C.LAB_WRITER_GROK_FALLBACK and C.XAI_API_KEY:        # v1.13.1: every Gemini model failed: Grok writes (a few cents)
+        try:
+            edits = _grok_writer(system, material, ni, champ)
+            return edits, f"xai:{C.XAI_MODEL}", notes
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            notes.append(f"grok: {str(exc)[:100]}")
     raise Retry("writer failed: " + ("; ".join(notes) or str(last)), free=True)
+
+
+def _grok_writer(system: str, material: str, ni: dict, champ: dict) -> list[dict]:
+    """Ask Grok (no tools) for the edits. Paid: it is booked and it respects the lab's daily budget."""
+    est = _reserve("xai")
+    if est is None:
+        raise RuntimeError("no lab budget left today")
+    try:
+        body = {"model": C.XAI_MODEL, "reasoning": {"effort": C.LAB_WRITER_XAI_EFFORT},
+                "input": [{"role": "system", "content": system}, {"role": "user", "content": material}]}
+        r = _post(xai.URL, xai._headers(), json.dumps(body), C.LAB_TIMEOUT_S)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code} {xai._err(r)}".strip())
+        js = r.json()
+        _record(ni["date"], f"writer:xai:{C.XAI_MODEL}", champ["prompt_id"], xai.usage_of(js), True,
+                package_id=ni["package_id"])
+        edits = parser.load_json(xai.answer_text(js)).get("variants")
+        if not isinstance(edits, list) or not edits:
+            raise ValueError("no variants in the answer")
+        return [e for e in edits if isinstance(e, dict)][:C.LAB_VARIANTS_PER_NIGHT]
+    finally:
+        _release(est)
 
 
 # ------------------------------------------------------------------ the nightly state machine
@@ -974,7 +1157,7 @@ def night_step(d: str, send=None) -> int:
             return 1 if changed else 0
         if det.get("writer_after") and _utc().isoformat() < det["writer_after"]:
             return 0
-        if C.LAB_VARIANTS_PER_NIGHT <= 0 or not C.GEMINI_API_KEY:
+        if C.LAB_VARIANTS_PER_NIGHT <= 0 or not (C.GEMINI_API_KEY or (C.LAB_WRITER_GROK_FALLBACK and C.XAI_API_KEY)):
             _set_night(d, stage="decided", decision="no_writer", detail=det)
             say(night_message(d))
             return 1
@@ -1136,8 +1319,11 @@ def set_champion(pid: str) -> str:
 def writer_check() -> str:
     """Which writer model this key can really use: tiny calls, best first, stopping at the first that
     works (the free plan allows few calls a day). For /gap_lab_writer."""
+    grok = bool(C.LAB_WRITER_GROK_FALLBACK and C.XAI_API_KEY)
+    grok_line = ("If every Gemini model fails at night, Grok writes the edits instead (a few cents, inside the lab budget)."
+                 if grok else "There is no Grok fallback (no xAI key, or LAB_WRITER_GROK_FALLBACK is off).")
     if not C.GEMINI_API_KEY:
-        return "no Gemini key: the lab has no writer (the champion still forecasts every night)"
+        return "no Gemini key. " + (grok_line if grok else "The lab has no writer (the champion still forecasts every night).")
     lines = ["WRITER CHECK (tiny calls, best model first, stops at the first that works):"]
     try:
         cands = writer_candidates()
@@ -1163,7 +1349,8 @@ def writer_check() -> str:
                 why += " = today's free calls for this model are used"
             lines.append(f"- {model}: not usable ({why})")
     lines.append(f"The writer would be: {first_ok}. Tonight it tries the same list in the same order." if first_ok
-                 else "No writer model works right now. Tonight the lab tries again, several times.")
+                 else "No Gemini model works right now. Tonight the lab tries again, several times.")
+    lines.append(grok_line)
     return "\n".join(lines)
 
 
@@ -1302,6 +1489,7 @@ def night_message(d: str) -> str:
         for v in det["variants"]:
             if v.get("ok") and v.get("why"):
                 lines.append(f"  why {v.get('name')}: {v['why']}")
+        lines += [""] + night_models_lines(d, row.get("champion_id"), [v for v in det["variants"] if v.get("ok")])
     if row.get("decision") == "no_variant_beat_champion":
         lines.append("No variant beat the champion tonight. Nothing goes on to the test.")
     if row.get("decision") == "test_queue_full":
@@ -1309,6 +1497,107 @@ def night_message(d: str) -> str:
     if row.get("decision") == "no_valid_variant":
         lines.append("Every variant broke a rule and was thrown away. Nothing was run.")
     lines.append(f"lab spend today: ${spent_today():.2f} of ${C.LAB_DAILY_BUDGET_USD:.2f}")
+    return "\n".join(lines)
+
+
+def _all_forecasts(pids: list[str]) -> dict[tuple[str, str], dict[tuple[str, str], float]]:
+    """{(prompt, model key): {(date, ticker): p}} for these prompts, in one query."""
+    if not pids:
+        return {}
+    marks = ", ".join(f":p{i}" for i in range(len(pids)))
+    rows = _q(f"select prompt_id, model_key, event_date, market_ticker, probability from gap_lab_forecasts "
+              f"where prompt_id in ({marks})", **{f"p{i}": p for i, p in enumerate(pids)})
+    out: dict = {}
+    for r in rows:
+        out.setdefault((r["prompt_id"], r["model_key"]), {})[(_d(r["event_date"]), r["market_ticker"])] = r["probability"] / 100.0
+    return out
+
+
+def night_models_lines(d: str, champ_id: str | None, variants: list[dict]) -> list[str]:
+    """Tonight's Brier for the champion and each valid variant on EVERY model ('-' = that model has not answered yet)."""
+    keys = model_keys()
+    ni = night_input(d)
+    if not keys or not ni or not champ_id:
+        return []
+    truth = outcomes(ni)
+    lines = ["ALL MODELS tonight (Brier; '-' = not answered yet; /gap_lab_night shows it again later):",
+             "prompt | " + " | ".join(short(k) for k in keys)]
+    for name, pid in [("champion", champ_id)] + [(v.get("name") or "-", v.get("prompt_id")) for v in variants]:
+        cells = [_fmt(night_brier(pid, k, d, truth)) if pid else "-" for k in keys]
+        lines.append(f"{name} | " + " | ".join(cells))
+    return lines
+
+
+def model_board_lines() -> list[str]:
+    """Every model on the champion prompt, on every settled night it has answered, plus the plain average
+    of all models, plus the board prompt that does best on that model."""
+    champ, keys = champion(), model_keys()
+    if not champ or not keys:
+        return ["ALL MODELS: the lab has not started yet."]
+    cid = champ["prompt_id"]
+    others = board_prompts()
+    fc = _all_forecasts([cid] + [p["prompt_id"] for p in others])
+    dates = sorted({d for m in fc.values() for d, _t in m})
+    truth = _truth(dates)
+    lines = [f"ALL MODELS on the champion prompt {cid} (settled nights only; lower Brier is better; judge = {short(keys[0])})",
+             "model | nights | words | Brier | <=30: words (said%) | best other prompt on this model (diff, words)"]
+    rows, pool = [], {}
+    for k in keys:
+        a = {kk: p for kk, p in fc.get((cid, k), {}).items() if kk in truth}
+        for kk, p in a.items():
+            pool.setdefault(kk, []).append(p)
+        b = brier([(p, truth[kk]) for kk, p in a.items()])
+        low = [(p, truth[kk]) for kk, p in a.items() if p <= 0.30]
+        best = None
+        for p in others:
+            ex = _d(p["written_from"]) if p.get("written_from") else None
+            o = fc.get((p["prompt_id"], k), {})
+            both = [kk for kk in o if kk in a and kk[0] != ex]
+            if len(both) < 8:
+                continue
+            diff = brier([(o[kk], truth[kk]) for kk in both]) - brier([(a[kk], truth[kk]) for kk in both])
+            if best is None or diff < best[0]:
+                best = (diff, p, len(both))
+        best_txt = "-" if not best else f"{best[1]['prompt_id']} {best[1].get('name') or ''} ({best[0]:+.3f}, {best[2]})"
+        low_txt = "-" if not low else f"{len(low)} ({100 * sum(y for _p, y in low) / len(low):.0f}%)"
+        rows.append((9.0 if b is None else b,
+                     f"{short(k)}{' (judge)' if k == keys[0] else ''} | {len({kk[0] for kk in a})} | {len(a)} | {_fmt(b)} | {low_txt} | {best_txt}"))
+    lines += [ln for _b, ln in sorted(rows, key=lambda t: t[0])]
+    avg = [(sum(v) / len(v), truth[kk]) for kk, v in pool.items() if len(v) >= 2]
+    if avg:
+        low = [(p, y) for p, y in avg if p <= 0.30]
+        low_txt = "-" if not low else f"{len(low)} ({100 * sum(y for _p, y in low) / len(low):.0f}%)"
+        lines.append(f"average of all models | {len({kk[0] for kk in pool})} | {len(avg)} | {_fmt(brier(avg))} | {low_txt} | -")
+    lines.append("To make another model the judge, put it first in the LAB_MODELS setting.")
+    return lines
+
+
+def forecast_text(d: str | None = None) -> str:
+    """Word by word: manual Grok next to the champion prompt on every model, for one night."""
+    d = d or clock.today_ct()
+    ni, keys = night_input(d), model_keys()
+    row = _night(d)
+    champ = champion()
+    cid = (row or {}).get("champion_id") or (champ or {}).get("prompt_id")
+    if not ni or not cid:
+        return f"no lab forecasts for {d}"
+    truth = outcomes(ni)
+    fc = _all_forecasts([cid])
+    manual = {f.get("market_ticker"): f.get("probability") for f in store.grok_forecasts_for_date(d)}
+    lines = [f"LAB FORECASTS {d}: champion prompt {cid} on every model (paper only). 'manual' = your Grok paste.",
+             "word | said? | manual | " + " | ".join(short(k) for k in keys)]
+    for w in ni["words"]:
+        t = w["market_ticker"]
+        y = truth.get(t)
+        cells = []
+        for k in keys:
+            p = fc.get((cid, k), {}).get((d, t))
+            cells.append("-" if p is None else str(round(100 * p)))
+        lines.append(f"{w['word']} | {'YES' if y == 1.0 else ('no' if y == 0.0 else '?')} | {manual.get(t, '-')} | " + " | ".join(cells))
+    if truth:
+        mp = [(manual[t] / 100.0, y) for t, y in truth.items() if manual.get(t) is not None]
+        cells = [_fmt(night_brier(cid, k, d, truth)) for k in keys]
+        lines.append(f"BRIER | {len(truth)} settled | {_fmt(brier(mp))} | " + " | ".join(cells))
     return "\n".join(lines)
 
 
@@ -1391,7 +1680,8 @@ def status_text() -> str:
     row = _night(today)
     lines = [f"champion: {champ['prompt_id'] if champ else '-'} ({(champ or {}).get('name') or '-'}) since "
              f"{_d(champ['champion_from']) if champ and champ.get('champion_from') else '-'}",
-             f"models: {', '.join(model_keys()) or 'none with a key'}  |  writer: {C.LAB_WRITER_MODEL}",
+             "models: " + (", ".join(short(k) + (" (judge)" if i == 0 else "") for i, k in enumerate(model_keys()))
+                           or "none with a key") + f"  |  writer: {C.LAB_WRITER_MODEL}",
              f"tonight ({today}): {row.get('stage') or 'not started'}" + (f" / {row.get('decision')}" if row.get("decision") else ""),
              f"queue: {counts.get('pending', 0)} waiting, {counts.get('running', 0)} running, {counts.get('done', 0)} done, "
              f"{counts.get('failed', 0)} failed",
@@ -1399,6 +1689,7 @@ def status_text() -> str:
     lines += leaderboard_lines()
     start = (date.fromisoformat(today) - timedelta(days=27)).isoformat()
     lines += [""] + live_lines(start, today)
+    lines += ["", "/gap_lab_models = every model on the champion prompt   /gap_lab_forecast = tonight word by word"]
     return "\n".join(lines)
 
 
@@ -1406,6 +1697,7 @@ def weekly_lines(start: str, end: str) -> list[str]:
     if not enabled():
         return ["Prompt lab is off."]
     lines = leaderboard_lines()
+    lines += [""] + model_board_lines()
     lines += [""] + live_lines(start, end)
     lines += [""] + spend_lines(start, end)
     logrows = [r for r in (store.get_state("lab_champion_log", []) or []) if str(r.get("at", ""))[:10] >= start]

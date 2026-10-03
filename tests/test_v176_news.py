@@ -80,7 +80,7 @@ def test_term_matching_rules():
 
 def test_wanted_feeds_health_only_when_needed():
     keys = [f[0] for f in abcfeeds.wanted_feeds([{"word": "Pardon"}, {"word": "Iran / Iranian"}])]
-    assert keys == ["top", "us", "politics", "intl", "world", "gma"]
+    assert keys == ["top", "us", "politics", "intl", "world", "gma", "front", "video"]   # v1.14.0: homepage + video page
     keys = [f[0] for f in abcfeeds.wanted_feeds([{"word": "SNAP / Food Stamp"}])]
     assert "health" in keys
     keys = [f[0] for f in abcfeeds.wanted_feeds([{"word": "Cancer"}])]

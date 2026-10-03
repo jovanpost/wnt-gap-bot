@@ -192,7 +192,7 @@ def test_slow_answer_message_and_timeout_setting(monkeypatch):
 
 
 def test_default_lineup():
-    assert "mistral:mistral-large" in C.CHALLENGERS
+    assert "mistral:mistral-medium" in C.CHALLENGERS       # v1.14.2: this key's Mistral list has no "large" model (Oct 2)
     assert "nvidia:nvidia/nemotron-3-ultra-550b-a55b" in C.CHALLENGERS
     assert not any(c.startswith("nvidia:qwen") for c in C.CHALLENGERS)   # NVIDIA lists no Qwen today
 

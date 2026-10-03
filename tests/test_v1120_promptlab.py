@@ -15,7 +15,7 @@ from datetime import datetime
 
 import pytest
 
-from gap import clock, config as C, netlimit, notify, pipeline, prompt, promptlab as PL, results, shadow, store
+from gap import challengers as CH, clock, config as C, netlimit, notify, pipeline, prompt, promptlab as PL, results, shadow, store
 
 N1, N2, N3 = "2026-09-30", "2026-10-01", "2026-10-02"          # N3 is "today" in these tests
 WORDS = [{"word": "Pardon", "market_ticker": "KX-PARD"}, {"word": "Helicopter", "market_ticker": "KX-HELI"},
@@ -84,10 +84,22 @@ class Net:
     def post(self, url, headers, payload, timeout):
         body = json.loads(payload)
         self.posts.append((url, body))
+        if "/chat/completions" in url:                                  # NVIDIA, Mistral, OpenRouter ...
+            status = self.status_by_model.get(body["model"], 200)
+            if status == "timeout":
+                import requests as rq
+                raise rq.Timeout("slow")
+            if status != 200:
+                return R(status, {"error": {"message": "busy"}})
+            txt = self._forecast(body["messages"][0]["content"], body["messages"][1]["content"])
+            return R(200, {"choices": [{"message": {"content": txt}}], "usage": {"prompt_tokens": 9000, "completion_tokens": 900}})
         if "api.x.ai" in url:
             if self.xai_status != 200:
                 return R(self.xai_status, {"error": {"message": "busy"}})
-            txt = self._forecast(body["input"][0]["content"], body["input"][1]["content"])
+            if body["input"][0]["content"].startswith("You improve a forecasting prompt"):   # Grok as the writer
+                txt = json.dumps({"variants": self.variants})
+            else:
+                txt = self._forecast(body["input"][0]["content"], body["input"][1]["content"])
             return R(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": txt}]}],
                            "usage": {"input_tokens": 9000, "output_tokens": 3000, "cost_in_usd_ticks": 500_000_000}})
         system = body["system_instruction"]["parts"][0]["text"]
@@ -161,11 +173,26 @@ def lab(monkeypatch):
     monkeypatch.setattr(C, "LAB_MIN_HELDOUT_WORDS", 8)
     monkeypatch.setattr(C, "LAB_MARGIN", 0.005)
     monkeypatch.setattr(C, "LAB_REQUIRE_NEWS", True)
-    monkeypatch.setattr(C, "LAB_PARALLEL", 1)
+    monkeypatch.setattr(C, "LAB_LANES", 1)
+    monkeypatch.setattr(C, "LAB_JUDGE_ROWS_PER_PASS", 6)
+    monkeypatch.setattr(C, "LAB_OTHER_ROWS_PER_PASS", 1)
+    monkeypatch.setattr(C, "LAB_FREE_DAILY_CALLS", 500)
+    monkeypatch.setattr(C, "LAB_FREE_MIN_GAP_S", 0.0)
+    monkeypatch.setattr(C, "CHALLENGERS", ["nvidia:deepseek", "nvidia:kimi", "mistral:mistral-large", "cerebras:gpt-oss-120b"])
+    monkeypatch.setattr(C, "NVIDIA_API_KEY", "nv-secret-key")
+    monkeypatch.setattr(C, "MISTRAL_API_KEY", "mi-secret-key")
+    monkeypatch.setattr(C, "CEREBRAS_API_KEY", "")
+    monkeypatch.setattr(C, "OPENROUTER_API_KEY", "")
+    monkeypatch.setattr(C, "GROQ_API_KEY", "")
+    monkeypatch.setattr(CH, "resolve_list", lambda prov, wanted: [f"{wanted}-v9"])
+    PL._slots.clear()
+    PL._slots["gemini"] = PL._gem
     monkeypatch.setattr(C, "LAB_GEMINI_MODEL", "auto")
     monkeypatch.setattr(C, "LAB_GEMINI_MIN_GAP_S", 0.0)
     monkeypatch.setattr(C, "LAB_GEMINI_DAILY_CALLS", 500)
     monkeypatch.setattr(C, "LAB_WRITER_TRIES", 3)
+    monkeypatch.setattr(C, "LAB_WRITER_GROK_FALLBACK", False)        # most tests: Gemini is the only writer
+    PL._stream_keys.clear()
     PL._gem.update(last=0.0, day="", calls=0)
     monkeypatch.setattr(C, "NET_MIN_GAP_S", 0.0)
     netlimit.reset()
@@ -177,6 +204,13 @@ def lab(monkeypatch):
     for d in (N1, N2):
         store.results_save({ticker(d, w): ("yes" if SAID[w["word"]] else "no") for w in WORDS})
     yield net
+    import threading
+    for _ in range(200):                                    # let background lab / command threads finish before the database goes away
+        busy = PL._running.locked() or any(t.name in ("promptlab", "lab-writer-check", "gap-models") and t.is_alive()
+                                           for t in threading.enumerate())
+        if not busy:
+            break
+        time.sleep(0.02)
     store.engine().dispose()
     monkeypatch.setattr(store, "_engine", None)
 
@@ -708,3 +742,304 @@ def test_v1121_one_word_commands(lab, monkeypatch):
             break
         time.sleep(0.02)
     assert all("WRITER CHECK" in t for t in sent)
+
+
+# ---------------------------------------------------------------- v1.13.0: the lab runs on EVERY model with a key
+
+ALL = ["xai", "gemini", "all"]
+KEYS = ["xai", "gemini", "nvidia:deepseek", "nvidia:kimi", "mistral:mistral-large"]
+
+
+def test_v1130_every_model_with_a_key_is_a_lab_model(lab, monkeypatch):
+    monkeypatch.setattr(C, "LAB_MODELS", ALL)
+    assert PL.model_keys() == KEYS and PL.primary_key() == "xai"        # Cerebras has no key: left out, nothing fails
+    assert [PL.short(k) for k in KEYS] == ["grok", "gemini", "deepseek", "kimi", "mistral"]
+    assert PL.short("nvidia:nvidia/nemotron-3-ultra-550b-a55b") == "nemotron" and PL.short("openrouter:free") == "openrouter"
+    monkeypatch.setattr(C, "LAB_MODELS", ["nvidia:kimi", "xai"])
+    assert PL.model_keys() == ["nvidia:kimi", "xai"] and PL.primary_key() == "nvidia:kimi"   # any model can be the judge
+    monkeypatch.setattr(C, "NVIDIA_API_KEY", "")
+    assert PL.model_keys() == ["xai"]
+
+
+def test_v1130_champion_runs_on_every_model_when_the_file_goes_out(lab, monkeypatch):
+    monkeypatch.setattr(C, "LAB_MODELS", ALL)
+    assert PL.live_start(N3) == 5
+    assert PL.process_queue() == {"done": 5}                            # one lane per model, one run each
+    champ = PL.champion()
+    for k in KEYS:
+        r = PL.run_row(champ["prompt_id"], k, N3)
+        assert r["status"] == "done" and r["live"] is True
+    assert PL.run_row(champ["prompt_id"], "nvidia:deepseek", N3)["model"] == "nvidia:deepseek-v9"
+    assert store.get_state("lab_model:nvidia:deepseek") == "deepseek-v9"   # pinned: every prompt meets the same model
+    body = next(b for u, b in lab.posts if "integrate.api.nvidia.com" in u)
+    assert body["messages"][0] == {"role": "system", "content": SEED} and body["messages"][1]["content"] == user_msg(N3)
+    assert "tools" not in body
+    assert PL.spent_today() == pytest.approx(0.05)                      # only Grok costs money
+
+    txt = PL.forecast_text(N3)
+    assert "word | said? | manual | grok | gemini | deepseek | kimi | mistral" in txt
+    assert "Helicopter | ? | - | 50 | 50 | 50 | 50 | 50" in txt
+    settle_tonight()
+    assert "Helicopter | YES | - | 50 | 50 | 50 | 50 | 50" in PL.forecast_text(N3)
+    assert "BRIER | 4 settled | - | 0.250 | 0.250 | 0.250 | 0.250 | 0.250" in PL.forecast_text(N3)
+    board = "\n".join(PL.model_board_lines())
+    assert "grok (judge) | 1 | 4 | 0.250" in board and "mistral | 1 | 4 | 0.250" in board
+    assert "average of all models | 1 | 4 | 0.250" in board
+    for secret in ("xai-secret-key", "nv-secret-key", "mi-secret-key", "gem-secret-key"):
+        assert secret not in txt + board
+
+
+def test_v1130_variants_are_tried_on_every_model_at_night(lab, monkeypatch):
+    monkeypatch.setattr(C, "LAB_MODELS", ALL)
+    lab.variants = edits(GOOD, MILD)
+    PL.live_start(N3)
+    set_clock(monkeypatch, "18:40")
+    settle_tonight()
+    sent: list = []
+    run_all(sent)
+    night = "\n".join(sent)
+    assert "ALL MODELS tonight" in night and "prompt | grok | gemini | deepseek | kimi | mistral" in night
+    good = PL._q("select prompt_id from gap_lab_prompts where name = 'running-story-length'")[0]["prompt_id"]
+    mild = PL._q("select prompt_id from gap_lab_prompts where name = 'less-middle'")[0]["prompt_id"]
+    for pid in (good, mild):                                             # every valid variant, every model, kept
+        got = {r["model_key"] for r in PL._q("select model_key from gap_lab_runs where prompt_id = :p and event_date = :d and status = 'done'", p=pid, d=N3)}
+        assert got == set(KEYS)
+    later = PL.night_message(N3)                                         # asked again later: every model has answered
+    assert "running-story-length | 0.040 | 0.040 | 0.040 | 0.040 | 0.040" in later
+    assert "champion | 0.250 | 0.250 | 0.250 | 0.250 | 0.250" in later
+    assert {r["model_key"] for r in PL._q("select model_key from gap_lab_runs where purpose = 'test'")} == {"xai"}   # the judge tests
+    assert PL.champion()["name"] == "running-story-length"
+
+
+def test_v1130_one_busy_or_slow_model_does_not_stop_the_others(lab, monkeypatch):
+    monkeypatch.setattr(C, "LAB_MODELS", ALL)
+    lab.status_by_model = {"deepseek-v9": 429, "kimi-v9": "timeout"}
+    PL.live_start(N3)
+    out = PL.process_queue()
+    assert out == {"done": 3, "retry": 2}
+    champ = PL.champion()["prompt_id"]
+    assert PL.run_row(champ, "nvidia:deepseek", N3)["attempts"] == 0     # a busy answer uses no try ...
+    assert PL._cooling("nvidia:deepseek") and not PL._cooling("nvidia:kimi") and not PL._cooling("xai")
+    assert PL.run_row(champ, "nvidia:kimi", N3)["attempts"] == 1         # ... a timeout does, so a slow model cannot loop for ever
+    lab.status_by_model = {"deepseek-v9": 404}
+    PL._cool.clear()
+    PL._x("update gap_lab_runs set not_before = null")
+    PL.process_queue()
+    assert store.get_state("lab_model:nvidia:deepseek") is None          # retired model: looked up again next time
+    lab.status_by_model = {"deepseek-v9": 401}
+    PL._cool.clear()
+    PL._x("update gap_lab_runs set not_before = null")
+    PL.process_queue()
+    assert PL.run_row(champ, "nvidia:deepseek", N3)["status"] == "failed"   # a refused key is final
+
+
+def test_v1130_lanes_and_free_daily_count(lab, monkeypatch):
+    monkeypatch.setattr(C, "LAB_MODELS", ["xai", "nvidia:kimi"])
+    monkeypatch.setattr(C, "LAB_FREE_DAILY_CALLS", 2)
+    champ = PL.bootstrap()["prompt_id"]
+    for d in (N1, N2, N3):
+        PL.enqueue(champ, "xai", d, "fill")
+        PL.enqueue(champ, "nvidia:kimi", d, "fill")
+    assert PL.process_queue() == {"done": 4}                             # judge: all 3; other model: 1 per pass
+    assert PL.process_queue() == {"done": 1}
+    assert PL.process_queue() == {"budget": 1}                           # its 2 free calls for today are used: it waits
+    monkeypatch.setattr(C, "LAB_FREE_DAILY_CALLS", 50)
+    assert PL.process_queue() == {"done": 1}
+
+
+def test_v1130_commands(lab, monkeypatch):
+    monkeypatch.setattr(C, "LAB_MODELS", ALL)
+    handlers = {}
+    monkeypatch.setattr(notify, "register", lambda name, fn: handlers.__setitem__(name, fn))
+    monkeypatch.setattr(notify, "on_json", lambda fn: None)
+    pipeline.register_commands()
+    assert "ALL MODELS" in handlers["gap_lab_models"]([], {})
+    assert "no lab forecasts" in handlers["gap_lab_forecast"](["2026-01-05"], {})
+    out = handlers["gap_lab"]([], {})
+    assert "models: grok (judge), gemini, deepseek, kimi, mistral" in out and "/gap_lab_models" in out
+
+
+# ---------------------------------------------------------------- v1.13.1: fallbacks for what failed on Oct 2
+
+class SSE:
+    """A streamed chat answer, the way an OpenAI-style service sends it."""
+    status_code = 200
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def iter_lines(self):
+        yield b": keep-alive"
+        half = len(self.text) // 2
+        for piece in (self.text[:half], self.text[half:]):
+            yield ("data: " + json.dumps({"model": "m", "choices": [{"delta": {"content": piece}}]})).encode()
+            yield b""
+        yield ("data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}],
+                                      "usage": {"prompt_tokens": 10, "completion_tokens": 5}})).encode()
+        yield b"data: [DONE]"
+
+
+def test_v1131_gemini_down_all_evening_grok_writes(lab, monkeypatch):
+    """Oct 2: every Gemini model answered 503 for half an hour. The night must not be lost."""
+    monkeypatch.setattr(C, "LAB_WRITER_GROK_FALLBACK", True)
+    lab.variants = edits(GOOD)
+    lab.pro_status = lab.flash_status = 503
+    PL.live_start(N3)
+    set_clock(monkeypatch, "18:40")
+    settle_tonight()
+    sent: list = []
+    run_all(sent)
+    night = PL._night(N3)
+    assert night["writer_model"] == "xai:grok-4.7" and night["decision"] == "winner_to_test"
+    assert "writer model skipped: gemini-3.5-flash: HTTP 503" in "\n".join(sent)
+    rows = PL._q("select model, cost_usd from gap_llm_runs where model like :m", m="lab:writer:xai%")
+    assert len(rows) == 1 and float(rows[0]["cost_usd"]) == pytest.approx(0.05)      # booked, inside the lab budget
+    body = next(b for u, b in lab.posts if "api.x.ai" in u and b["input"][0]["content"].startswith("You improve"))
+    assert body["reasoning"] == {"effort": C.LAB_WRITER_XAI_EFFORT} and "tools" not in body
+    out = PL.writer_check()
+    assert "No Gemini model works right now" in out and "Grok writes the edits instead" in out
+
+    monkeypatch.setattr(C, "LAB_WRITER_MODEL", "grok")                  # Grok can also be THE writer
+    assert PL.writer_candidates() == []
+    monkeypatch.setattr(C, "LAB_WRITER_MODEL", "auto")
+    monkeypatch.setattr(C, "LAB_DAILY_BUDGET_USD", 0.0)                 # no budget: the fallback does not spend
+    with pytest.raises(PL.Retry, match="no lab budget left"):
+        PL.write_variants(PL.champion(), PL.night_input(N3), PL.outcomes(PL.night_input(N3)), "xai")
+
+
+def test_v1131_gateway_timeout_switches_to_a_streamed_answer(lab, monkeypatch):
+    """Oct 2: DeepSeek and GLM on NVIDIA answered HTTP 504 five times (the host cuts a silent answer at ~5 min)."""
+    monkeypatch.setattr(C, "LAB_MODELS", ["xai", "nvidia:deepseek"])
+    lab.status_by_model = {"deepseek-v9": 504}
+    PL.live_start(N3)
+    PL.process_queue()
+    champ = PL.champion()["prompt_id"]
+    assert PL.run_row(champ, "nvidia:deepseek", N3)["status"] == "pending" and "nvidia:deepseek" in PL._stream_keys
+    streamed = []
+
+    def fake_stream(url, headers, body, timeout):
+        streamed.append(body["model"])
+        return 200, {"model": body["model"], "usage": {"prompt_tokens": 9, "completion_tokens": 9},
+                     "choices": [{"message": {"content": lab._forecast(body["messages"][0]["content"], body["messages"][1]["content"])}}]}, None
+
+    monkeypatch.setattr(PL, "_stream", fake_stream)
+    PL._cool.clear()
+    PL._x("update gap_lab_runs set not_before = null")
+    PL.process_queue()
+    assert streamed == ["deepseek-v9"] and PL.run_row(champ, "nvidia:deepseek", N3)["status"] == "done"
+
+
+def test_v1131_challenger_streams_after_504_and_rotates_after_rubbish(monkeypatch):
+    monkeypatch.setattr(C, "NVIDIA_API_KEY", "nv-secret-key")
+    monkeypatch.setattr(C, "OPENROUTER_API_KEY", "or-secret-key")
+    monkeypatch.setattr(C, "NET_MIN_GAP_S", 0.0)
+    netlimit.reset()
+    words = ["Pardon", "Helicopter"]
+    good = json.dumps({"date": N3, "forecasts": [{"word": w, "probability": 30, "reasoning": "Blind: x"} for w in words]})
+    calls = []
+
+    def post(url, headers=None, data=None, timeout=None, stream=False):
+        body = json.loads(data)
+        calls.append((body["model"], bool(body.get("stream")), stream))
+        if stream:
+            return SSE(good)
+        return R(504, {"error": {"message": "gateway timeout"}})
+
+    monkeypatch.setattr(CH.requests, "post", post)
+    said = []
+    out = CH.forecast("nvidia", "z-ai/glm-5.3", "file", words, N3, shadow.PREFACE, sleep=lambda s_: None, on_attempt=said.append)
+    assert calls == [("z-ai/glm-5.3", False, False), ("z-ai/glm-5.3", True, True)]
+    assert out["attempts"] == 2 and [f["probability"] for f in out["forecasts"]] == [30, 30]
+    assert "next try streams the answer" in said[0]
+
+    calls.clear()
+
+    def post2(url, headers=None, data=None, timeout=None, stream=False):
+        body = json.loads(data)
+        calls.append(body["model"])
+        txt = "" if body["model"].startswith("google/") else good
+        return R(200, {"model": body["model"], "choices": [{"message": {"content": txt or "not json"}}]})
+
+    monkeypatch.setattr(CH.requests, "post", post2)
+    out = CH.forecast("openrouter", "google/gemma-4-31b-it:free", "file", words, N3, shadow.PREFACE,
+                      sleep=lambda s_: None, fallbacks=["meta/llama-5:free"])
+    assert calls == ["google/gemma-4-31b-it:free", "meta/llama-5:free"] and out["model"] == "openrouter:meta/llama-5:free"
+
+
+def test_v1131_no_matching_model_says_what_is_there(monkeypatch):
+    ids = ["mistral-medium-2604", "mistral-small-2603", "magistral-medium-latest", "codestral-latest", "mistral-ocr-2505"]
+    monkeypatch.setattr(CH, "list_models", lambda prov, timeout=30: ids)
+    with pytest.raises(CH.Fatal) as e:
+        CH.resolve_list("mistral", "mistral-large")
+    msg = str(e.value)
+    assert "no model matching 'mistral-large' (5 models listed; closest: mistral-medium-2604, mistral-small-2603)" in msg
+    assert "/gap_models mistral" in msg and "ocr" not in msg
+
+    handlers, sent = {}, []
+    monkeypatch.setattr(notify, "register", lambda name, fn: handlers.__setitem__(name, fn))
+    monkeypatch.setattr(notify, "on_json", lambda fn: None)
+    monkeypatch.setattr(notify, "send", lambda t, quiet=False, reply_to=None: sent.append(t))
+    monkeypatch.setattr(C, "MISTRAL_API_KEY", "mi-secret-key")
+    monkeypatch.setattr(C, "GROQ_API_KEY", "")
+    pipeline.register_commands()
+    assert "usage: /gap_models" in handlers["gap_models"]([], {})
+    assert "no API key" in handlers["gap_models"](["groq"], {})
+    assert "arrives here" in handlers["gap_models"](["mistral", "medium"], {})
+    for _ in range(100):
+        if sent:
+            break
+        time.sleep(0.02)
+    assert sent and "2 of 5 model ids containing 'medium'" in sent[0] and "mi-secret-key" not in sent[0]
+
+
+# ---------------------------------------------------------------- v1.14.2: answers cut off by the token limit
+
+def test_v1142_cut_off_answer_gets_more_room(lab, monkeypatch):
+    """Oct 2: GLM on NVIDIA and two free OpenRouter models answered 'empty answer (length)' again and again."""
+    monkeypatch.setattr(C, "NVIDIA_API_KEY", "nv-secret-key")
+    monkeypatch.setattr(C, "CHALLENGER_MAX_TOKENS", 12000)
+    monkeypatch.setattr(C, "CHALLENGER_MAX_TOKENS_CAP", 48000)
+    words = ["Pardon", "Helicopter"]
+    good = json.dumps({"date": N3, "forecasts": [{"word": w, "probability": 30, "reasoning": "Blind: x"} for w in words]})
+    asked = []
+
+    def post(url, headers=None, data=None, timeout=None, stream=False):
+        body = json.loads(data)
+        asked.append(body["max_tokens"])
+        if body["max_tokens"] < 48000:
+            return R(200, {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+        return R(200, {"choices": [{"message": {"content": good}, "finish_reason": "stop"}]})
+
+    monkeypatch.setattr(CH.requests, "post", post)
+    said = []
+    out = CH.forecast("nvidia", "z-ai/glm-5.3", "file", words, N3, shadow.PREFACE, sleep=lambda s_: None, on_attempt=said.append)
+    assert asked == [12000, 24000, 48000] and out["attempts"] == 3
+    assert "cut off, next try allows 24,000 tokens" in said[0]
+
+    # the lab remembers it per model
+    monkeypatch.setattr(C, "LAB_MODELS", ["nvidia:glm"])
+    PL._more_tokens.clear()
+    seen = []
+
+    def lab_post(url, headers, payload, timeout):
+        body = json.loads(payload)
+        seen.append(body["max_tokens"])
+        if body["max_tokens"] < 24000:
+            return R(200, {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+        return lab.post(url, headers, payload, timeout)
+
+    monkeypatch.setattr(PL, "_post", lab_post)
+    champ = PL.bootstrap()["prompt_id"]
+    PL.enqueue(champ, "nvidia:glm", N3, "fill")
+    assert PL.process_queue() == {"retry": 1}
+    PL._x("update gap_lab_runs set not_before = null")
+    assert PL.process_queue() == {"done": 1} and seen == [12000, 24000]
+    assert PL.short("mistral:mistral-medium") == "mistral" and "mistral:mistral-medium" in ",".join(
+        [x for x in ["nvidia:deepseek", "mistral:mistral-medium"]])
+
+
+def test_v1142_file_now_script_is_read_only():
+    src = (ROOT / "scripts" / "file_now.py").read_text(encoding="utf-8")
+    for bad in ("insert_", "freeze(", "update_run", "record_llm_run", "set_state", "notify.send", "print(db_url", "DATABASE_URL)"):
+        assert bad not in src                                           # it builds, saves a text file, asks Grok; nothing else
+    assert "need_database_url_optional" in src and "_prompt_hidden" in src and src.index("_secrets") < src.index("from gap import")

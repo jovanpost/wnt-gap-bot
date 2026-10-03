@@ -64,6 +64,19 @@ def main(argv: list[str] | None = None, words: list[dict] | None = None) -> int:
 
     st = netlimit.stats()
     print("")
+    try:                                   # v1.14.0: how ABC's homepage and video page were read (to spot a layout change)
+        from gap import abcfront
+        for which in ("home", "video"):
+            fs = abcfront.last_stats.get(which)
+            if not fs:
+                print(f"ABC {which} page: not fetched in this run (switched off, or served from the 5-minute cache)")
+            elif fs.get("error"):
+                print(f"ABC {which} page: FAILED ({fs['error']})")
+            else:
+                print(f"ABC {which} page: {fs.get('kept', 0)} headlines kept ({fs.get('links', 0)} from story links, "
+                      f"{fs.get('aria', 0)} from card labels, {fs.get('embedded', 0)} from page data; {fs.get('bytes', 0):,} bytes)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"(front page stats unavailable: {type(exc).__name__})")
     print(f"SUMMARY: {took:.1f}s total (ABC, other networks and Google at the same time), {st['requests']} web requests, "
           f"{st['waited_s']:.1f}s total spacing wait (speed limit: {C.NET_MIN_GAP_S}s apart per site, "
           f"max {C.NET_MAX_PARALLEL} at once)")

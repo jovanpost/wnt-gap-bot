@@ -49,7 +49,7 @@ def __getattr__(name: str):
 
 def build_user_message(event_date: str, event_ticker: str, words: list[dict],
                        history_block: str = "", headlines_block: str = "", abc_block: str = "",
-                       more_block: str = "") -> str:
+                       more_block: str = "", broadcasts_block: str = "") -> str:
     lines = [
         f"Date: {event_date}",
         f"Event: {event_ticker}",
@@ -60,6 +60,8 @@ def build_user_message(event_date: str, event_ticker: str, words: list[dict],
         lines.append(f"{i}. {w['word']}")
     if history_block:
         lines.append(history_block)
+    if broadcasts_block:                 # v1.15.0: what aired on the last shows (ABC's own segment list)
+        lines.append(broadcasts_block)
     if abc_block:
         lines.append(abc_block)
     if more_block:
@@ -89,7 +91,13 @@ def build_paste_file(event_date: str, event_ticker: str, words: list[dict]) -> s
             # Never let a history problem stop tonight's file. Grok works without it.
             log.exception("word history skipped")
     heads, abc, more = _news_blocks(words)
-    user = build_user_message(event_date, event_ticker, words, hist, heads, abc, more)
+    shows = ""
+    try:                                 # v1.15.0: never let this stop tonight's file
+        from . import broadcasts
+        shows = broadcasts.block(event_date)
+    except Exception:
+        log.exception("previous broadcasts skipped")
+    user = build_user_message(event_date, event_ticker, words, hist, heads, abc, more, shows)
     return (
         get_system_prompt().rstrip()
         + "\n\n---\n\n"
